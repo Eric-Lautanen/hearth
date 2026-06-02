@@ -56,13 +56,19 @@ Bold = AVX2-optimized. Portable = scalar but still parallelized.
 
 ## Quick Start
 
-### Prerequisites
+### 1. Prerequisites
 
-- Rust 1.85+ (tested on 1.95)
-- A PrismML Bonsai GGUF model file
-- x86_64 CPU with AVX2 recommended (SSE4.1 minimum)
+- **[Rust](https://rustup.rs) 1.85+** (tested on 1.95). If you don't have Rust, install it with `winget install Rustlang.Rustup` on Windows or `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` on Linux/macOS.
+- **A Bonsai GGUF model file** placed in a folder you can reference. Two tested models:
+  - `Bonsai-1.7B-Q1_0.gguf` — 1-bit, fastest, ~350MB
+  - `Ternary-Bonsai-1.7B-Q2_0.gguf` — 2-bit ternary, higher quality, ~630MB
+- **x86_64 CPU** with AVX2 recommended (SSE4.1 minimum). Most CPUs from 2015+ have AVX2.
 
-### Build
+Download models from the [PrismML Bonsai releases](https://huggingface.co/prism-ml).
+
+### 2. Build
+
+Clone the repo and compile. The first build downloads dependencies and takes 2–5 minutes. Subsequent builds are much faster.
 
 ```bash
 git clone https://github.com/yourname/hearth.git
@@ -70,43 +76,43 @@ cd hearth
 cargo build --release
 ```
 
-The build config uses `target-cpu=native`, `lto=fat`, `codegen-units=1` for maximum performance. LLVM optimizes specifically for your CPU.
+The build config uses `target-cpu=native`, `lto=fat`, `codegen-units=1` for maximum performance — LLVM optimizes specifically for your CPU.
 
-### Run
+### 3. Run
 
-```bash
-# Single-shot — generate and exit
-./target/release/hearth-chat-cli model.gguf \
-  --temp 0.7 \
-  --max-tokens 512 \
-  --prompt "Write a haiku about Rust"
+The binary builds to `target\release\hearth-chat-cli.exe`. Models typically live wherever you saved them — we'll use `C:\Users\you\models\` as an example below. Replace with your actual paths.
 
-# Interactive chat
-./target/release/hearth-chat-cli model.gguf
+**Verify it works** (quick 20-token test, takes ~1 second):
 
-# Benchmark (deterministic greedy sampling)
-./target/release/hearth-chat-cli model.gguf \
-  --temp 0 \
-  --max-tokens 60 \
-  --prompt "Hello" \
-  --prompt-raw
+```powershell
+C:\Users\you\hearth\target\release\hearth-chat-cli.exe C:\Users\you\models\Bonsai-1.7B-Q1_0.gguf --temp 0 --max-tokens 20 --prompt "Hello" --prompt-raw
 ```
 
-### CLI Options
+**One-shot question** (generates a response and exits):
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `<model.gguf>` | required | Path to GGUF model file |
-| `--temp T` | 0.7 | Sampling temperature |
-| `--top-k K` | 40 | Top-K sampling |
-| `--top-p P` | 0.9 | Top-P (nucleus) sampling |
-| `--repeat-pen R` | 1.1 | Repetition penalty |
-| `--max-tokens N` | 512 | Max new tokens per reply |
-| `--prompt TEXT` | — | Single-shot mode |
-| `--prompt-raw` | — | Skip chat template wrapping |
-| `--kv-f32` | — | Use F32 KV cache (default: Q8_0) |
-| `--gpu` | — | Attempt GPU load (stub — falls back to CPU) |
-| `--gpu-layers N` | — | First N layers on GPU (stub) |
+```powershell
+C:\Users\you\hearth\target\release\hearth-chat-cli.exe C:\Users\you\models\Bonsai-1.7B-Q1_0.gguf --prompt "Write a haiku about Rust" --max-tokens 100
+```
+
+**Interactive chat** (back-and-forth conversation, Ctrl+C to exit):
+
+```powershell
+C:\Users\you\hearth\target\release\hearth-chat-cli.exe C:\Users\you\models\Bonsai-1.7B-Q2_0.gguf --max-tokens 256
+```
+
+#### What do the flags mean?
+
+| Flag | Default | What it does |
+|------|---------|--------------|
+| `<model.gguf>` | required | Path to your model file (comes first, no `--` prefix) |
+| `--temp` | 0.7 | Creativity level. `0` = deterministic, `1.0+` = more random |
+| `--max-tokens` | 512 | How many words to generate. Lower = faster |
+| `--prompt` | — | One-shot mode: ask a question and get one reply, then exit |
+| `--prompt-raw` | — | Send prompt as-is without wrapping it in a chat template |
+| `--top-k` | 40 | Only pick from the top 40 most likely next words |
+| `--top-p` | 0.9 | Nucleus sampling: pick from words totaling 90% probability |
+| `--repeat-pen` | 1.1 | Penalize repeated words (1.0 = no penalty) |
+| `--kv-f32` | — | Use full-precision KV cache instead of Q8_0 (uses more RAM) |
 
 ## Architecture
 
