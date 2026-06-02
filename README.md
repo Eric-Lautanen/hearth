@@ -28,11 +28,11 @@ Full benchmarks with raw data: [`BENCHMARKS.md`](BENCHMARKS.md)
 
 - **Pure Rust stack** — GGUF parser, BPE tokenizer, samplers, quant kernels, KV cache, thread pool. No C, no CMake, no `libllama`.
 - **Hand-tuned AVX2 kernels** — Q1_0, Q2_0, Q8_0 dot products with lookup-table acceleration and FMA accumulation. SSE4.1 + scalar fallbacks for non-AVX2 CPUs.
-- **Custom thread pool** — replaces Rayon with `std::thread::park`/`unpark`. Workers sleep at 0% CPU idle, wake in <1µs. Static work partitioning — no work-stealing overhead. Scales 5.9× on 8 cores (OpenMP: 4.4×).
+- **Custom thread pool** — replaces Rayon with `std::thread::park`/`unpark`. Workers sleep at 0% CPU idle, wake in <1µs. Static work partitioning — no work-stealing overhead. Scales 5.93× on 8 cores (OpenMP: 4.38×).
 - **Q8_0 KV cache** — quantized key/value cache reduces memory by 4× with negligible accuracy loss.
 - **Chat with templates** — PrismML Bonsai (Qwen3 architecture) chat templates parsed from GGUF metadata. Interactive and single-shot modes.
 - **Sampler controls** — temperature, top-k, top-p, min-p, repetition penalty.
-- **GPU stubs** — `hearth-compute` has a fully-architected GPU backend API (wgpu-ready) with fused dequant+matmul, flash attention, RMS norm, RoPE shader signatures. Not yet implemented.
+- **GPU stubs** — `hearth-compute` has skeleton API signatures for fused dequant+matmul, flash attention, RMS norm, and RoPE. All methods return `None`/`false` — not yet implemented.
 
 ## Supported Quantization Formats
 
@@ -40,11 +40,14 @@ Full benchmarks with raw data: [`BENCHMARKS.md`](BENCHMARKS.md)
 |--------|-----------|------------|--------|
 | Q1_0 / Q1_0_G128 | 1 | 128 | AVX2 LUT + FMA |
 | Q2_0 | 2 | 128 | AVX2 LUT + FMA |
+| Q2_K | 2 | 256 | QK block dequant |
+| Q3_K | 3 | 256 | QK block dequant |
 | Q4_0 | 4 | 32 | Portable + Q8_0 fusion |
 | Q4_1 | 4 | 32 | Portable |
 | Q4_K | 4 | 256 | QK block dequant |
 | Q5_0 | 5 | 32 | Portable |
 | Q5_1 | 5 | 32 | Portable |
+| Q5_K | 5 | 256 | QK block dequant |
 | Q6_K | 6 | 256 | QK block dequant |
 | Q8_0 | 8 | 32 | Portable + Q8_0 fusion |
 | F16 / F32 | — | — | matrixmultiply sgemm |
@@ -110,6 +113,7 @@ The build config uses `target-cpu=native`, `lto=fat`, `codegen-units=1` for maxi
 ```
 hearth-chat-cli
   └─ hearth-llm         ← inference engine, forward pass, thread pool
+       ├─ hearth-core    ← shared types (Model, PipelineRequest)
        ├─ hearth-gguf    ← zero-copy mmap GGUF parser
        ├─ hearth-quant   ← AVX2 dot-product kernels (Q1/Q2/Q8/...)
        ├─ hearth-tokenizer ← BPE tokenizer, chat templates
