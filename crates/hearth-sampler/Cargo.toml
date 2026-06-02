@@ -1,0 +1,9 @@
+[package]
+name = "hearth-sampler"
+version = "0.1.0"
+edition = "2021"
+description = "Token sampling (temperature, top-p, top-k)"
+
+[dependencies]
+hearth-core = { workspace = true }
+rand = "0.9"

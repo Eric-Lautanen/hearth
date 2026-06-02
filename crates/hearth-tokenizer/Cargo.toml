@@ -1,0 +1,8 @@
+[package]
+name = "hearth-tokenizer"
+version = "0.1.0"
+edition = "2021"
+description = "BPE tokenizer from GGUF metadata"
+
+[dependencies]
+hearth-gguf = { workspace = true }

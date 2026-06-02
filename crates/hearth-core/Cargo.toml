@@ -1,0 +1,5 @@
+[package]
+name = "hearth-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared traits and types for Hearth AI runtime"

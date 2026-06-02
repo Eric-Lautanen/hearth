@@ -1,0 +1,8 @@
+[package]
+name = "hearth-compute"
+version = "0.1.0"
+edition = "2021"
+description = "GPU compute stubs for hearth-llm type compatibility"
+
+[dependencies]
+hearth-gguf = { workspace = true }
