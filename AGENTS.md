@@ -9,24 +9,45 @@
 - Ref (Prism fork): `$env:TEMP\llama.cpp-prism`
 - Ref binary: `$env:TEMP\llama.cpp-prism\build\bin\Release\llama-cli.exe`
 - Models: `$env:USERPROFILE\AppData\Roaming\hearth\models\`
-  - `Bonsai-1.7B-Q1_0.gguf` (Q1_0_G128, 128/18 blocks)
-  - `Ternary-Bonsai-1.7B-Q2_0.gguf` (Q2_0, 128/34 blocks)
+  - `Bonsai-1.7B-Q1_0.gguf` (Q1_0_G128, 128/18 blocks) — 28 layers, d=2048, ffn=6144
+  - `Ternary-Bonsai-1.7B-Q2_0.gguf` (Q2_0, 128/34 blocks) — 28 layers, d=2048, ffn=6144
+  - `Bonsai-4B.gguf` (Q1_0_G128, 128/18 blocks) — 36 layers, d=2560, ffn=9728
+  - `Ternary-Bonsai-4B-Q2_0.gguf` (Q2_0, 128/34 blocks) — 36 layers, d=2560, ffn=9728
+  - `Bonsai-8B.gguf` (Q1_0_G128, 128/18 blocks) — 36 layers, d=4096, ffn=12288
+  - `Ternary-Bonsai-8B-Q2_0.gguf` (Q2_0, 128/34 blocks) — 36 layers, d=4096, ffn=12288
 
 ## Ref commands
 ```powershell
-# Q1_0 benchmark
+# 1.7B Q1_0
 & "$env:TEMP\llama.cpp-prism\build\bin\Release\llama-cli.exe" -m "$env:USERPROFILE\AppData\Roaming\hearth\models\Bonsai-1.7B-Q1_0.gguf" --temp 0 -n 20 -p "Hello"
-# Q2_0 benchmark
+# 1.7B Q2_0
 & "$env:TEMP\llama.cpp-prism\build\bin\Release\llama-cli.exe" -m "$env:USERPROFILE\AppData\Roaming\hearth\models\Ternary-Bonsai-1.7B-Q2_0.gguf" --temp 0 -n 20 -p "Hello"
+# 4B Q1_0
+& "$env:TEMP\llama.cpp-prism\build\bin\Release\llama-cli.exe" -m "$env:USERPROFILE\AppData\Roaming\hearth\models\Bonsai-4B.gguf" --temp 0 -n 20 -p "Hello"
+# 4B Q2_0
+& "$env:TEMP\llama.cpp-prism\build\bin\Release\llama-cli.exe" -m "$env:USERPROFILE\AppData\Roaming\hearth\models\Ternary-Bonsai-4B-Q2_0.gguf" --temp 0 -n 20 -p "Hello"
+# 8B Q1_0
+& "$env:TEMP\llama.cpp-prism\build\bin\Release\llama-cli.exe" -m "$env:USERPROFILE\AppData\Roaming\hearth\models\Bonsai-8B.gguf" --temp 0 -n 20 -p "Hello"
+# 8B Q2_0
+& "$env:TEMP\llama.cpp-prism\build\bin\Release\llama-cli.exe" -m "$env:USERPROFILE\AppData\Roaming\hearth\models\Ternary-Bonsai-8B-Q2_0.gguf" --temp 0 -n 20 -p "Hello"
 ```
 
 ## Hearth commands
 ```powershell
+# Generic
 & ".\target\release\hearth-chat-cli.exe" "$env:USERPROFILE\AppData\Roaming\hearth\models\model.gguf" --temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw
-# Quick benchmark (20 tokens)
+# 1.7B Q1_0
 & ".\target\release\hearth-chat-cli.exe" "$env:USERPROFILE\AppData\Roaming\hearth\models\Bonsai-1.7B-Q1_0.gguf" --temp 0 --max-tokens 20 --prompt "Hello" --prompt-raw
-# Q2_0
+# 1.7B Q2_0
 & ".\target\release\hearth-chat-cli.exe" "$env:USERPROFILE\AppData\Roaming\hearth\models\Ternary-Bonsai-1.7B-Q2_0.gguf" --temp 0 --max-tokens 20 --prompt "Hello" --prompt-raw
+# 4B Q1_0
+& ".\target\release\hearth-chat-cli.exe" "$env:USERPROFILE\AppData\Roaming\hearth\models\Bonsai-4B.gguf" --temp 0 --max-tokens 20 --prompt "Hello" --prompt-raw
+# 4B Q2_0
+& ".\target\release\hearth-chat-cli.exe" "$env:USERPROFILE\AppData\Roaming\hearth\models\Ternary-Bonsai-4B-Q2_0.gguf" --temp 0 --max-tokens 20 --prompt "Hello" --prompt-raw
+# 8B Q1_0
+& ".\target\release\hearth-chat-cli.exe" "$env:USERPROFILE\AppData\Roaming\hearth\models\Bonsai-8B.gguf" --temp 0 --max-tokens 20 --prompt "Hello" --prompt-raw
+# 8B Q2_0
+& ".\target\release\hearth-chat-cli.exe" "$env:USERPROFILE\AppData\Roaming\hearth\models\Ternary-Bonsai-8B-Q2_0.gguf" --temp 0 --max-tokens 20 --prompt "Hello" --prompt-raw
 ```
 
 ## Build & verify
