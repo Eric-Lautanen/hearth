@@ -13,12 +13,20 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 5 — batched prefill + KV cache fix)
+## Current status (2026-06-02, Session 6 — SIMD RoPE)
 
-### Critical bug fixed: KV cache lazy resize
-`KVCache::new()` created empty `k`/`v` Vecs. On first `write_kv` call, `resize(total, 0.0f32)` zeroed 128MB per vector (256MB per layer = 9.2GB total). This caused 33→103ms growing per-layer times in `forward_batch`. Fixed by pre-allocating at construction: `vec![0.0f32; total]`.
+### SIMD RoPE with precomputed sin/cos: DONE
+`RopeCache` struct was already defined but never wired into the model. The standalone `ops::rope()` function recomputed `theta.powf()` and `sin_cos()` on every token — 6,912 trig calls per forward (36 layers × 2 head groups × 80 dim ÷ 2 halves × 2 Q+K). 
 
-### Batched prefill: DONE
+**Changes:**
+- Re-laid-out table: interleaved `[sin, cos, sin, cos]` → contiguous `[sin0..sin63, cos0..cos63]` per position, enabling `f32x8` loads
+- `RopeCache::apply` now uses SIMD: 8 complex pairs per `f32x8` iteration (was scalar)
+- Wired into `LlamaModel` — initialized at load time, all 6 `ops::rope()` calls replaced with `self.rope_cache.apply()`
+- Removed unused `scaling_type`/`scaling_factor`/`orig_ctx` locals
+
+**Result:** `rope` timing dropped from ~960µs to ~10µs per forward. Net ~2% forward time reduction.
+
+### Batched prefill: DONE (from Session 5)
 Wired `forward_batch` into `generate_text()` for CPU multi-token prompts. Optimized `matmul_batch` with Q8_0 quantized activations + custom ThreadPool + sequential quantize (no rayon contention).
 
 | Config | Prefill 7t | Total 57t | Tok/s |
@@ -26,21 +34,18 @@ Wired `forward_batch` into `generate_text()` for CPU multi-token prompts. Optimi
 | Single-token (pre-alloc KV) | ~322ms | 3013ms | 18.9 |
 | Batched (pre-alloc KV) | 264-420ms | 3213-3589ms | 15.9-17.7 |
 
-Prefill is 10-22% faster than single-token path in best case (264ms vs 322ms), but high variance (264-420ms). Total throughput slightly lower than single-token decode due to decode thermal variance (~17 tok/s vs ~20).
+### Critical bug fixed: KV cache lazy resize (from Session 5)
+`KVCache::new()` created empty `k`/`v` Vecs. On first `write_kv` call, `resize(total, 0.0f32)` zeroed 128MB per vector (256MB per layer = 9.2GB total). Fixed by pre-allocating at construction.
 
-Key files changed:
-- `kvcache.rs:27-28` — pre-allocate K/V Vecs at construction
-- `matmul.rs:524-555` — Q8_0 quantized activations + ThreadPool
-- `mod.rs:2066-2094` — wired `forward_batch` into `generate_text`
+### Remaining bottlenecks (4B Q1_0, single-token forward ~47ms)
+From `[timing]` output (decode tokens):
+- qkv_matmul ~30-37%  
+- ffn_gate_up_matmul ~30-37%
+- ffn_down_matmul ~15-23%
+- attn_output_matmul ~9-12%
+- lm_head_matmul ~4-8%
 
-### Remaining bottlenecks (4B Q1_0, single-token forward ~46ms)
-From `[timing]` output (decode tokens after prefill):
-- qkv_matmul ~37%  
-- ffn_gate_up_matmul ~30%
-- ffn_down_matmul ~15%
-- attn_output_matmul ~12%
-
-Next targets: SIMD RoPE, fused attn quant.
+Next target: Fuse attn_out quant into attention kernel (est 3-5%).
 
 | Model | Hearth | Ref | H/Ref | Forward |
 |---|---|---|---|---|
@@ -79,6 +84,7 @@ Next targets: SIMD RoPE, fused attn quant.
 2026-06-02 Custom thread pool park/unpark: 18.3→27.2 tok/s (+49%)
 2026-06-02 Gen counter + 8 workers + yield (Sess 3): 19.3→24.5 tok/s (+27%)
 2026-06-02 i16 LUT (Q2V_I16 pre-extended, skip sign extension): ~24 tok/s (within noise)
+2026-06-02 SIMD RoPE (precomputed sin/cos table + f32x8 apply): rope 960µs→10µs
 
 ### 4B Q1_0
 
@@ -87,6 +93,7 @@ Next targets: SIMD RoPE, fused attn quant.
 2026-06-02 KV cache .to_vec() removal: 15.2→19.6 tok/s (+29%)
 2026-06-02 Scratch buffer reuse: neutral
 2026-06-02 i16 LUT, thread tuning: ~20 tok/s (variance)
+2026-06-02 SIMD RoPE (precomputed sin/cos table + f32x8 apply): rope 960µs→10µs
 
 ### 4B Q2_0
 
@@ -135,6 +142,7 @@ Q1_0 shuffle kernel beats reference on ALL model sizes
 Q2_0 is 3-5× faster than reference at all sizes
 LLVM generates better AVX2 code than MSVC SSE2 for quant kernels
 10 workers helps large models (4B/8B Q2_0: +11%/+41%) but kills small ones
+RopeCache was dead code — struct defined but never instantiated; ops::rope() recomputed trig every token
 
 ## Per-token forward pass (warm, non-prefill)
 
@@ -142,10 +150,10 @@ LLVM generates better AVX2 code than MSVC SSE2 for quant kernels
 ffn_gate_up_matmul 41% | ffn_down_matmul 30% | qkv_matmul 16% | attn_output_matmul 4% | lm_head_matmul 5% | rest 5%
 
 ### 1.7B Q2_0 (~47ms)
-ffn_gate_up_matmul 34% | ffn_down_matmul 18% | qkv_matmul 16% | attn_output_matmul 9% | lm_head_matmul 10% | attention 5% | rope 2% | rest 6%
+ffn_gate_up_matmul 34% | ffn_down_matmul 18% | qkv_matmul 16% | attn_output_matmul 9% | lm_head_matmul 10% | attention 5% | rope ~0.02% | rest 6%
 
-### 4B Q1_0 (~48ms)
-ffn_gate_up_matmul 40% | ffn_down_matmul 25% | qkv_matmul 15% | attn_output_matmul 8% | lm_head_matmul 7% | rest 5%
+### 4B Q1_0 (~47ms)
+ffn_gate_up_matmul 30-37% | ffn_down_matmul 15-23% | qkv_matmul 30-37% | attn_output_matmul 9-12% | lm_head_matmul 4-8% | rope ~0.02% | rest ~2%
 
 ### 4B Q2_0 (profile pre-S3, ~355ms; post-S4 ~90ms)
 ffn_gate_up_matmul 40% | ffn_down_matmul 19% | qkv_matmul 16% | kv_cache_write 12% | attn_output_matmul 10% | lm_head_matmul 2% | rest 3%
