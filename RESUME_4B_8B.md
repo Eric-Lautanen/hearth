@@ -3,54 +3,86 @@
 > Read `AGENTS.md` and `BUG_4B_8B_models.md` first.
 > **⚠️ ALL 6 MODELS ARE TARGETS** — Q1_0 and Q2_0 at 1.7B, 4B, and 8B scales.
 
-## Current state (2026-06-02, init)
+## Current state (2026-06-02, extensive benchmarks)
 
-### 1.7B (baseline — previously optimized)
-| Model | Hearth | Reference | Delta |
-|-------|--------|-----------|-------|
-| Q1_0 | **34.4** | 32.0 | +7.5% |
-| Q2_0 | **27.2** | 5.1 | +433% |
+### Multi-threaded (Hearth: 15T, Ref: 16T)
 
-### 4B
-| Model | Hearth | Reference | Delta |
-|-------|--------|-----------|-------|
-| Q1_0 | **~14** | 14.1 | ~0% |
-| Q2_0 | **~2.9** | 1.8 | +56% |
+| Model | Hearth tok/s | Ref tok/s | H/Ref | Gap |
+|-------|-------------|-----------|-------|-----|
+| 1.7B Q1_0 | **34.4** | 32.0 | 1.08× | +8% |
+| 1.7B Q2_0 | **27.2** | 5.1 | 5.33× | +433% |
+| 4B Q1_0 | **15.4** | 17.4 | 0.89× | -11% |
+| 4B Q2_0 | **8.6** | 2.8 | 3.07× | +207% |
+| 8B Q1_0 | **5.2** | 8.2 | 0.63× | 🔴 -37% |
+| 8B Q2_0 | **4.6** | 1.5 | 3.07× | +207% |
 
-### 8B
-| Model | Hearth | Reference | Delta |
-|-------|--------|-----------|-------|
-| Q1_0 | **~2.5** | 8.4 | **-70% 🔴** |
-| Q2_0 | **~1.6** | 1.6 | ~0% |
+### Single-threaded (Reference only)
 
-## What was done (this session)
+| Model | Ref 1T | Ref MT | Scaling |
+|-------|--------|--------|---------|
+| 1.7B Q1_0 | 7.3 | 32.0 | 4.4× |
+| 4B Q1_0 | 2.9 | 17.4 | 6.0× |
+| 4B Q2_0 | 0.3 | 2.8 | 9.3× |
+| 8B Q1_0 | 1.4 | 8.2 | 5.9× |
+| 8B Q2_0 | 0.2 | 1.5 | 7.5× |
 
-### Downloaded ternary (Q2_0) models from HuggingFace
+### Q1_0 / Q2_0 speed ratio at each scale
+
+| Scale | Ref Q1/Q2 | Hearth Q1/Q2 |
+|-------|-----------|-------------|
+| 1.7B | 6.3× | 1.26× |
+| 4B | 6.2× | 1.79× |
+| 8B | 5.5× | **1.13×** 🔴 |
+
+Q1_0 should be 5-6× faster than Q2_0 (reference confirms this). Hearth's Q1_0 kernel degrades with dimension — at 8B it's barely faster than Q2_0. The Q2_0 kernel scales perfectly.
+
+## Key findings
+
+### 🔴 8B Q1_0 regression: myth vs reality
+
+- **Myth**: 70% slower than reference (from a single cold token)
+- **Reality**: 37% slower (192ms avg over 50 tokens vs ref 122ms over 20 tokens)
+- The initial 393ms measurement included first-token warm-up overhead
+
+### 🔴 Q1_0 kernel collapses at d=4096
+
+Hearth Q1_0/Q2_0 ratio: 1.26× at 1.7B → 1.79× at 4B → **1.13× at 8B**. The scalar LUT kernel in `q1_0g128.rs` has 512 Q1V table lookups per row at d=4096. At 15 threads, L1 cache pressure from the 2KB lookup table likely causes constant evictions. Q2_0's AVX2 kernel (`q2_0.rs`) avoids this by batching 16 elements per LUT load.
+
+### ✅ Q2_0 is bulletproof
+
+3.07× ref at 4B and 8B, 5.33× at 1.7B. The AVX2 kernel + custom pool scales perfectly at all model sizes. No evidence of performance degradation.
+
+### ✅ 4B Q1_0 is competitive
+
+11% behind reference. Within range of MSVC vs LLVM codegen gap seen on 1.7B (1.26× kernel deficit). No architectural issues at this scale.
+
+### Parallel scaling analysis
+
+Ref 8B Q1_0 scales 5.9× from 1→16T. Assuming Hearth's 1T kernel is ~1.26× slower, Hearth's effective scaling is ~4.7×. The ~20% scaling gap suggests thread contention on the Q1_0 weight tensor at d=4096.
+
+## What was done (this session, 2026-06-02)
+
+### Downloaded Q2_0 models
 - `Ternary-Bonsai-4B-Q2_0.gguf` (1.0 GB) from `prism-ml/Ternary-Bonsai-4B-gguf`
 - `Ternary-Bonsai-8B-Q2_0.gguf` (2.0 GB) from `prism-ml/Ternary-Bonsai-8B-gguf`
 
 ### Verified all 6 models load and generate
 All 6 Bonsai models (1.7B/4B/8B × Q1_0/Q2_0) load successfully and produce coherent output. No NaN, no crashes, no architecture mismatches.
 
-### Initial benchmarks against llama.cpp reference
-Ran initial 5-token benchmarks for all 4 new models. The 8B Q1_0 shows a major ~70% regression vs reference.
+### Extensive benchmarks
+- 100-token Hearth run for 4B Q1_0 — per-token convergence, warm-up curve
+- 50-token Hearth runs for 4B Q2_0, 8B Q1_0, 8B Q2_0 — `avg_cpu_overhead`
+- 20-token reference runs for all 4 models (multi-threaded)
+- 20-token reference single-thread (`-t 1`) runs for all 4 models
+- Per-token forward-pass breakdowns
 
-## 🔴 Critical: 8B Q1_0 perf regression
+## To try (prioritized)
 
-The 8B Q1_0 model at ~393ms/token vs reference's ~119ms/token (8.4 tok/s) is a 3.4× regression. This is the primary focus for next session.
-
-Hypotheses:
-1. **Memory bandwidth saturation** — 1.1GB model exceeds L3 cache, constant DRAM fetches hurt more with Hearth's parallel dispatch pattern
-2. **Thread pool contention** — 15 workers on 1.6× larger rows (4096 vs 2560) may cause more contention
-3. **Single-token measurement noise** — need multi-token warm-up runs
-4. **Q8_0 KV cache path** — 8B model has d_model=4096, the Q8_0 KV cache quant/dequant might be a bottleneck
-
-## To try (next sessions)
-
-1. 🔴 **Debug 8B Q1_0**: multi-token warm-up benchmark, per-layer timing, thread count sweep
-2. **Q2_0 i16 LUT**: pre-computed Q2V lookup table to eliminate sign-extension
-3. **KV cache optimization**: 4B Q2_0 shows 12% time in KV cache writes
-4. **Row partitioning tuning**: larger d_model may need different static partitioning strategy
+1. 🔴🔴 **Port Q2_0 AVX2 pattern to Q1_0 kernel** — 16-el batches, `_mm256_madd_epi16`, FMA accumulation. Same transformation that delivered +55% on Q2_0.
+2. **Q2_0: pre-computed i16 LUT** — eliminate `vpmovsxbw` sign-extension, universal +10-15%.
+3. **Thread pool: row-chunk partitioning for large models** — keep working set < L3 cache.
+4. **Add `--threads` CLI flag or `HEARTH_NUM_THREADS` env var** — needed for thread count sweeps.
+5. **Fuse Q8_0 activation quant into first matmul row** — eliminate redundant vector read.
 
 ## Key files
 - `BUG_4B_8B_models.md` — full bug report with perf tables and forward-pass breakdown
