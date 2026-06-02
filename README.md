@@ -30,7 +30,7 @@ Full benchmarks with raw data: [`BENCHMARKS.md`](BENCHMARKS.md)
 - **Hand-tuned AVX2 kernels** — Q1_0, Q2_0, Q8_0 dot products with lookup-table acceleration and FMA accumulation. SSE4.1 + scalar fallbacks for non-AVX2 CPUs.
 - **Custom thread pool** — replaces Rayon with `std::thread::park`/`unpark`. Workers sleep at 0% CPU idle, wake in <1µs. Static work partitioning — no work-stealing overhead. Scales 5.9× on 8 cores (OpenMP: 4.4×).
 - **Q8_0 KV cache** — quantized key/value cache reduces memory by 4× with negligible accuracy loss.
-- **Chat with templates** — Qwen3, Llama, Mistral, Phi, Gemma chat templates parsed from GGUF metadata. Interactive and single-shot modes.
+- **Chat with templates** — PrismML Bonsai (Qwen3 architecture) chat templates parsed from GGUF metadata. Interactive and single-shot modes.
 - **Sampler controls** — temperature, top-k, top-p, min-p, repetition penalty.
 - **GPU stubs** — `hearth-compute` has a fully-architected GPU backend API (wgpu-ready) with fused dequant+matmul, flash attention, RMS norm, RoPE shader signatures. Not yet implemented.
 
@@ -56,7 +56,7 @@ Bold = AVX2-optimized. Portable = scalar but still parallelized.
 ### Prerequisites
 
 - Rust 1.85+ (tested on 1.95)
-- A GGUF model file (Qwen3, Llama, Mistral, Phi, Gemma, etc.)
+- A PrismML Bonsai GGUF model file
 - x86_64 CPU with AVX2 recommended (SSE4.1 minimum)
 
 ### Build
