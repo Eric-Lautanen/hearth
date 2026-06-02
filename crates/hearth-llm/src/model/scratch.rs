@@ -59,6 +59,7 @@ pub(crate) struct ForwardScratch {
     pub(crate) moe_ffn: Vec<f32>,
     pub(crate) x_q8: Vec<u8>,
     pub(crate) ffn_q8: Vec<u8>,
+    pub(crate) scratch_q8: Vec<u8>,
     pub(crate) head_norm_tmp: Vec<f32>,
     pub(crate) timers: ForwardTimers,
 }

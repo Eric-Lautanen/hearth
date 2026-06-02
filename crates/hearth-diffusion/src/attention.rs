@@ -162,7 +162,9 @@ pub fn attention_batched_matmul(
                 for s in 0..seq_len {
                     sum += qk[h * seq_len + s] * v[s * n_qkv + h * head_dim + d];
                 }
-                unsafe { *((o_chunk_ptr + (o_off + d) * 4) as *mut f32) = sum; }
+                unsafe {
+                    *((o_chunk_ptr + (o_off + d) * 4) as *mut f32) = sum;
+                }
             }
         }
     });

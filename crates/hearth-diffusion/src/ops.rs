@@ -11,14 +11,12 @@ pub fn matmul_q2(q2: &super::weights::Q2Tensor, x: &[f32], out: &mut [f32]) {
     hearth_quant::quantize_q8_0(x, &mut x_q8);
     let a_ptr = x_q8.as_ptr() as usize;
     let out_ptr = out.as_mut_ptr() as usize;
-    (0..rows).into_par_iter().for_each(|row| {
-        unsafe {
-            *((out_ptr + row * 4) as *mut f32) = hearth_quant::dot_q2_0_q8_0_ptr(
-                (w_base + row * row_bytes) as *const u8,
-                a_ptr as *const u8,
-                cols,
-            );
-        }
+    (0..rows).into_par_iter().for_each(|row| unsafe {
+        *((out_ptr + row * 4) as *mut f32) = hearth_quant::dot_q2_0_q8_0_ptr(
+            (w_base + row * row_bytes) as *const u8,
+            a_ptr as *const u8,
+            cols,
+        );
     });
 }
 
@@ -41,11 +39,12 @@ pub fn matmul_q2_batched(q2: &super::weights::Q2Tensor, x: &[f32], out: &mut [f3
         let a_ptr = x_q8.as_ptr() as usize;
         for row in 0..rows {
             unsafe {
-                *((out_ptr_base + (out_off + row) * 4) as *mut f32) = hearth_quant::dot_q2_0_q8_0_ptr(
-                    (w_base + row * row_bytes) as *const u8,
-                    a_ptr as *const u8,
-                    cols,
-                );
+                *((out_ptr_base + (out_off + row) * 4) as *mut f32) =
+                    hearth_quant::dot_q2_0_q8_0_ptr(
+                        (w_base + row * row_bytes) as *const u8,
+                        a_ptr as *const u8,
+                        cols,
+                    );
             }
         }
     });
@@ -186,7 +185,15 @@ pub fn attention(
     }
 }
 
-pub fn conv2d_3x3(input: &[f32], weight: &[f32], bias: &[f32], h: usize, w: usize, c_in: usize, c_out: usize) -> Vec<f32> {
+pub fn conv2d_3x3(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    h: usize,
+    w: usize,
+    c_in: usize,
+    c_out: usize,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; h * w * c_out];
     for oh in 0..h {
         for ow in 0..w {
@@ -231,7 +238,15 @@ pub fn upsample_nearest_2x(input: &[f32], h: usize, w: usize, c: usize) -> Vec<f
     out
 }
 
-pub fn group_norm(x: &mut [f32], weight: &[f32], bias: &[f32], n_groups: usize, c: usize, hw: usize, eps: f32) {
+pub fn group_norm(
+    x: &mut [f32],
+    weight: &[f32],
+    bias: &[f32],
+    n_groups: usize,
+    c: usize,
+    hw: usize,
+    eps: f32,
+) {
     let c_per_group = c / n_groups;
     for g in 0..n_groups {
         let c_start = g * c_per_group;
@@ -253,7 +268,15 @@ pub fn group_norm(x: &mut [f32], weight: &[f32], bias: &[f32], n_groups: usize, 
     }
 }
 
-pub fn conv2d_1x1(input: &[f32], weight: &[f32], bias: &[f32], h: usize, w: usize, c_in: usize, c_out: usize) -> Vec<f32> {
+pub fn conv2d_1x1(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    h: usize,
+    w: usize,
+    c_in: usize,
+    c_out: usize,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; h * w * c_out];
     for oh in 0..h {
         for ow in 0..w {

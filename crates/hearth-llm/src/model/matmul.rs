@@ -521,232 +521,40 @@ impl LlamaModel {
         let m = actual_rows;
         let k = actual_cols;
 
-        match entry.dtype {
-            GgmlDType::Q2_0 => {
-                let rows: Vec<usize> = (0..m).collect();
-                let result: Vec<f32> = rows
-                    .par_iter()
-                    .flat_map(|&row| {
-                        let w = entry.row_data(row);
-                        (0..seq_len)
-                            .map(|s| {
-                                let x_row = &input[s * k..(s + 1) * k];
-                                hearth_quant::dot_q2_0_f32(w, x_row, k)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                for row in 0..m {
-                    for s in 0..seq_len {
-                        out[s * m + row] = result[row * seq_len + s];
-                    }
-                }
+        if matches!(
+            entry.dtype,
+            GgmlDType::Q2_0 | GgmlDType::Q1_0 | GgmlDType::Q1_0_G128
+        ) {
+            let q8_size = k.div_ceil(32) * 34;
+            let dot_fn = match entry.dtype {
+                GgmlDType::Q2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
+                _ => dot_q1_0g128_fast,
+            };
+            let mut q8_buf = Vec::with_capacity(seq_len * q8_size);
+            for s in 0..seq_len {
+                hearth_quant::quantize_q8_0(&input[s * k..(s + 1) * k], &mut q8_buf);
             }
-            GgmlDType::Q1_0 => {
-                let rows: Vec<usize> = (0..m).collect();
-                let result: Vec<f32> = rows
-                    .par_iter()
-                    .flat_map(|&row| {
-                        let w = entry.row_data(row);
-                        (0..seq_len)
-                            .map(|s| {
-                                let x_row = &input[s * k..(s + 1) * k];
-                                hearth_quant::dot_q1_0(w, x_row, k)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                for row in 0..m {
-                    for s in 0..seq_len {
-                        out[s * m + row] = result[row * seq_len + s];
-                    }
-                }
+            for s in 0..seq_len {
+                self.pool.par_dot_rows(
+                    m,
+                    entry.data.as_ptr() as usize,
+                    q8_buf[s * q8_size..].as_ptr() as usize,
+                    out[s * m..].as_mut_ptr() as usize,
+                    entry.dtype.byte_size(k),
+                    k,
+                    dot_fn,
+                );
             }
-            GgmlDType::Q1_0_G128 => {
-                let rows: Vec<usize> = (0..m).collect();
-                let result: Vec<f32> = rows
-                    .par_iter()
-                    .flat_map(|&row| {
-                        let w = entry.row_data(row);
-                        (0..seq_len)
-                            .map(|s| {
-                                let x_row = &input[s * k..(s + 1) * k];
-                                hearth_quant::dot_q1_0g128_f32(w, x_row, k)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                for row in 0..m {
-                    for s in 0..seq_len {
-                        out[s * m + row] = result[row * seq_len + s];
-                    }
-                }
-            }
-            GgmlDType::Q8_0 => {
-                let rows: Vec<usize> = (0..m).collect();
-                let result: Vec<f32> = rows
-                    .par_iter()
-                    .flat_map(|&row| {
-                        let w = entry.row_data(row);
-                        (0..seq_len)
-                            .map(|s| {
-                                let x_row = &input[s * k..(s + 1) * k];
-                                hearth_quant::dot_q8_0(w, x_row, k)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                for row in 0..m {
-                    for s in 0..seq_len {
-                        out[s * m + row] = result[row * seq_len + s];
-                    }
-                }
-            }
-            GgmlDType::Q4_K => {
-                let rows: Vec<usize> = (0..m).collect();
-                let result: Vec<f32> = rows
-                    .par_iter()
-                    .flat_map(|&row| {
-                        let w = entry.row_data(row);
-                        (0..seq_len)
-                            .map(|s| {
-                                let x_row = &input[s * k..(s + 1) * k];
-                                hearth_quant::dot_q4_k(w, x_row, k)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                for row in 0..m {
-                    for s in 0..seq_len {
-                        out[s * m + row] = result[row * seq_len + s];
-                    }
-                }
-            }
-            GgmlDType::Q4_0 => {
-                let rows: Vec<usize> = (0..m).collect();
-                let result: Vec<f32> = rows
-                    .par_iter()
-                    .flat_map(|&row| {
-                        let w = entry.row_data(row);
-                        (0..seq_len)
-                            .map(|s| {
-                                let x_row = &input[s * k..(s + 1) * k];
-                                hearth_quant::dot_q4_0(w, x_row, k)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                for row in 0..m {
-                    for s in 0..seq_len {
-                        out[s * m + row] = result[row * seq_len + s];
-                    }
-                }
-            }
-            GgmlDType::Q4_1 => {
-                let rows: Vec<usize> = (0..m).collect();
-                let result: Vec<f32> = rows
-                    .par_iter()
-                    .flat_map(|&row| {
-                        let w = entry.row_data(row);
-                        (0..seq_len)
-                            .map(|s| {
-                                let x_row = &input[s * k..(s + 1) * k];
-                                hearth_quant::dot_q4_1(w, x_row, k)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                for row in 0..m {
-                    for s in 0..seq_len {
-                        out[s * m + row] = result[row * seq_len + s];
-                    }
-                }
-            }
-            GgmlDType::Q5_0 => {
-                let rows: Vec<usize> = (0..m).collect();
-                let result: Vec<f32> = rows
-                    .par_iter()
-                    .flat_map(|&row| {
-                        let w = entry.row_data(row);
-                        (0..seq_len)
-                            .map(|s| {
-                                let x_row = &input[s * k..(s + 1) * k];
-                                hearth_quant::dot_q5_0(w, x_row, k)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                for row in 0..m {
-                    for s in 0..seq_len {
-                        out[s * m + row] = result[row * seq_len + s];
-                    }
-                }
-            }
-            GgmlDType::Q5_1 => {
-                let rows: Vec<usize> = (0..m).collect();
-                let result: Vec<f32> = rows
-                    .par_iter()
-                    .flat_map(|&row| {
-                        let w = entry.row_data(row);
-                        (0..seq_len)
-                            .map(|s| {
-                                let x_row = &input[s * k..(s + 1) * k];
-                                hearth_quant::dot_q5_1(w, x_row, k)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                for row in 0..m {
-                    for s in 0..seq_len {
-                        out[s * m + row] = result[row * seq_len + s];
-                    }
-                }
-            }
-            GgmlDType::Q6_K => {
-                let rows: Vec<usize> = (0..m).collect();
-                let result: Vec<f32> = rows
-                    .par_iter()
-                    .flat_map(|&row| {
-                        let w = entry.row_data(row);
-                        (0..seq_len)
-                            .map(|s| {
-                                let x_row = &input[s * k..(s + 1) * k];
-                                hearth_quant::dot_q6_k(w, x_row, k)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                for row in 0..m {
-                    for s in 0..seq_len {
-                        out[s * m + row] = result[row * seq_len + s];
-                    }
-                }
-            }
-            _ => {
-                if row_buf.len() < k * m {
-                    row_buf.resize(k * m, 0.0f32);
-                }
-                hearth_quant::dequantize(entry.dtype, &entry.data, &mut row_buf[..k * m])
-                    .map_err(|e| format!("Dequant {}: {}", weight_name, e))?;
-
-                unsafe {
-                    matrixmultiply::sgemm(
-                        m,
-                        seq_len,
-                        k,
-                        1.0,
-                        row_buf.as_ptr(),
-                        k as isize,
-                        1,
-                        input.as_ptr(),
-                        1,
-                        k as isize,
-                        0.0,
-                        out.as_mut_ptr(),
-                        1,
-                        m as isize,
-                    );
-                }
+        } else {
+            for s in 0..seq_len {
+                self.matmul(
+                    weight_name,
+                    &input[s * k..(s + 1) * k],
+                    &mut out[s * m..(s + 1) * m],
+                    row_buf,
+                    0,
+                    None,
+                )?;
             }
         }
         Ok(())

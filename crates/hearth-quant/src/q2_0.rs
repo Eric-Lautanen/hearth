@@ -6,7 +6,7 @@ use core::arch::x86_64::*;
 const BLOCK_SIZE: usize = 128;
 const BLOCK_BYTES: usize = 34;
 
-/// Precomputed lookup: for each byte, extract 4 two-bit values → {-1, 0, 1, 2}
+/// Precomputed lookup: for each byte, extract 4 two-bit values → {-1, 0, 1, 2} as i8
 const Q2V: [[i8; 4]; 256] = {
     let mut table = [[0i8; 4]; 256];
     let mut b = 0usize;
@@ -15,6 +15,24 @@ const Q2V: [[i8; 4]; 256] = {
         while j < 4 {
             let q = (b >> (j * 2)) & 3;
             table[b][j] = (q as i8) - 1;
+            j += 1;
+        }
+        b += 1;
+    }
+    table
+};
+
+/// Pre-computed i16 LUT: same values as Q2V but sign-extended to i16.
+/// Eliminates `_mm256_cvtepi8_epi16` in the AVX2 dot kernel.
+/// 256 entries × 4 i16 × 2 bytes = 2 KB — stays hot in L1.
+const Q2V_I16: [[i16; 4]; 256] = {
+    let mut table = [[0i16; 4]; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut j = 0;
+        while j < 4 {
+            let q = (b >> (j * 2)) & 3;
+            table[b][j] = (q as i8 as i16) - 1;
             j += 1;
         }
         b += 1;
@@ -104,9 +122,8 @@ unsafe fn dot_q2_0_q8_0_lut_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -
     let mut acc_global = _mm256_setzero_ps();
     for b in 0..blocks {
         let w_off = b * BLOCK_BYTES;
-        let w_scale = _mm256_set1_ps(
-            f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32(),
-        );
+        let w_scale =
+            _mm256_set1_ps(f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32());
         let qs = w_ptr.add(w_off + 2);
 
         let mut acc_block = _mm256_setzero_ps();
@@ -123,26 +140,56 @@ unsafe fn dot_q2_0_q8_0_lut_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -
             {
                 let a0 = _mm_loadu_si128(a_vals as *const __m128i);
                 let a16_0 = _mm256_cvtepi8_epi16(a0);
-                let w_packed = [
-                    *(Q2V.as_ptr().add(*qs_sub as usize) as *const u32),
-                    *(Q2V.as_ptr().add(*qs_sub.add(1) as usize) as *const u32),
-                    *(Q2V.as_ptr().add(*qs_sub.add(2) as usize) as *const u32),
-                    *(Q2V.as_ptr().add(*qs_sub.add(3) as usize) as *const u32),
-                ];
-                let s0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(w_packed.as_ptr() as *const __m128i));
+                let idx0 = *qs_sub as usize;
+                let idx1 = *qs_sub.add(1) as usize;
+                let idx2 = *qs_sub.add(2) as usize;
+                let idx3 = *qs_sub.add(3) as usize;
+                let mut w_buf: [i16; 16] = [0i16; 16];
+                core::ptr::copy_nonoverlapping(Q2V_I16[idx0].as_ptr(), w_buf.as_mut_ptr(), 4);
+                core::ptr::copy_nonoverlapping(
+                    Q2V_I16[idx1].as_ptr(),
+                    w_buf.as_mut_ptr().add(4),
+                    4,
+                );
+                core::ptr::copy_nonoverlapping(
+                    Q2V_I16[idx2].as_ptr(),
+                    w_buf.as_mut_ptr().add(8),
+                    4,
+                );
+                core::ptr::copy_nonoverlapping(
+                    Q2V_I16[idx3].as_ptr(),
+                    w_buf.as_mut_ptr().add(12),
+                    4,
+                );
+                let s0 = _mm256_loadu_si256(w_buf.as_ptr() as *const __m256i);
                 acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a16_0, s0));
             }
 
             {
                 let a1 = _mm_loadu_si128(a_vals.add(16) as *const __m128i);
                 let a16_1 = _mm256_cvtepi8_epi16(a1);
-                let w_packed = [
-                    *(Q2V.as_ptr().add(*qs_sub.add(4) as usize) as *const u32),
-                    *(Q2V.as_ptr().add(*qs_sub.add(5) as usize) as *const u32),
-                    *(Q2V.as_ptr().add(*qs_sub.add(6) as usize) as *const u32),
-                    *(Q2V.as_ptr().add(*qs_sub.add(7) as usize) as *const u32),
-                ];
-                let s1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(w_packed.as_ptr() as *const __m128i));
+                let idx4 = *qs_sub.add(4) as usize;
+                let idx5 = *qs_sub.add(5) as usize;
+                let idx6 = *qs_sub.add(6) as usize;
+                let idx7 = *qs_sub.add(7) as usize;
+                let mut w_buf: [i16; 16] = [0i16; 16];
+                core::ptr::copy_nonoverlapping(Q2V_I16[idx4].as_ptr(), w_buf.as_mut_ptr(), 4);
+                core::ptr::copy_nonoverlapping(
+                    Q2V_I16[idx5].as_ptr(),
+                    w_buf.as_mut_ptr().add(4),
+                    4,
+                );
+                core::ptr::copy_nonoverlapping(
+                    Q2V_I16[idx6].as_ptr(),
+                    w_buf.as_mut_ptr().add(8),
+                    4,
+                );
+                core::ptr::copy_nonoverlapping(
+                    Q2V_I16[idx7].as_ptr(),
+                    w_buf.as_mut_ptr().add(12),
+                    4,
+                );
+                let s1 = _mm256_loadu_si256(w_buf.as_ptr() as *const __m256i);
                 acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a16_1, s1));
             }
 

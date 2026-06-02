@@ -83,10 +83,7 @@ pub fn load_weights(path: &Path) -> std::io::Result<ModelWeights> {
         let cols = read_u64(&mut r)? as usize;
         let byte_len = read_u32(&mut r)? as usize;
         let data = read_bytes(&mut r, byte_len)?;
-        tensors.insert(
-            name,
-            StoredTensor::Q2(Q2Tensor { rows, cols, data }),
-        );
+        tensors.insert(name, StoredTensor::Q2(Q2Tensor { rows, cols, data }));
     }
 
     let n_skip = read_u32(&mut r)? as usize;
@@ -105,7 +102,14 @@ pub fn load_weights(path: &Path) -> std::io::Result<ModelWeights> {
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
-                tensors.insert(name, StoredTensor::F32(F32Tensor { rows, cols, data: f32_data }));
+                tensors.insert(
+                    name,
+                    StoredTensor::F32(F32Tensor {
+                        rows,
+                        cols,
+                        data: f32_data,
+                    }),
+                );
             }
             1 => {
                 tensors.insert(name, StoredTensor::Bf16(Bf16Tensor { rows, cols, data }));

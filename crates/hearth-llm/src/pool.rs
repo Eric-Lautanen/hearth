@@ -1,8 +1,12 @@
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 pub type DotFn = unsafe fn(*const u8, *const u8, usize) -> f32;
+
+unsafe fn dummy_dot_fn(_w: *const u8, _a: *const u8, _n: usize) -> f32 {
+    0.0
+}
 
 pub struct WorkParams {
     pub n: usize,
@@ -16,8 +20,6 @@ pub struct WorkParams {
 
 struct Worker {
     handle: Option<thread::JoinHandle<()>>,
-    thread_handle: thread::Thread,
-    start_flag: Arc<AtomicBool>,
     done_flag: Arc<AtomicBool>,
 }
 
@@ -25,6 +27,7 @@ pub struct ThreadPool {
     workers: Vec<Worker>,
     params: Arc<AtomicPtr<WorkParams>>,
     _params_box: Box<WorkParams>,
+    gen: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     num_threads: usize,
 }
@@ -39,52 +42,60 @@ impl ThreadPool {
             out_ptr: 0,
             row_bytes: 0,
             n_cols: 0,
-            dot_fn: unsafe { std::mem::transmute::<usize, DotFn>(0) },
+            dot_fn: dummy_dot_fn,
         });
         let params = Arc::new(AtomicPtr::new(&mut *params_box));
+        let gen = Arc::new(AtomicU64::new(0));
 
         let mut workers = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
-            let start = Arc::new(AtomicBool::new(false));
             let done = Arc::new(AtomicBool::new(false));
-            let start_clone = start.clone();
             let done_clone = done.clone();
             let sd = shutdown.clone();
             let p = params.clone();
+            let g = gen.clone();
             let nt = num_threads;
             let handle = thread::spawn(move || {
+                let mut local_gen = 0u64;
+                let mut spins = 0u64;
                 loop {
-                    while !start_clone.load(Ordering::Acquire) {
+                    let cur_gen = g.load(Ordering::Acquire);
+                    if cur_gen != local_gen {
+                        local_gen = cur_gen;
+                        spins = 0;
                         if sd.load(Ordering::Acquire) {
                             return;
                         }
-                        thread::park();
-                    }
-                    if sd.load(Ordering::Acquire) {
-                        return;
-                    }
-                    let wp = unsafe { &*p.load(Ordering::Acquire) };
-                    let chunk = wp.n.div_ceil(nt);
-                    let begin = i * chunk;
-                    let end = (begin + chunk).min(wp.n);
-                    for row in begin..end {
-                        unsafe {
-                            *((wp.out_ptr + row * 4) as *mut f32) = (wp.dot_fn)(
-                                (wp.w_base + row * wp.row_bytes) as *const u8,
-                                wp.a_ptr as *const u8,
-                                wp.n_cols,
-                            );
+                        let wp = unsafe { &*p.load(Ordering::Relaxed) };
+                        let chunk = wp.n.div_ceil(nt);
+                        let begin = i * chunk;
+                        let end = (begin + chunk).min(wp.n);
+                        for row in begin..end {
+                            unsafe {
+                                *((wp.out_ptr + row * 4) as *mut f32) = (wp.dot_fn)(
+                                    (wp.w_base + row * wp.row_bytes) as *const u8,
+                                    wp.a_ptr as *const u8,
+                                    wp.n_cols,
+                                );
+                            }
+                        }
+                        done_clone.store(true, Ordering::Release);
+                    } else {
+                        if sd.load(Ordering::Acquire) {
+                            return;
+                        }
+                        spins += 1;
+                        if spins < 65536 {
+                            std::hint::spin_loop();
+                        } else {
+                            spins = 0;
+                            thread::yield_now();
                         }
                     }
-                    start_clone.store(false, Ordering::Relaxed);
-                    done_clone.store(true, Ordering::Release);
                 }
             });
-            let th = handle.thread().clone();
             workers.push(Worker {
                 handle: Some(handle),
-                thread_handle: th,
-                start_flag: start,
                 done_flag: done,
             });
         }
@@ -93,13 +104,10 @@ impl ThreadPool {
             workers,
             params,
             _params_box: params_box,
+            gen,
             shutdown,
             num_threads,
         }
-    }
-
-    pub fn num_threads(&self) -> usize {
-        self.num_threads
     }
 
     pub fn par_dot_rows(
@@ -141,11 +149,9 @@ impl ThreadPool {
         for w in &self.workers {
             w.done_flag.store(false, Ordering::Relaxed);
         }
-        std::sync::atomic::fence(Ordering::SeqCst);
-        for w in &self.workers {
-            w.start_flag.store(true, Ordering::Release);
-            w.thread_handle.unpark();
-        }
+        // Release store ensures the params write and done_flag reset are visible
+        // to workers that see the gen change via Acquire load.
+        self.gen.fetch_add(1, Ordering::Release);
         for w in &self.workers {
             while !w.done_flag.load(Ordering::Acquire) {
                 std::hint::spin_loop();
@@ -157,10 +163,6 @@ impl ThreadPool {
 impl Drop for ThreadPool {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        for w in &self.workers {
-            w.start_flag.store(true, Ordering::Release);
-            w.thread_handle.unpark();
-        }
         for mut w in self.workers.drain(..) {
             if let Some(h) = w.handle.take() {
                 let _ = h.join();

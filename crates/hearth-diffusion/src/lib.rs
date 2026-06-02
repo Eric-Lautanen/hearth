@@ -41,7 +41,9 @@ pub fn generate(
     }
 
     let mut img_seq = vec![0.0f32; seq_img * d];
-    let x_embedder = transformer.weights.bf16_as_f32("x_embedder")
+    let x_embedder = transformer
+        .weights
+        .bf16_as_f32("x_embedder")
         .unwrap_or_else(|| vec![0.0f32; d * in_c]);
     for s in 0..seq_img {
         let off_in = s * in_c;

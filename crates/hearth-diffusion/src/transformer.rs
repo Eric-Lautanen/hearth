@@ -1,19 +1,19 @@
-use crate::ops;
 use crate::attention;
+use crate::ops;
 use crate::weights::ModelWeights;
 
 pub struct FluxConfig {
-    pub d_model: usize,          // 3072
-    pub n_heads: usize,          // 24
-    pub head_dim: usize,         // 128
-    pub ffn_dim: usize,          // 9216
-    pub n_double_layers: usize,  // 5
-    pub n_single_layers: usize,  // 20
-    pub joint_dim: usize,        // 7680 (text context dim)
-    pub in_channels: usize,      // 128 (latent channels, patchified to d_model)
-    pub rope_theta: f32,         // 2000
-    pub axes_dims: Vec<usize>,   // [32, 32, 32, 32]
-    pub eps: f32,                // 1e-6
+    pub d_model: usize,         // 3072
+    pub n_heads: usize,         // 24
+    pub head_dim: usize,        // 128
+    pub ffn_dim: usize,         // 9216
+    pub n_double_layers: usize, // 5
+    pub n_single_layers: usize, // 20
+    pub joint_dim: usize,       // 7680 (text context dim)
+    pub in_channels: usize,     // 128 (latent channels, patchified to d_model)
+    pub rope_theta: f32,        // 2000
+    pub axes_dims: Vec<usize>,  // [32, 32, 32, 32]
+    pub eps: f32,               // 1e-6
 }
 
 impl Default for FluxConfig {
@@ -72,8 +72,15 @@ impl FluxTransformer {
 
         // Double-stream blocks
         for i in 0..self.cfg.n_double_layers {
-            let (new_img, new_txt) =
-                self.double_stream_block(i, &img_emb, &txt_emb, &pooled_proj, &t_full, img_h, img_w);
+            let (new_img, new_txt) = self.double_stream_block(
+                i,
+                &img_emb,
+                &txt_emb,
+                &pooled_proj,
+                &t_full,
+                img_h,
+                img_w,
+            );
             img_emb = new_img;
             txt_emb = new_txt;
         }
@@ -84,7 +91,16 @@ impl FluxTransformer {
 
         // Single-stream blocks
         for i in 0..self.cfg.n_single_layers {
-            hidden = self.single_stream_block(i, &hidden, &pooled_proj, &t_full, seq_img, seq_txt, img_h, img_w);
+            hidden = self.single_stream_block(
+                i,
+                &hidden,
+                &pooled_proj,
+                &t_full,
+                seq_img,
+                seq_txt,
+                img_h,
+                img_w,
+            );
         }
 
         // Split off img portion
@@ -97,15 +113,11 @@ impl FluxTransformer {
     fn time_embed(&self, t_emb: &[f32], _guidance: &[f32]) -> Vec<f32> {
         let d = self.cfg.d_model;
         // timestep_embedder: 256 → d
-        let mut x = self.linear_bf16_single_idx(
-            "time_guidance_embed.timestep_embedder.linear_1",
-            t_emb, d,
-        );
+        let mut x =
+            self.linear_bf16_single_idx("time_guidance_embed.timestep_embedder.linear_1", t_emb, d);
         ops::silu(&mut x);
-        let x = self.linear_bf16_single_idx(
-            "time_guidance_embed.timestep_embedder.linear_2",
-            &x, d,
-        );
+        let x =
+            self.linear_bf16_single_idx("time_guidance_embed.timestep_embedder.linear_2", &x, d);
         x
     }
 
@@ -122,28 +134,24 @@ impl FluxTransformer {
         let d = self.cfg.d_model;
 
         // Modulation
-        let mod_img = self.linear_bf16_single_idx(
-            "double_stream_modulation_img.linear",
-            t_emb,
-            6 * d,
-        );
-        let mod_txt = self.linear_bf16_single_idx(
-            "double_stream_modulation_txt.linear",
-            t_emb,
-            6 * d,
-        );
+        let mod_img =
+            self.linear_bf16_single_idx("double_stream_modulation_img.linear", t_emb, 6 * d);
+        let mod_txt =
+            self.linear_bf16_single_idx("double_stream_modulation_txt.linear", t_emb, 6 * d);
 
-        let (shift_img, scale_img, gate_img) = (
-            &mod_img[0..d], &mod_img[d..2 * d], &mod_img[2 * d..3 * d],
-        );
+        let (shift_img, scale_img, gate_img) =
+            (&mod_img[0..d], &mod_img[d..2 * d], &mod_img[2 * d..3 * d]);
         let (shift_mlp_img, scale_mlp_img, gate_mlp_img) = (
-            &mod_img[3 * d..4 * d], &mod_img[4 * d..5 * d], &mod_img[5 * d..6 * d],
+            &mod_img[3 * d..4 * d],
+            &mod_img[4 * d..5 * d],
+            &mod_img[5 * d..6 * d],
         );
-        let (shift_txt, scale_txt, gate_txt) = (
-            &mod_txt[0..d], &mod_txt[d..2 * d], &mod_txt[2 * d..3 * d],
-        );
+        let (shift_txt, scale_txt, gate_txt) =
+            (&mod_txt[0..d], &mod_txt[d..2 * d], &mod_txt[2 * d..3 * d]);
         let (shift_mlp_txt, scale_mlp_txt, gate_mlp_txt) = (
-            &mod_txt[3 * d..4 * d], &mod_txt[4 * d..5 * d], &mod_txt[5 * d..6 * d],
+            &mod_txt[3 * d..4 * d],
+            &mod_txt[4 * d..5 * d],
+            &mod_txt[5 * d..6 * d],
         );
 
         // --- Norm + modulate (img) ---
@@ -238,8 +246,12 @@ impl FluxTransformer {
         // rope_2d needs per-position encoding
         // For simplicity, use basic RoPE on img
         crate::ops::rope_2d(
-            &mut q_img_rope, &mut k_img_rope,
-            0, 0, head_dim, self.cfg.rope_theta,
+            &mut q_img_rope,
+            &mut k_img_rope,
+            0,
+            0,
+            head_dim,
+            self.cfg.rope_theta,
             &self.cfg.axes_dims,
         );
 
@@ -313,9 +325,15 @@ impl FluxTransformer {
         let mut img_ffn_normed = vec![0.0f32; img_seq * d];
         for s in 0..img_seq {
             let off = s * d;
-            ops::rms_norm(&new_img[off..off + d], &vec![1.0f32; d], self.cfg.eps, &mut img_ffn_normed[off..off + d]);
+            ops::rms_norm(
+                &new_img[off..off + d],
+                &vec![1.0f32; d],
+                self.cfg.eps,
+                &mut img_ffn_normed[off..off + d],
+            );
             for i in 0..d {
-                img_ffn_normed[off + i] = img_ffn_normed[off + i] * (1.0 + scale_mlp_img[i]) + shift_mlp_img[i];
+                img_ffn_normed[off + i] =
+                    img_ffn_normed[off + i] * (1.0 + scale_mlp_img[i]) + shift_mlp_img[i];
             }
         }
         let ffn_img_prefix = format!("transformer_blocks.{}.ff", idx);
@@ -330,7 +348,8 @@ impl FluxTransformer {
             for s in 0..img_seq {
                 let off = s * ffn_total;
                 gate[s * half..(s + 1) * half].copy_from_slice(&ffn_hidden[off..off + half]);
-                up[s * half..(s + 1) * half].copy_from_slice(&ffn_hidden[off + half..off + ffn_total]);
+                up[s * half..(s + 1) * half]
+                    .copy_from_slice(&ffn_hidden[off + half..off + ffn_total]);
             }
             ops::silu(&mut gate);
             for i in 0..gate.len() {
@@ -349,9 +368,15 @@ impl FluxTransformer {
         let mut txt_ffn_normed = vec![0.0f32; txt_seq * d];
         for s in 0..txt_seq {
             let off = s * d;
-            ops::rms_norm(&new_txt[off..off + d], &vec![1.0f32; d], self.cfg.eps, &mut txt_ffn_normed[off..off + d]);
+            ops::rms_norm(
+                &new_txt[off..off + d],
+                &vec![1.0f32; d],
+                self.cfg.eps,
+                &mut txt_ffn_normed[off..off + d],
+            );
             for i in 0..d {
-                txt_ffn_normed[off + i] = txt_ffn_normed[off + i] * (1.0 + scale_mlp_txt[i]) + shift_mlp_txt[i];
+                txt_ffn_normed[off + i] =
+                    txt_ffn_normed[off + i] * (1.0 + scale_mlp_txt[i]) + shift_mlp_txt[i];
             }
         }
         let ffn_txt_prefix = format!("transformer_blocks.{}.ff_context", idx);
@@ -365,7 +390,8 @@ impl FluxTransformer {
             for s in 0..txt_seq {
                 let off = s * ffn_total;
                 gate[s * half..(s + 1) * half].copy_from_slice(&ffn_hidden[off..off + half]);
-                up[s * half..(s + 1) * half].copy_from_slice(&ffn_hidden[off + half..off + ffn_total]);
+                up[s * half..(s + 1) * half]
+                    .copy_from_slice(&ffn_hidden[off + half..off + ffn_total]);
             }
             ops::silu(&mut gate);
             for i in 0..gate.len() {
@@ -398,18 +424,19 @@ impl FluxTransformer {
         let seq = seq_img + seq_txt;
 
         // Modulation
-        let mod_out = self.linear_bf16_single_idx(
-            "single_stream_modulation.linear",
-            t_emb,
-            3 * d,
-        );
+        let mod_out = self.linear_bf16_single_idx("single_stream_modulation.linear", t_emb, 3 * d);
         let (shift, scale, gate) = (&mod_out[0..d], &mod_out[d..2 * d], &mod_out[2 * d..3 * d]);
 
         // Norm + modulate
         let mut normed = vec![0.0f32; hidden.len()];
         for s in 0..seq {
             let off = s * d;
-            ops::rms_norm(&hidden[off..off + d], &vec![1.0f32; d], self.cfg.eps, &mut normed[off..off + d]);
+            ops::rms_norm(
+                &hidden[off..off + d],
+                &vec![1.0f32; d],
+                self.cfg.eps,
+                &mut normed[off..off + d],
+            );
             for i in 0..d {
                 normed[off + i] = normed[off + i] * (1.0 + scale[i]) + shift[i];
             }
@@ -417,7 +444,9 @@ impl FluxTransformer {
 
         // Combined QKV + MLP projection
         let prefix = format!("single_transformer_blocks.{}.attn", idx);
-        let proj_rows = self.weights.q2(&format!("{}.to_qkv_mlp_proj", prefix))
+        let proj_rows = self
+            .weights
+            .q2(&format!("{}.to_qkv_mlp_proj", prefix))
             .map(|w| w.rows)
             .unwrap_or(0);
         let mut qkv_mlp = vec![0.0f32; seq * proj_rows];
@@ -436,20 +465,26 @@ impl FluxTransformer {
         for s in 0..seq {
             let off = s * proj_rows;
             q_all[s * n_qkv..(s + 1) * n_qkv].copy_from_slice(&qkv_mlp[off..off + n_qkv]);
-            k_all[s * n_qkv..(s + 1) * n_qkv].copy_from_slice(&qkv_mlp[off + n_qkv..off + 2 * n_qkv]);
-            v_all[s * n_qkv..(s + 1) * n_qkv].copy_from_slice(&qkv_mlp[off + 2 * n_qkv..off + 3 * n_qkv]);
+            k_all[s * n_qkv..(s + 1) * n_qkv]
+                .copy_from_slice(&qkv_mlp[off + n_qkv..off + 2 * n_qkv]);
+            v_all[s * n_qkv..(s + 1) * n_qkv]
+                .copy_from_slice(&qkv_mlp[off + 2 * n_qkv..off + 3 * n_qkv]);
             gate_mlp[s * self.cfg.ffn_dim..(s + 1) * self.cfg.ffn_dim]
                 .copy_from_slice(&qkv_mlp[off + 3 * n_qkv..off + 3 * n_qkv + self.cfg.ffn_dim]);
-            up_mlp[s * self.cfg.ffn_dim..(s + 1) * self.cfg.ffn_dim]
-                .copy_from_slice(&qkv_mlp[off + 3 * n_qkv + self.cfg.ffn_dim..off + 3 * n_qkv + 2 * self.cfg.ffn_dim]);
+            up_mlp[s * self.cfg.ffn_dim..(s + 1) * self.cfg.ffn_dim].copy_from_slice(
+                &qkv_mlp
+                    [off + 3 * n_qkv + self.cfg.ffn_dim..off + 3 * n_qkv + 2 * self.cfg.ffn_dim],
+            );
         }
 
         // Apply RoPE to img portion Q and K
         crate::ops::rope_2d(
             &mut q_all[..seq_img * n_qkv],
             &mut k_all[..seq_img * n_qkv],
-            0, 0,
-            self.cfg.head_dim, self.cfg.rope_theta,
+            0,
+            0,
+            self.cfg.head_dim,
+            self.cfg.rope_theta,
             &self.cfg.axes_dims,
         );
 

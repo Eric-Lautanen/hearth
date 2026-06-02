@@ -63,6 +63,106 @@ pub fn rms_norm_gemma(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     }
 }
 
+/// Pre-computed sin/cos table for Rotary Position Embedding.
+/// Eliminates trig (sin_cos) and exponent (theta.powf) calls from the hot path.
+pub struct RopeCache {
+    data: Vec<f32>,
+    half: usize,
+    max_seq_len: usize,
+}
+
+impl RopeCache {
+    pub fn new(
+        max_seq_len: usize,
+        rope_dim: usize,
+        theta: f32,
+        scaling_type: Option<&str>,
+        scaling_factor: Option<f32>,
+        original_ctx_len: Option<u32>,
+    ) -> Self {
+        let half = rope_dim / 2;
+        let factor = scaling_factor.unwrap_or(1.0);
+        let orig_ctx = original_ctx_len.unwrap_or(2048) as f32;
+
+        let mut eff_rate = vec![1.0f32; half];
+        let mut mscale = 1.0f32;
+
+        match scaling_type {
+            Some("yarn") => {
+                let freq_scale = 1.0 / factor;
+                let n_dims = rope_dim as f32;
+                let corr_dim = |n_rot: f32| -> f32 {
+                    n_dims * (orig_ctx / (n_rot * 2.0 * std::f32::consts::PI)).ln()
+                        / (2.0 * theta.ln())
+                };
+                let corr_low = (corr_dim(32.0)).floor().max(0.0);
+                let corr_high = (corr_dim(1.0)).ceil().min(n_dims - 1.0);
+                for i in 0..half {
+                    let ramp_y = (i as f32 - corr_low) / (corr_high - corr_low).max(0.001);
+                    let ramp_mix = 1.0 - ramp_y.clamp(0.0, 1.0);
+                    eff_rate[i] = freq_scale * (1.0 - ramp_mix) + ramp_mix;
+                }
+                mscale = 1.0 + 0.1 * factor.ln();
+            }
+            Some("linear") if factor > 1.0 => {
+                let scale = 1.0 / factor;
+                for i in 0..half {
+                    eff_rate[i] = scale;
+                }
+            }
+            _ => {}
+        }
+
+        let mut inv_freq = vec![0.0f32; half];
+        for i in 0..half {
+            inv_freq[i] = 1.0 / theta.powf(2.0 * (i as f32) / rope_dim as f32);
+        }
+
+        let mut data = vec![0.0f32; max_seq_len * half * 2];
+        for pos in 0..max_seq_len {
+            for i in 0..half {
+                let freq = pos as f32 * eff_rate[i] * inv_freq[i];
+                let (sin, cos) = freq.sin_cos();
+                let base = pos * half * 2;
+                data[base + i] = sin * mscale;
+                data[base + half + i] = cos * mscale;
+            }
+        }
+
+        RopeCache {
+            data,
+            half,
+            max_seq_len,
+        }
+    }
+
+    pub fn apply(&self, x: &mut [f32], pos: usize) {
+        let half = self.half;
+        let base = (pos % self.max_seq_len) * half * 2;
+        let chunks = half / 8;
+        let rem = half % 8;
+        for i in 0..chunks {
+            let off = i * 8;
+            let vs = f32x8::from(&self.data[base + off..base + off + 8]);
+            let vc = f32x8::from(&self.data[base + half + off..base + half + off + 8]);
+            let vx0 = f32x8::from(&x[off..off + 8]);
+            let vx1 = f32x8::from(&x[off + half..off + half + 8]);
+            let r0 = vx0 * vc - vx1 * vs;
+            let r1 = vx0 * vs + vx1 * vc;
+            x[off..off + 8].copy_from_slice(&r0.to_array());
+            x[off + half..off + half + 8].copy_from_slice(&r1.to_array());
+        }
+        for i in half - rem..half {
+            let sin = self.data[base + i];
+            let cos = self.data[base + half + i];
+            let x0 = x[i];
+            let x1 = x[i + half];
+            x[i] = x0 * cos - x1 * sin;
+            x[i + half] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
 pub fn rope(
     x: &mut [f32],
     pos: usize,

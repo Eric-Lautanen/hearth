@@ -1,6 +1,13 @@
 use crate::ops;
 
-pub fn decode(latent: &[f32], latent_h: usize, latent_w: usize, in_c: usize, out_h: usize, out_w: usize) -> Vec<u8> {
+pub fn decode(
+    latent: &[f32],
+    latent_h: usize,
+    latent_w: usize,
+    in_c: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<u8> {
     // For now, use bilinear upscale + post-processing as a placeholder VAE.
     // The real FLUX VAE decoder requires Conv2d + GroupNorm + ResnetBlock + AttnBlock weights.
     stub_decode(latent, latent_h, latent_w, in_c, out_h, out_w)
@@ -30,9 +37,17 @@ fn stub_decode(latent: &[f32], lh: usize, lw: usize, c: usize, h: usize, w: usiz
 
     // Apply a simple 3×3 convolution to smooth (no learned weights - just averaging)
     let mut smoothed = vec![0.0f32; h * w * 3];
-    let kernel: [f32; 9] = [1.0/16.0, 2.0/16.0, 1.0/16.0,
-                             2.0/16.0, 4.0/16.0, 2.0/16.0,
-                             1.0/16.0, 2.0/16.0, 1.0/16.0];
+    let kernel: [f32; 9] = [
+        1.0 / 16.0,
+        2.0 / 16.0,
+        1.0 / 16.0,
+        2.0 / 16.0,
+        4.0 / 16.0,
+        2.0 / 16.0,
+        1.0 / 16.0,
+        2.0 / 16.0,
+        1.0 / 16.0,
+    ];
 
     for y in 0..h {
         for x in 0..w {
@@ -90,7 +105,15 @@ impl VaeDecoder {
 }
 
 #[allow(dead_code)]
-fn group_norm(x: &mut [f32], weight: &[f32], bias: &[f32], n_groups: usize, c: usize, hw: usize, eps: f32) {
+fn group_norm(
+    x: &mut [f32],
+    weight: &[f32],
+    bias: &[f32],
+    n_groups: usize,
+    c: usize,
+    hw: usize,
+    eps: f32,
+) {
     let c_per_group = c / n_groups;
     for g in 0..n_groups {
         let c_start = g * c_per_group;
@@ -114,12 +137,21 @@ fn group_norm(x: &mut [f32], weight: &[f32], bias: &[f32], n_groups: usize, c: u
 
 #[allow(dead_code)]
 fn resnet_block(
-    x: &[f32], h: usize, w: usize, in_ch: usize, out_ch: usize,
-    norm1_w: &[f32], norm1_b: &[f32],
-    conv1_w: &[f32], conv1_b: &[f32],
-    norm2_w: &[f32], norm2_b: &[f32],
-    conv2_w: &[f32], conv2_b: &[f32],
-    shortcut_w: Option<&[f32]>, shortcut_b: Option<&[f32]>,
+    x: &[f32],
+    h: usize,
+    w: usize,
+    in_ch: usize,
+    out_ch: usize,
+    norm1_w: &[f32],
+    norm1_b: &[f32],
+    conv1_w: &[f32],
+    conv1_b: &[f32],
+    norm2_w: &[f32],
+    norm2_b: &[f32],
+    conv2_w: &[f32],
+    conv2_b: &[f32],
+    shortcut_w: Option<&[f32]>,
+    shortcut_b: Option<&[f32]>,
 ) -> Vec<f32> {
     let hw = h * w;
     let n_groups = 32;
@@ -127,12 +159,16 @@ fn resnet_block(
     // norm1 → SiLU → conv1
     let mut h_out = x.to_vec();
     group_norm(&mut h_out, norm1_w, norm1_b, n_groups, in_ch, hw, 1e-6);
-    for v in h_out.iter_mut() { *v = *v / (1.0 + (-*v).exp()); }
+    for v in h_out.iter_mut() {
+        *v = *v / (1.0 + (-*v).exp());
+    }
     h_out = ops::conv2d_3x3(&h_out, conv1_w, conv1_b, h, w, in_ch, out_ch);
 
     // norm2 → SiLU → conv2
     group_norm(&mut h_out, norm2_w, norm2_b, n_groups, out_ch, hw, 1e-6);
-    for v in h_out.iter_mut() { *v = *v / (1.0 + (-*v).exp()); }
+    for v in h_out.iter_mut() {
+        *v = *v / (1.0 + (-*v).exp());
+    }
     h_out = ops::conv2d_3x3(&h_out, conv2_w, conv2_b, h, w, out_ch, out_ch);
 
     // Shortcut

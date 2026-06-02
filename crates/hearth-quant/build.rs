@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(msvc_kernel)");
     let feature = std::env::var("CARGO_FEATURE_MSVC_KERNEL");
     if feature.is_err() {
         return;

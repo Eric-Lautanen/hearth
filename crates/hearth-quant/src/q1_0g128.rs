@@ -569,49 +569,8 @@ pub unsafe fn dot_q1_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
     }
 }
 
-/// LUT-based AVX2 kernel: accumulate all blocks via FMA, single hsum per row.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn dot_q1_0g128_q8_0_lut_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
-    let q1_blocks = n / 128;
-    let mut acc_global = _mm256_setzero_ps();
-    for b in 0..q1_blocks {
-        let w_off = b * 18;
-        let w_scale = _mm256_set1_ps(
-            f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32(),
-        );
-        let w_bits = w_ptr.add(w_off + 2);
-        let mut acc_block = _mm256_setzero_ps();
-        for q8_sub in 0..4 {
-            let a_off = (b * 4 + q8_sub) * 34;
-            let a_scale = _mm256_set1_ps(
-                f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32(),
-            );
-            let a_vals = a_ptr.add(a_off + 2);
-            let bs = w_bits.add(q8_sub * 4);
-            let mut acc = _mm256_setzero_si256();
-            let a0 = _mm_loadu_si128(a_vals as *const __m128i);
-            let a16_0 = _mm256_cvtepi8_epi16(a0);
-            let s0 = _mm256_cvtepi8_epi16(_mm_unpacklo_epi64(
-                _mm_loadl_epi64(Q1V[*bs as usize].as_ptr() as *const __m128i),
-                _mm_loadl_epi64(Q1V[*bs.add(1) as usize].as_ptr() as *const __m128i),
-            ));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a16_0, s0));
-            let a1 = _mm_loadu_si128(a_vals.add(16) as *const __m128i);
-            let a16_1 = _mm256_cvtepi8_epi16(a1);
-            let s1 = _mm256_cvtepi8_epi16(_mm_unpacklo_epi64(
-                _mm_loadl_epi64(Q1V[*bs.add(2) as usize].as_ptr() as *const __m128i),
-                _mm_loadl_epi64(Q1V[*bs.add(3) as usize].as_ptr() as *const __m128i),
-            ));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a16_1, s1));
-            acc_block = _mm256_fmadd_ps(a_scale, _mm256_cvtepi32_ps(acc), acc_block);
-        }
-        acc_global = _mm256_fmadd_ps(w_scale, acc_block, acc_global);
-    }
-    hsum_float_8(acc_global)
-}
-
 /// Dispatch: dot_q1_0g128_q8_0 using raw pointers (no slice bounds checks).
+/// Uses shuffle-based AVX2 kernel (no LUT, avoids L1 cache pressure).
 /// # Safety
 /// Both pointers must be valid for n/128*18 (w_ptr) and n/32*34 (a_ptr) bytes.
 /// n must be a multiple of 128.
@@ -620,7 +579,7 @@ pub unsafe fn dot_q1_0g128_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
-            dot_q1_0g128_q8_0_lut_avx2(w_ptr, a_ptr, n)
+            dot_q1_0g128_q8_0_ptr_avx2(w_ptr, a_ptr, n)
         } else {
             dot_q1_0g128_q8_0_ptr_sse41(w_ptr, a_ptr, n)
         }
@@ -762,6 +721,58 @@ fn dot_q1_0g128_q8_0_scalar(weight_row: &[u8], act_data: &[u8], n: usize) -> f32
 mod tests {
     use super::*;
     use crate::q8_0;
+    use std::time::Instant;
+
+    /// Microbenchmark the active shuffle AVX2 kernel across model dimensions
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn bench_shuffle_kernel() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("Skipping AVX2 benchmark (no AVX2)");
+            return;
+        }
+        let dims = [2048usize, 4096, 2560, 9728];
+        let iters = 5_000;
+
+        for &n in &dims {
+            let n_blocks = n / 128;
+            let mut w = vec![0u8; n_blocks * 18];
+            let mut a = vec![0u8; n_blocks * 4 * 34];
+
+            for b in 0..n_blocks {
+                let bo = b * 18;
+                let scale = ((b as f32 + 1.0) * 0.1).sin().abs() * 0.5 + 0.01;
+                let s = half::f16::from_f32(scale).to_le_bytes();
+                w[bo] = s[0];
+                w[bo + 1] = s[1];
+                for j in 0..16 {
+                    w[bo + 2 + j] = ((b * 16 + j).wrapping_mul(37) ^ 0xAB) as u8;
+                }
+            }
+            for b in 0..n_blocks * 4 {
+                let bo = b * 34;
+                let scale = ((b as f32 + 1.0) * 0.05).cos().abs() * 0.5 + 0.01;
+                let s = half::f16::from_f32(scale).to_le_bytes();
+                a[bo] = s[0];
+                a[bo + 1] = s[1];
+                for j in 0..32 {
+                    a[bo + 2 + j] = ((b * 32 + j).wrapping_mul(53) ^ 0xCD) as u8;
+                }
+            }
+
+            unsafe {
+                let _ = dot_q1_0g128_q8_0_ptr_avx2(w.as_ptr(), a.as_ptr(), n);
+            }
+
+            let t0 = Instant::now();
+            let mut sum = 0.0f32;
+            for _ in 0..iters {
+                sum += unsafe { dot_q1_0g128_q8_0_ptr_avx2(w.as_ptr(), a.as_ptr(), n) };
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / iters as f64;
+            eprintln!("n={:5}: Shuffle={:7.1}ns  (sum={})", n, ns, sum);
+        }
+    }
 
     #[test]
     fn test_q1_0_dequantize() {
