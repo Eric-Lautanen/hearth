@@ -8,6 +8,7 @@ members = [
     "crates/hearth-sampler",
     "crates/hearth-llm",
     "crates/hearth-compute",
+    "crates/hearth-diffusion",
 ]
 
 [workspace.dependencies]

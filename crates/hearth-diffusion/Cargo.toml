@@ -1,0 +1,19 @@
+[package]
+name = "hearth-diffusion"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hearth-diffuse"
+path = "src/bin/hearth-diffuse.rs"
+
+[dependencies]
+hearth-quant = { workspace = true }
+hearth-gguf = { workspace = true }
+hearth-llm = { workspace = true }
+hearth-tokenizer = { workspace = true }
+hearth-core = { workspace = true }
+half = { workspace = true }
+bytemuck = { workspace = true }
+memmap2 = { workspace = true }
+rayon = { workspace = true }

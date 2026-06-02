@@ -730,7 +730,7 @@ impl LlamaModel {
         };
         need(&mut bs.hidden, seq_len * d);
         need(&mut bs.residual, seq_len * d);
-        need(&mut bs.attn_out, seq_len * d);
+        need(&mut bs.attn_out, seq_len * nq);
         need(&mut bs.q_buf, seq_len * nq);
         need(&mut bs.k_buf, seq_len * nkv);
         need(&mut bs.v_buf, seq_len * nkv);
@@ -947,7 +947,7 @@ impl LlamaModel {
                     n_kv_heads,
                     head_dim,
                     max_seq,
-                    &mut bs.attn_out[..seq_len * d],
+                    &mut bs.attn_out[..seq_len * nq],
                     &mut bs.attn_scores,
                 );
             } else {
@@ -960,18 +960,18 @@ impl LlamaModel {
                     n_kv_heads,
                     head_dim,
                     max_seq,
-                    &mut bs.attn_out[..seq_len * d],
+                    &mut bs.attn_out[..seq_len * nq],
                     &mut bs.attn_scores,
                 );
             }
 
             self.matmul_batch(
                 &format!("{}.attn_output.weight", p),
-                &bs.attn_out[..seq_len * d],
+                &bs.attn_out[..seq_len * nq],
                 &mut bs.q_buf[..seq_len * d],
                 rb,
                 d,
-                d,
+                nq,
                 seq_len,
             )?;
             for i in 0..seq_len * d {
@@ -1058,6 +1058,314 @@ impl LlamaModel {
         Ok(())
     }
 
+    pub fn encode_text(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let seq_len = tokens.len();
+        if seq_len == 0 {
+            return Err("Empty token sequence".into());
+        }
+        let d = self.config.d_model as usize;
+        let n_layers = self.config.n_layers as usize;
+        let n_heads = self.config.n_heads as usize;
+        let n_kv_heads = self.config.n_kv_heads as usize;
+        let head_dim = self.config.head_dim as usize;
+        let ffn_dim = self.config.d_ffn as usize;
+        let nq = n_heads * head_dim;
+        let nkv = n_kv_heads * head_dim;
+        let max_seq = self.config.max_seq_len as usize;
+        let scaling_type = self.config.rope_scaling_type.as_deref();
+        let scaling_factor = self.config.rope_scaling_factor;
+        let orig_ctx = self.config.original_ctx_len;
+
+        let mut caches: Vec<KVCache> = (0..n_layers)
+            .map(|_| {
+                KVCache::new_with_storage(
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    KVStorage::F32,
+                )
+            })
+            .collect();
+
+        let mut bs = BatchScratch {
+            hidden: Vec::new(),
+            residual: Vec::new(),
+            attn_out: Vec::new(),
+            q_buf: Vec::new(),
+            k_buf: Vec::new(),
+            v_buf: Vec::new(),
+            q_heads: Vec::new(),
+            k_heads: Vec::new(),
+            v_heads: Vec::new(),
+            gate: Vec::new(),
+            up: Vec::new(),
+            ffn_tmp: Vec::new(),
+            norm_tmp: Vec::new(),
+            attn_scores: Vec::new(),
+        };
+        let mut rb = self.row_buf.lock().unwrap().clone();
+        self.ensure_batch_size(&mut bs, seq_len, d, nq, nkv, ffn_dim, max_seq);
+
+        {
+            let entry = self
+                .tensors
+                .get("token_embd.weight")
+                .ok_or_else(|| "Missing token_embd.weight".to_string())?;
+            let n = entry.n_cols().min(d);
+            for (s, &tid) in tokens.iter().enumerate() {
+                let token_id = tid as usize;
+                let row = &mut bs.hidden[s * d..(s + 1) * d];
+                row[..d].fill(0.0f32);
+                if token_id < entry.n_rows() {
+                    hearth_quant::dequantize(entry.dtype, entry.row_data(token_id), &mut row[..n])
+                        .map_err(|e| format!("Embed dequant: {}", e))?;
+                }
+                if self.config.embed_scale {
+                    let scale = (d as f32).sqrt();
+                    for v in row[..d].iter_mut() {
+                        *v *= scale;
+                    }
+                }
+            }
+        }
+
+        for layer in 0..n_layers {
+            let p = format!("blk.{}", layer);
+
+            bs.norm_tmp[..seq_len * d].copy_from_slice(&bs.hidden[..seq_len * d]);
+            let attn_norm = self.get_1d(&format!("{}.attn_norm.weight", p), d)?;
+            self.norm_batch(
+                &bs.norm_tmp[..seq_len * d],
+                attn_norm,
+                self.config.rms_norm_eps,
+                &mut bs.residual[..seq_len * d],
+                seq_len,
+                d,
+            );
+
+            self.matmul_batch(
+                &format!("{}.attn_q.weight", p),
+                &bs.residual[..seq_len * d],
+                &mut bs.q_buf[..seq_len * nq],
+                &mut rb,
+                nq,
+                d,
+                seq_len,
+            )?;
+            self.matmul_batch(
+                &format!("{}.attn_k.weight", p),
+                &bs.residual[..seq_len * d],
+                &mut bs.k_buf[..seq_len * nkv],
+                &mut rb,
+                nkv,
+                d,
+                seq_len,
+            )?;
+            self.matmul_batch(
+                &format!("{}.attn_v.weight", p),
+                &bs.residual[..seq_len * d],
+                &mut bs.v_buf[..seq_len * nkv],
+                &mut rb,
+                nkv,
+                d,
+                seq_len,
+            )?;
+
+            bs.q_heads[..seq_len * nq].copy_from_slice(&bs.q_buf[..seq_len * nq]);
+            bs.k_heads[..seq_len * nkv].copy_from_slice(&bs.k_buf[..seq_len * nkv]);
+            bs.v_heads[..seq_len * nkv].copy_from_slice(&bs.v_buf[..seq_len * nkv]);
+
+            if self.tensors.contains_key(&format!("{}.attn_q_norm.weight", p)) {
+                let q_norm = self.get_1d(&format!("{}.attn_q_norm.weight", p), head_dim)?;
+                for s in 0..seq_len {
+                    for h in 0..n_heads {
+                        let off = s * nq + h * head_dim;
+                        let tmp = bs.q_heads[off..off + head_dim].to_vec();
+                        self.norm(&tmp, q_norm, self.config.rms_norm_eps, &mut bs.q_heads[off..off + head_dim]);
+                    }
+                }
+            }
+            if self.tensors.contains_key(&format!("{}.attn_k_norm.weight", p)) {
+                let k_norm = self.get_1d(&format!("{}.attn_k_norm.weight", p), head_dim)?;
+                for s in 0..seq_len {
+                    for h in 0..n_kv_heads {
+                        let off = s * nkv + h * head_dim;
+                        let tmp = bs.k_heads[off..off + head_dim].to_vec();
+                        self.norm(&tmp, k_norm, self.config.rms_norm_eps, &mut bs.k_heads[off..off + head_dim]);
+                    }
+                }
+            }
+
+            let rope_dim = self.config.rope_dim as usize;
+            for s in 0..seq_len {
+                let pos = s;
+                for h in 0..n_heads {
+                    let off = s * nq + h * head_dim;
+                    ops::rope(
+                        &mut bs.q_heads[off..off + rope_dim],
+                        pos,
+                        rope_dim,
+                        self.config.rope_theta,
+                        scaling_type,
+                        scaling_factor,
+                        orig_ctx,
+                    );
+                }
+                for h in 0..n_kv_heads {
+                    let off = s * nkv + h * head_dim;
+                    ops::rope(
+                        &mut bs.k_heads[off..off + rope_dim],
+                        pos,
+                        rope_dim,
+                        self.config.rope_theta,
+                        scaling_type,
+                        scaling_factor,
+                        orig_ctx,
+                    );
+                }
+            }
+
+            for s in 0..seq_len {
+                for h in 0..n_kv_heads {
+                    let k_off = s * nkv + h * head_dim;
+                    let v_off = s * nkv + h * head_dim;
+                    caches[layer].write_kv(
+                        s,
+                        h,
+                        &bs.k_heads[k_off..k_off + head_dim],
+                        &bs.v_heads[v_off..v_off + head_dim],
+                    );
+                }
+            }
+
+            if caches[layer].is_q8_0() {
+                let kv_total = n_kv_heads * max_seq * head_dim;
+                if bs.k_heads.len() < kv_total {
+                    bs.k_heads.resize(kv_total, 0.0f32);
+                }
+                if bs.v_heads.len() < kv_total {
+                    bs.v_heads.resize(kv_total, 0.0f32);
+                }
+                for h in 0..n_kv_heads {
+                    let ks = caches[layer].k_slice_dequant(h, seq_len).to_vec();
+                    let vs = caches[layer].v_slice_dequant(h, seq_len).to_vec();
+                    let k_off = h * max_seq * head_dim;
+                    let v_off = h * max_seq * head_dim;
+                    bs.k_heads[k_off..k_off + seq_len * head_dim].copy_from_slice(&ks);
+                    bs.v_heads[v_off..v_off + seq_len * head_dim].copy_from_slice(&vs);
+                }
+                ops::attention_batch(
+                    &bs.q_heads[..seq_len * nq],
+                    &bs.k_heads,
+                    &bs.v_heads,
+                    seq_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    &mut bs.attn_out[..seq_len * nq],
+                    &mut bs.attn_scores,
+                );
+            } else {
+                ops::attention_batch(
+                    &bs.q_heads[..seq_len * nq],
+                    &caches[layer].k,
+                    &caches[layer].v,
+                    seq_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    &mut bs.attn_out[..seq_len * nq],
+                    &mut bs.attn_scores,
+                );
+            }
+
+            self.matmul_batch(
+                &format!("{}.attn_output.weight", p),
+                &bs.attn_out[..seq_len * nq],
+                &mut bs.q_buf[..seq_len * d],
+                &mut rb,
+                d,
+                nq,
+                seq_len,
+            )?;
+            for i in 0..seq_len * d {
+                bs.hidden[i] += bs.q_buf[i];
+            }
+
+            bs.norm_tmp[..seq_len * d].copy_from_slice(&bs.hidden[..seq_len * d]);
+            let ffn_norm = self.get_1d(&format!("{}.ffn_norm.weight", p), d)?;
+            self.norm_batch(
+                &bs.norm_tmp[..seq_len * d],
+                ffn_norm,
+                self.config.rms_norm_eps,
+                &mut bs.residual[..seq_len * d],
+                seq_len,
+                d,
+            );
+
+            self.matmul_batch(
+                &format!("{}.ffn_gate.weight", p),
+                &bs.residual[..seq_len * d],
+                &mut bs.gate[..seq_len * ffn_dim],
+                &mut rb,
+                ffn_dim,
+                d,
+                seq_len,
+            )?;
+            self.matmul_batch(
+                &format!("{}.ffn_up.weight", p),
+                &bs.residual[..seq_len * d],
+                &mut bs.up[..seq_len * ffn_dim],
+                &mut rb,
+                ffn_dim,
+                d,
+                seq_len,
+            )?;
+
+            for s in 0..seq_len {
+                let off = s * ffn_dim;
+                ops::silu(&mut bs.gate[off..off + ffn_dim]);
+                ops::mul_elem(
+                    &bs.gate[off..off + ffn_dim],
+                    &bs.up[off..off + ffn_dim],
+                    &mut bs.ffn_tmp[off..off + ffn_dim],
+                );
+            }
+
+            self.matmul_batch(
+                &format!("{}.ffn_down.weight", p),
+                &bs.ffn_tmp[..seq_len * ffn_dim],
+                &mut bs.q_buf[..seq_len * d],
+                &mut rb,
+                d,
+                ffn_dim,
+                seq_len,
+            )?;
+            for i in 0..seq_len * d {
+                bs.hidden[i] += bs.q_buf[i];
+            }
+        }
+
+        let out_norm = self.get_1d("output_norm.weight", d)?;
+        let mut hidden_states = vec![0.0f32; seq_len * d];
+        for s in 0..seq_len {
+            let off = s * d;
+            let tmp = bs.hidden[off..off + d].to_vec();
+            self.norm(&tmp, out_norm, self.config.rms_norm_eps, &mut hidden_states[off..off + d]);
+        }
+
+        let pooled: Vec<f32> = (0..d)
+            .map(|i| {
+                let sum: f32 = (0..seq_len).map(|s| hidden_states[s * d + i]).sum();
+                sum / seq_len as f32
+            })
+            .collect();
+
+        Ok((hidden_states, pooled))
+    }
+
     #[allow(dead_code)]
     fn prefill_batch(
         &self,
@@ -1069,6 +1377,10 @@ impl LlamaModel {
         rb: &mut Vec<f32>,
     ) -> Result<(), String> {
         self.forward_batch(prompt_ids, caches, logits, cancel, bs, rb)
+    }
+
+    pub fn tokenizer(&self) -> &std::sync::Mutex<hearth_tokenizer::Tokenizer> {
+        &self.tokenizer
     }
 
     pub fn template_kind(&self) -> hearth_tokenizer::TemplateKind {
