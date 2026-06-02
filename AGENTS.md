@@ -2,7 +2,13 @@
 
 > **Date**: 2026-05 — my training data snapshot may be stale. Use web search tools (`rust-search_*`) liberally for latest papers, code improvements, quantization formats, and LLM inference optimizations. Don't guess — search.
 
-***ALWAYS*** keep bug reports updated and compilation errors and warnings clean.  NEVER USE allow blocks!
+***ALWAYS*** keep bug reports updated and compilation errors and warnings clean.  NEVER USE allow blocks!  NEVER git commit/push unless explicitly asked — this is a working copy, not a shared repo.
+
+**IMPORTANT: Never run tests in parallel (`cargo test` without `--test-threads=1`).** The quant tests share global LUT arrays (`Q2V`, `Q1V`) and race on initialization if run concurrently, producing flaky failures.
+
+**IMPORTANT: Never push code to github.  Only use git for diffs if noticable performance degredation.
+
+**IMPORTANT: ALWAYS update BUG_TRACKER.md and at the end of each session completely rewrite RESUME.MD with things to try during the next session!!!
 
 ## Key paths
 - Repo: `C:\Users\ericl\Documents\hearth`
@@ -54,9 +60,11 @@
 ```powershell
 cargo clean if need be
 cargo check/build --release
-cargo test -p hearth-quant
+cargo test --test-threads=1 -p hearth-quant
 cargo fmt
 ```
+
+
 
 ## Key ref implementation files (Prism fork)
 - `ggml/src/ggml-common.h` — block structs (Q1_0, Q2_0, Q8_0, etc.)
@@ -94,7 +102,7 @@ After quant kernel changes:
 cargo check -p hearth-quant
 cargo clippy -p hearth-quant -- -D warnings
 cargo fmt --check
-cargo test -p hearth-quant
+cargo test --test-threads=1 -p hearth-quant
 cargo build --release
 ```
 After any LLM change also check `cargo check -p hearth-llm` (pre-existing clippy warnings in GPU stubs are OK).

@@ -1,85 +1,65 @@
-# Continue session: Hearth perf optimization
+# Session 5 Resume — Results from performance_ops.md
 
-> **⚠️ BOTH Q1_0 AND Q2_0 ARE CRITICAL TARGETS.** Work on both models.
-> Every change must be benchmarked against both. Do NOT optimize for one at the expense of the other.
+Cross-referenced 12 opportunities against `BUG_TRACKER.md`. 5 done, 7 not tried.
 
-Read `AGENTS.md` and `BUG_perf_1.7B_models.md` first.
+## Done (from performance_ops.md)
 
-## Current state (2026-06-02, session 2 final)
+| # | Opportunity | Gain | Status |
+|---|---|---|---|
+| 1 | Scratch Q8 buffer reuse | 5-10% (neutral) | Sess 3 — `ForwardScratch` reuse |
+| 3 | KV cache `.to_vec()` removal | 2-5% (+29% on 4B) | Sess 3 — `k_slice_dequant_into` |
+| 4 | Gen counter spin-wait (was Option B) | 5-15% (+33%) | Sess 3 — replaced park/unpark |
+| 5 | **Batched prefill for prompt processing** | **10-22% TTFT** | **Sess 5 — DONE** |
+| 7 | Shuffle-based Q1_0 AVX2 kernel | 5-15% (+25%) | Sess 3 — `dot_q1_0g128_q8_0_ptr_avx2` |
 
-| Model  | Hearth | Reference | Delta  | Forward pass |
-|--------|--------|-----------|--------|-------------|
-| Q1_0   | **34.4** | 32.0    | **+7.5%** | 29.1ms |
-| Q2_0   | **27.2** | 5.1     | **+433%** | 36.8ms |
+## Batched prefill results (Session 5)
 
-**Hearth now BEATS the reference on Q1_0! Q1_0: 18.7→34.4 tok/s (+84%). Q2_0: 17.4→27.2 tok/s (+56%).**
+**Achievements:**
+- Wired `forward_batch()` into `generate_text()` for CPU multi-token prompts
+- Replaced f32-activation rayon matmul with Q8_0 quantized activations + custom ThreadPool
+- Pre-allocated KV cache (`KVCache::new` now allocates full-size `k`/`v` vectors at construction, eliminating per-layer 256MB resizes in `write_kv`)
+- Sequential quantize (removed rayon contention with pool spinners)
 
-1-thread: Hearth Q1_0 5.8 tok/s vs Ref 7.3 tok/s → kernel codegen gap persists at 1.26×.
-But custom thread pool parallel scaling: 19.0→34.4 tok/s — 5.93× scaling (was 3.26× with Rayon).
+**4B Q1_0 benchmarks (7-token prefill → 50 decode tokens):**
+| Config | Prefill (7t) | Total (57t) | Tok/s |
+|---|---|---|---|
+| Baseline (single-token, pre-alloc KV) | ~322ms (7×46ms) | ~3013ms | 18.9 |
+| Batched (Q8_0 matmul, pre-alloc KV) | 264-420ms (38-60ms/tok) | 3213-3589ms | 15.9-17.7 |
+| Batched (NO pre-alloc KV) | 1305-1750ms | 5191-6418ms | 6.4-11.0 |
 
-## What worked (this session, 2026-06-02)
+**Key insight:** KV cache resize was the dominant bottleneck — each `write_kv` first call did `resize(total, 0.0f32)` for 128MB K + 128MB V (256MB zeroing per layer = 9.2GB total). Pre-allocating at construction time eliminated this, reducing per-layer time from 33→103ms (growing) to stable 5-7ms.
 
-### 7. 🔴🔴 Custom thread pool via `thread::park`/`unpark` — GAME CHANGER (+55% Q1_0, +49% Q2_0)
-Replaced all Rayon parallel dispatch with a custom `ThreadPool` using `thread::park`/`unpark` for worker signaling.
-- Workers sleep via `thread::park()` between matmuls, consuming 0% CPU idle
-- Main thread writes `WorkParams` to shared memory, signals workers via `unpark()`, spin-waits on done flags
-- Zero allocation per dispatch — `WorkParams` is just 7× `usize` + function pointer written to a pre-allocated box
-- All matmul closures decomposed into uniform `par_dot_rows(w_base, a_ptr, out_ptr, ...)` calls
+## Not tried — ranked by estimated impact
 
-Key files: `crates/hearth-llm/src/pool.rs` (new), `crates/hearth-llm/src/model/matmul.rs` (converted all Q1_0/Q2_0/Q8_0 paths)
+### 1. Fuse attn_out quant into attention kernel [Tier 1, #2]
+**Est:** 3-5%
+**Files:** `ops.rs:215`, `mod.rs:562-574`
+**What:** `attn_out` is computed in `ops::attention()` then separately quantized to Q8_0. Fuse quant into the attention value-accumulation step — avoid the separate pass.
+**Caveat:** Q2_0 models use Q2_0×Q8_0 matmul for attn_output, so the quant is Q8_0. Q1_0 models use Q1_0×Q8_0. Both need the activation in Q8_0 format. The fusion would write Q8_0 blocks directly during attention output accumulation.
 
-Root cause of Rayon's scaling gap: `rayon::broadcast` uses internal barriers that require thread wake-up synchronization. Custom pool keeps threads parked (0% CPU) and unpark has sub-µs latency. With 197 dispatches per forward pass, the cumulative savings are ~15ms/token.
+### 2. SIMD RoPE with precomputed sin/cos [Tier 2, #6]
+**Est:** 2-4%
+**File:** `ops.rs:66-135`
+**What:** Current RoPE uses per-element `sin_cos()` + scalar multiply-add. Precompute sin/cos tables at load time for all positions up to `max_seq_len`. Apply rotation via `f32x8` (one `wide` load per 8 complex pairs). Same pattern as `ggml_rope_ext`. head_dim=128, 36 layers.
 
-### 6. Q1_0/Q2_0 kernel hsum optimization (marginal)
-Changed inner kernels to accumulate f32 across all Q1_0/Q2_0 blocks using `_mm256_fmadd_ps` instead of per-block scalar `hsum_float_8` + multiply + accumulate. Single hsum at end of row. Within noise range but cleaner code.
+### 3. Pre-expand weight rows to sign arrays [Tier 3, #8]
+**Est:** 15-25% on small models
+**What:** At load time, expand Q1_0 weight rows from bit-packed 18B/128el to raw i8 sign arrays (128B/block). 8× memory trade (e.g., 1.7B Q1_0: 37MB→265MB). Eliminates all bit-unpacking from hot loop.
 
-### What didn't work (this session)
+### 4. Coarsen ThreadPool: group QKV into single dispatch [Tier 1, #4 Option A]
+**Est:** 1-3%
+**What:** Currently Q, K, V matmuls are 3 separate `par_dot_rows()` calls. Each gen-counter increment + spin-wait adds ~1-3µs overhead.
 
-### 💀 Raw `std::thread::scope` — 5.2 tok/s (Q1_0), 2.8 tok/s (Q2_0)
-Creating/joining OS threads per matmul call is catastrophic on Windows. ~100µs thread creation × 113 calls × 16 threads = massive overhead.
-Also tried spin-wait thread pool (consumed 100% CPU, starved main thread) — fixed by using `thread::park`/`unpark`.
+### 5. Remaining Tier 4 items
+- NEON kernel paths for ARM
+- AVX-512 VNNI (`VPDPBUSD`) kernel
+- CPU flash attention (tiled softmax)
+- Software prefetch for weight rows
 
-### 💀 LM head F32 path
-Both models have lm_head as quantized dtype (Q1_0 for Bonsai, Q2_0 for Ternary). No F32 weight.
-
-### 💀 Q8_0 activation quant fusion / LLVM codegen flags
-Quant pass is ~0.5% of forward pass. `+-slow-unaligned-mem-256` not recognized by Rust LLVM.
-
-## Remaining gap: NONE! Hearth beats reference on Q1_0, dominates Q2_0
-
-### ~26% kernel codegen gap at 1-thread persists (LLVM 5.8 tok/s vs MSVC 7.3 tok/s)
-But custom pool parallelism compensates: 5.93× scaling vs reference OpenMP 4.38×.
-### Q2_0 kernel: 27.2 tok/s vs 34.4 for Q1_0 (gap due to larger block size: 34 vs 18 bytes)
-
-## To try (next sessions) — see BUG_perf_1.7B_models.md for details
-
-1. **Pre-computed Q2V i16 LUT** — expand `Q2V` from `[i8;4]` to `[i16;4]` (2KB). Eliminates sign-extension per Q2_0 batch. Could close Q2_0→Q1_0 gap.
-2. **Kernel micro-optimizations** — low priority given current results.
-
-## Key files changed (all sessions)
-- `.cargo/config.toml` — added `target-cpu=native`
-- `crates/hearth-llm/src/pool.rs` — **NEW**: custom thread pool with `park`/`unpark`, static row partitioning
-- `crates/hearth-llm/src/model/matmul.rs` — converted Q1_0/Q2_0/Q8_0/fused paths to use pool
-- `crates/hearth-llm/src/model/mod.rs` — added `pool: ThreadPool` field, threads = ncpu-1
-- `crates/hearth-llm/src/lib.rs` — added `mod pool`
-- `crates/hearth-quant/src/q1_0g128.rs` — hsum→FMA accumulation across blocks
-- `crates/hearth-quant/src/q2_0.rs` — hsum→FMA accumulation across blocks
-- `crates/hearth-llm/src/parallel.rs` — now unused (kept for reference)
-
-## Bench commands
+## Build & verify
 ```powershell
-# Q1_0 — default (best)
-& ".\target\release\hearth-chat-cli.exe" "$env:USERPROFILE\AppData\Roaming\hearth\models\Bonsai-1.7B-Q1_0.gguf" --temp 0 --max-tokens 100 --prompt "Hello" --prompt-raw
-
-# Q2_0 — ternary model (CRITICAL, work on this too)
-& ".\target\release\hearth-chat-cli.exe" "$env:USERPROFILE\AppData\Roaming\hearth\models\Ternary-Bonsai-1.7B-Q2_0.gguf" --temp 0 --max-tokens 100 --prompt "Hello" --prompt-raw
-
-# 1-thread (Q1_0)
-$env:RAYON_NUM_THREADS="1"; & ".\target\release\hearth-chat-cli.exe" "$env:USERPROFILE\AppData\Roaming\hearth\models\Bonsai-1.7B-Q1_0.gguf" --temp 0 --max-tokens 60 --prompt "Hello" --prompt-raw
-
-# Reference Q1_0
-& "$env:TEMP\llama.cpp-prism\build\bin\Release\llama-cli.exe" -m "$env:USERPROFILE\AppData\Roaming\hearth\models\Bonsai-1.7B-Q1_0.gguf" --temp 0 -n 20 -p "Hello"
-
-# Reference Q2_0
-& "$env:TEMP\llama.cpp-prism\build\bin\Release\llama-cli.exe" -m "$env:USERPROFILE\AppData\Roaming\hearth\models\Ternary-Bonsai-1.7B-Q2_0.gguf" --temp 0 -n 20 -p "Hello"
+cargo build --release
+cargo fmt
+cargo clippy -p hearth-quant -- -D warnings
+cargo test -p hearth-quant -- --test-threads=1
 ```
