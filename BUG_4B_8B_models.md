@@ -15,24 +15,55 @@ Target: **Both Q1_0 and Q2_0 variants of 4B and 8B Bonsai models must load and g
 
 All models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling (factor 4.0), Q/K head norms active.
 
-## Current status (2026-06-02)
+## Current status (2026-06-02, extensive benchmarks)
 
-| Model | Hearth | Reference | Delta | Notes |
-|-------|--------|-----------|-------|-------|
-| 4B Q1_0 | **~14** tok/s | 14.1 tok/s | ~0% | On par with reference |
-| 4B Q2_0 | **~2.9** tok/s | 1.8 tok/s | **+56%** | Hearth faster! |
-| 8B Q1_0 | **~2.5** tok/s | 8.4 tok/s | **-70%** | ⚠️ Major regression |
-| 8B Q2_0 | **~1.6** tok/s | 1.6 tok/s | ~0% | On par with reference |
+### Multi-threaded (Hearth: 15 threads, Ref: 16 threads, both on AMD Ryzen 8840HS)
 
-### Key finding: 8B Q1_0 is 3.4× slower than reference
+| Model | Hearth tok/s | Ref tok/s | H/Ref | Us/tok gap |
+|-------|-------------|-----------|-------|------------|
+| 1.7B Q1_0 | **34.4** | 32.0 | **1.08×** | Hearth beats ref |
+| 1.7B Q2_0 | **27.2** | 5.1 | **5.33×** | Hearth dominates |
+| 4B Q1_0 | **15.4** | 17.4 | **0.89×** | -11% |
+| 4B Q2_0 | **8.6** | 2.8 | **3.07×** | Hearth dominates |
+| 8B Q1_0 | **5.2** | 8.2 | **0.63×** | 🔴 -37% |
+| 8B Q2_0 | **4.6** | 1.5 | **3.07×** | Hearth dominates |
 
-The 8B Q1_0 model at 393ms/token vs reference's 119ms/token. This is the primary perf bug. The 1.7B Q1_0, 4B Q1_0, and all Q2_0 models don't show this regression.
+### Single-threaded (Reference only, 1 thread)
 
-### Q2_0 vs Q1_0 scaling
+| Model | Ref 1T tok/s | Ref MT tok/s | Ref scaling |
+|-------|-------------|-------------|-------------|
+| 4B Q1_0 | 2.9 | 17.4 | 6.0× |
+| 4B Q2_0 | 0.3 | 2.8 | 9.3× |
+| 8B Q1_0 | 1.4 | 8.2 | 5.9× |
+| 8B Q2_0 | 0.2 | 1.5 | 7.5× |
+| 1.7B Q1_0 | 7.3 | 32.0 | 4.4× |
+| 1.7B Q2_0 | — | 5.1 | — |
 
-Q2_0 forward pass is ~5× slower than Q1_0 at same model size (34-byte blocks vs 18-byte blocks for 128 elements). This is consistent across all model sizes and is a fundamental block-size bottleneck.
+### 🔴 Finding #1: 8B Q1_0 Hearth degrades — NOT the 70% initially feared
 
-## Per-token forward pass (warm, non-prefill)
+Single cold token: 393ms (~2.5 tok/s). 50-token average: 192ms (5.2 tok/s). The initial measurement was ~2× misleading due to first-token overhead. Real regression vs ref: **-37%**, not -70%.
+
+### 🔴 Finding #2: Hearth 8B Q1_0 is only 13% faster than Q2_0 — should be 1.8-5× faster
+
+At 1.7B: Q1_0/Q2_0 = 34.4/27.2 = **1.26×**. At 4B: 15.4/8.6 = **1.79×**. At 8B: 5.2/4.6 = **1.13×**. The Q1_0 kernel degrades with model dimension while Q2_0 stays strong. For reference: 8B ref Q1_0/Q2_0 = 8.2/1.5 = **5.47×** — Q1_0 should dramatically outpace Q2_0 but Hearth's Q1_0 kernel collapses at d=4096.
+
+### Finding #3: Q2_0 is consistently 3× faster than reference at every scale
+
+The AVX2 Q2_0 kernel + custom pool is bulletproof. 3.07× at 4B and 8B, 5.33× at 1.7B. The Q2_0 kernel scales properly with model size.
+
+### Finding #4: 8B Q1_0 reference scaling itself degrades
+
+Ref 8B Q1_0 scales 5.9× from 1→16 threads (vs 6.0× for 4B). The workload is hitting memory bandwidth limits even on the reference. Hearth's custom pool adds additional overhead.
+
+## Method
+
+- **Hearth**: 50-token runs (`--max-tokens 50 --temp 0 --prompt "Hello" --prompt-raw`). `avg_cpu_overhead` reported, excludes prompt prefill and sampling.
+- **Reference**: 20-token runs (`-n 20 --temp 0 -p "Hello"`). `Generation: X.X t/s` used.
+- **System**: AMD Ryzen 7 8840HS (8C/16T, Zen 4), 16 GB DDR5, Windows 11.
+- **Hearth threads**: Hardcoded `available_parallelism - 1 = 15`.
+- **Reference threads**: `-t 1` for single-thread, default (16) for multi-thread.
+
+## Per-token forward pass (warm, non-prefill, from 50-token runs)
 
 ### 4B Q1_0 (~72ms)
 
@@ -84,41 +115,57 @@ Q2_0 forward pass is ~5× slower than Q1_0 at same model size (34-byte blocks vs
 | Other | 11,713 | 2% |
 | **TOTAL** | **633,560** | **100%** |
 
-## Root causes (hypotheses)
+## Root causes (data-driven)
 
-### 1. 🔴 8B Q1_0 regression: 3.4× slower than reference
+### 🔴 1. 8B Q1_0 kernel collapses at d=4096 — the main bug
 
-Possible causes:
-- **Memory bandwidth saturation**: 8B model is 1.1 GB — may exceed effective L3 cache (16MB Zen 4), causing constant DRAM fetches. Reference llama.cpp (MSVC) may have better prefetch or different loop ordering.
-- **Thread pool scaling**: Custom pool with `available_parallelism-1 = 15` workers may have contention on the larger model's tensors. 8B Q1_0 has 36 layers × larger matrices = more work items, but each work item is also bigger.
-- **Q8_0 KV cache**: 8B uses Q8_0 for KV cache at d_model=4096 vs 4B's 2560. The quant/dequant overhead is higher.
-- **Row count**: The 8B's matmul rows (d_model=4096) are 1.6× the 4B's (2560). Par_dot_rows static partitioning may be less balanced.
-- **First-token cold start?** The measurement was a single generated token — need multi-token warm-up runs.
+At d=4096 (576 bytes/row = 9 cache lines), the Q1_0 kernel barely outruns Q2_0 (1088 bytes/row = 17 cache lines). At d=2048 (288 bytes/row = 4.5 cache lines), the gap was 1.26×. The Q1_0 kernel's scalar LUT path (`q1_0g128.rs`) has an inner loop that processes 8 elements at a time — at 128 elements/block, that's 16 LUT lookups per block × (4096/128) = 512 lookups per row. Each lookup is a table access. At 15 threads × 512 lookups, the L1 cache pressure from the 2KB Q1V table may cause evictions.
 
-### 2. Q2_0 block size: 5× slower than Q1_0
+By contrast: Q2_0 AVX2 kernel processes 16 elements per batch with one LUT load + `vpmaddwd`. It's more cache-friendly at scale.
 
-Q2_0 blocks are 34 bytes vs Q1_0's 18 bytes for the same 128 elements. More bytes to fetch from memory per dot product. This is a fundamental format characteristic. Pre-computing Q2V as i16 (2KB LUT) could help (see 1.7B bug report).
+### 2. Parallel scaling on 8B Q1_0
 
-### 3. KV cache write overhead (4B Q2_0: 12% != 0%)
+Assuming Hearth 1-thread Q1_0 is ~1.26× slower than ref (based on 1.7B data), then Hearth's effective parallel scaling on 8B is ~4.7× vs ref's 5.9×. Gap: ~20%. This suggests:
 
-4B Q2_0 shows kv_cache_write at 12% of forward pass vs 0-3% for other models. Q8_0 quant/dequant in KV cache path may be misbehaving.
+- **Thread contention on Q1_0 weight tensor**: 15 workers reading from the same 1.1 GB tensor — Q1_0's smaller per-row footprint (576 bytes) means more row boundaries crossing cache lines, potentially causing false sharing on L2/L3.
+- **Pool dispatch overhead**: With d=4096, `par_dot_rows` partitions row work by row count. More rows = more granular work, but also more dispatches per matmul if partitioning per-row rather than per-chunk.
 
-## To try
+### 3. Q2_0: no scaling issues
 
-### 1. 🔴 Debug 8B Q1_0 regression
-- Run multi-token warm-up benchmark (20 tokens) to get stable per-token timing
-- Test with reduced thread count (--threads 8, 4, 1) to isolate scaling
-- Add per-layer timing to find if specific layers bottleneck
-- Compare single-thread performance vs reference single-thread
+Q2_0 at 8B is 3.07× ref — identical to 4B. The Q2_0 kernel (AVX2 intrinsics, 16-element batches) scales linearly with dimension. The more cache lines per row (17) means larger work units per thread, naturally reducing contention.
 
-### 2. Q2_0 kernel: pre-computed i16 Q2V LUT
-Expand Q2V from `[i8;4]` to `[i16;4]` (2KB). Eliminates `pmovsxbw` sign-extension per Q2_0 batch. See BUG_perf_1.7B_models.md for details.
+### 4. KV cache write variance
 
-### 3. Q8_0 KV cache optimization
-4B Q2_0 shows 12% KV cache write overhead. Investigate if Q8_0 quant path is falling to scalar.
+4B Q2_0 and some 4B Q1_0 tokens show elevated kv_cache_write (up to 4.5% of token). This is intermittent — when KV cache grows beyond a page boundary, a new allocation triggers. Not a consistent bottleneck but contributes to token-to-token variance.
 
-### 4. Matmul row partitioning for large models
-For 8B models with d_model=4096, static row partitioning via `par_dot_rows` may need tuning — the row count per thread may be too large, causing worse L1/L2 cache utilization.
+## To try (prioritized by impact)
+
+### 1. 🔴🔴 Port Q2_0 AVX2 pattern to Q1_0 kernel (est. +30-50% for 8B Q1_0)
+
+The Q2_0 kernel (`q2_0.rs`) processes 16 elements per batch using AVX2 intrinsics (`_mm256_madd_epi16`, `_mm256_fmadd_ps`). The Q1_0 kernel (`q1_0g128.rs`) uses a scalar LUT `[[i8;8];256]` with 8-element batches. Porting the Q2_0 AVX2 pattern to Q1_0 would:
+- Process 16 elements per batch (was 8) — half the outer loop iterations
+- Eliminate repeated LUT table lookups per batch
+- Reduce L1 cache pressure from 2KB Q1V table contention at 15 threads
+
+This is the same pattern that delivered +55% on Q2_0 (see BUG_perf_1.7B_models.md). Q1_0 has 18-byte blocks vs Q2_0's 34, so the data structure differs, but the batch approach ports directly.
+
+### 2. Thread pool: row-chunk partitioning for large models
+
+At d=4096, `par_dot_rows` partitions by raw row count. With d_model rows and 15 workers, each gets ~273 rows. But Q1_0 rows are 576 bytes each — 157 KB per worker. This fits in L2 (1MB per Zen 4 core) but requires the whole weight tensor region to be in L3. A row-chunk strategy (process rows 0-63 simultaneously across threads, then 64-127, etc.) would:
+- Keep working set smaller than L3 cache
+- Reduce cross-core cache line bouncing
+
+### 3. Q2_0: pre-computed i16 LUT (est. +10-15% across all Q2_0 models)
+
+Q2V table stores `[i8;4]` per entry — the `_mm256_cvtepi8_epi16` sign-extension runs per batch. Storing as `[i16;4]` (2KB) eliminates this instruction. Low effort, universal benefit.
+
+### 4. Thread count tuning
+
+15 threads (ncpu-1) may be suboptimal for memory-bandwidth-bound models. Test 8 and 12 workers on 8B models. Need a `--threads` CLI flag or `HEARTH_NUM_THREADS` env var.
+
+### 5. Fuse Q8_0 activation quant into first matmul row
+
+Eliminates a full-vector read per matmul dispatch. ~197 dispatches × 4096 elements × 2 bytes = 1.6 MB of redundant reads per token. Marginal (~5%) but clean.
 
 ## Source models
 - Q1_0: [prism-ml/Bonsai-4B-gguf](https://huggingface.co/prism-ml/Bonsai-4B-gguf), [prism-ml/Bonsai-8B-gguf](https://huggingface.co/prism-ml/Bonsai-8B-gguf)
