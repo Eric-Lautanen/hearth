@@ -1,0 +1,26 @@
+[package]
+name = "hearth-llm"
+version = "0.1.0"
+edition = "2021"
+description = "Llama model architecture + CPU inference"
+
+[features]
+msvc-kernel = ["hearth-quant/msvc-kernel"]
+
+[dependencies]
+half = { workspace = true }
+hearth-core = { workspace = true }
+hearth-gguf = { workspace = true }
+hearth-quant = { workspace = true }
+hearth-tokenizer = { workspace = true }
+hearth-sampler = { workspace = true }
+bytemuck = { workspace = true }
+hearth-compute = { workspace = true }
+pollster = "0.3"
+rayon = { workspace = true }
+matrixmultiply = { workspace = true }
+wide = { workspace = true }
+
+[[bin]]
+name = "hearth-chat-cli"
+path = "src/bin/hearth-chat-cli.rs"

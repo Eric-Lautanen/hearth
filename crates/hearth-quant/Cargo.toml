@@ -1,0 +1,17 @@
+[package]
+name = "hearth-quant"
+version = "0.1.0"
+edition = "2021"
+description = "CPU quantization kernels"
+
+[build-dependencies]
+cc = "1"
+
+[features]
+msvc-kernel = []
+
+[dependencies]
+half = { workspace = true }
+bytemuck = { workspace = true }
+hearth-gguf = { workspace = true }
+wide = { workspace = true }

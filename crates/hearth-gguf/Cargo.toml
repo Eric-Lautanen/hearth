@@ -1,0 +1,11 @@
+[package]
+name = "hearth-gguf"
+version = "0.1.0"
+edition = "2021"
+description = "GGUF file parser"
+
+[dependencies]
+memmap2 = { workspace = true }
+half = { workspace = true }
+hearth-core = { workspace = true }
+thiserror = { workspace = true }
