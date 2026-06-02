@@ -23,9 +23,10 @@ pub struct KVCache {
 
 impl KVCache {
     pub fn new(n_kv_heads: usize, head_dim: usize, max_seq_len: usize) -> Self {
+        let total = n_kv_heads * head_dim * max_seq_len;
         KVCache {
-            k: Vec::new(),
-            v: Vec::new(),
+            k: vec![0.0f32; total],
+            v: vec![0.0f32; total],
             k_q8: Vec::new(),
             v_q8: Vec::new(),
             n_kv_heads,
@@ -187,6 +188,36 @@ impl KVCache {
                     );
                 }
                 &self.dequant_buf[..needed]
+            }
+        }
+    }
+
+    pub fn k_slice_dequant_into(&self, head: usize, seq_len: usize, out: &mut [f32]) {
+        if let KVStorage::Q8_0 = self.storage {
+            for pos in 0..seq_len {
+                let off = self.q8_position_offset(head, pos);
+                let blocks = self.head_dim.div_ceil(Q8_0_BLOCK_SIZE);
+                let total_bytes = blocks * Q8_0_BLOCK_BYTES;
+                dequantize_q8_0_block(
+                    &self.k_q8[off..off + total_bytes],
+                    &mut out[pos * self.head_dim..(pos + 1) * self.head_dim],
+                    self.head_dim,
+                );
+            }
+        }
+    }
+
+    pub fn v_slice_dequant_into(&self, head: usize, seq_len: usize, out: &mut [f32]) {
+        if let KVStorage::Q8_0 = self.storage {
+            for pos in 0..seq_len {
+                let off = self.q8_position_offset(head, pos);
+                let blocks = self.head_dim.div_ceil(Q8_0_BLOCK_SIZE);
+                let total_bytes = blocks * Q8_0_BLOCK_BYTES;
+                dequantize_q8_0_block(
+                    &self.v_q8[off..off + total_bytes],
+                    &mut out[pos * self.head_dim..(pos + 1) * self.head_dim],
+                    self.head_dim,
+                );
             }
         }
     }

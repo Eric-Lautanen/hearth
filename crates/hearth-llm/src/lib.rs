@@ -3,7 +3,6 @@ pub mod generate;
 pub mod kvcache;
 pub mod model;
 pub mod ops;
-mod parallel;
 mod pool;
 
 pub use config::ModelConfig;

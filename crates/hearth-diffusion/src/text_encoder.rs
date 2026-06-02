@@ -1,5 +1,5 @@
-use hearth_llm::LlamaModel;
 use hearth_core::LoadStrategy;
+use hearth_llm::LlamaModel;
 
 pub struct TextEncoder {
     model: LlamaModel,
@@ -21,7 +21,9 @@ impl TextEncoder {
 
     pub fn encode(&self, prompt: &str, max_tokens: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
         let tokens = {
-            let mut tok = self.model.tokenizer()
+            let mut tok = self
+                .model
+                .tokenizer()
                 .lock()
                 .map_err(|e| format!("Tokenizer lock: {}", e))?;
             tok.encode(prompt, false)
@@ -29,10 +31,19 @@ impl TextEncoder {
 
         let tokens: Vec<u32> = tokens.into_iter().take(max_tokens).collect();
         let seq_len = tokens.len();
-        eprintln!("[text_encoder] {} tokens for: \"{}\"", seq_len, &prompt[..prompt.len().min(60)]);
+        eprintln!(
+            "[text_encoder] {} tokens for: \"{}\"",
+            seq_len,
+            &prompt[..prompt.len().min(60)]
+        );
 
         let (hidden_states, pooled_raw) = self.model.encode_text(&tokens)?;
-        eprintln!("[text_encoder] Hidden: {}×{}, pooled: {}", seq_len, self.qwen_dim, pooled_raw.len());
+        eprintln!(
+            "[text_encoder] Hidden: {}×{}, pooled: {}",
+            seq_len,
+            self.qwen_dim,
+            pooled_raw.len()
+        );
 
         let prompt_embeds = zero_pad(&hidden_states, seq_len, self.qwen_dim, self.joint_dim);
         let pooled_embeds = zero_pad(&pooled_raw, 1, self.qwen_dim, self.d_model);

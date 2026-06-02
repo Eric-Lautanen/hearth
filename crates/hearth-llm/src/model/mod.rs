@@ -54,6 +54,7 @@ pub struct LlamaModel {
     layer_names: Vec<LayerTensorNames>,
     lm_head_name: String,
     pool: ThreadPool,
+    rope_cache: ops::RopeCache,
 }
 
 impl LlamaModel {
@@ -116,6 +117,7 @@ impl LlamaModel {
             moe_ffn: Vec::new(),
             x_q8: Vec::new(),
             ffn_q8: Vec::new(),
+            scratch_q8: Vec::new(),
             head_norm_tmp: vec![0.0f32; head_dim],
             timers: ForwardTimers {
                 embed_us: 0,
@@ -270,6 +272,15 @@ impl LlamaModel {
                 .unwrap_or(1),
         );
 
+        let rope_cache = ops::RopeCache::new(
+            max_seq,
+            config.rope_dim as usize,
+            config.rope_theta,
+            config.rope_scaling_type.as_deref(),
+            config.rope_scaling_factor,
+            config.original_ctx_len,
+        );
+
         Ok(LlamaModel {
             config,
             tokenizer: std::sync::Mutex::new(tokenizer),
@@ -284,6 +295,7 @@ impl LlamaModel {
             layer_names,
             lm_head_name,
             pool,
+            rope_cache,
         })
     }
 
@@ -314,9 +326,6 @@ impl LlamaModel {
         let nkv = n_kv_heads * head_dim;
         let seq_len = caches[0].current_len + 1;
         let token_id = token_ids[0] as usize;
-        let scaling_type = self.config.rope_scaling_type.as_deref();
-        let scaling_factor = self.config.rope_scaling_factor;
-        let orig_ctx = self.config.original_ctx_len;
 
         if sc.attn_scores.len() < seq_len {
             sc.attn_scores.resize(seq_len, 0.0f32);
@@ -427,27 +436,11 @@ impl LlamaModel {
             let rope_dim = self.config.rope_dim as usize;
             for h in 0..n_heads {
                 let s = h * head_dim;
-                ops::rope(
-                    &mut sc.q_heads[s..s + rope_dim],
-                    pos,
-                    rope_dim,
-                    self.config.rope_theta,
-                    scaling_type,
-                    scaling_factor,
-                    orig_ctx,
-                );
+                self.rope_cache.apply(&mut sc.q_heads[s..s + rope_dim], pos);
             }
             for h in 0..n_kv_heads {
                 let s = h * head_dim;
-                ops::rope(
-                    &mut sc.k_heads[s..s + rope_dim],
-                    pos,
-                    rope_dim,
-                    self.config.rope_theta,
-                    scaling_type,
-                    scaling_factor,
-                    orig_ctx,
-                );
+                self.rope_cache.apply(&mut sc.k_heads[s..s + rope_dim], pos);
             }
             sc.timers.rope_us += t0.elapsed().as_micros();
 
@@ -765,9 +758,6 @@ impl LlamaModel {
         let nq = n_heads * head_dim;
         let nkv = n_kv_heads * head_dim;
         let max_seq = self.config.max_seq_len as usize;
-        let scaling_type = self.config.rope_scaling_type.as_deref();
-        let scaling_factor = self.config.rope_scaling_factor;
-        let orig_ctx = self.config.original_ctx_len;
 
         self.ensure_batch_size(bs, seq_len, d, nq, nkv, ffn_dim, max_seq);
 
@@ -885,27 +875,13 @@ impl LlamaModel {
                 let pos = s;
                 for h in 0..n_heads {
                     let off = s * nq + h * head_dim;
-                    ops::rope(
-                        &mut bs.q_heads[off..off + rope_dim],
-                        pos,
-                        rope_dim,
-                        self.config.rope_theta,
-                        scaling_type,
-                        scaling_factor,
-                        orig_ctx,
-                    );
+                    self.rope_cache
+                        .apply(&mut bs.q_heads[off..off + rope_dim], pos);
                 }
                 for h in 0..n_kv_heads {
                     let off = s * nkv + h * head_dim;
-                    ops::rope(
-                        &mut bs.k_heads[off..off + rope_dim],
-                        pos,
-                        rope_dim,
-                        self.config.rope_theta,
-                        scaling_type,
-                        scaling_factor,
-                        orig_ctx,
-                    );
+                    self.rope_cache
+                        .apply(&mut bs.k_heads[off..off + rope_dim], pos);
                 }
             }
 
@@ -1072,19 +1048,9 @@ impl LlamaModel {
         let nq = n_heads * head_dim;
         let nkv = n_kv_heads * head_dim;
         let max_seq = self.config.max_seq_len as usize;
-        let scaling_type = self.config.rope_scaling_type.as_deref();
-        let scaling_factor = self.config.rope_scaling_factor;
-        let orig_ctx = self.config.original_ctx_len;
 
         let mut caches: Vec<KVCache> = (0..n_layers)
-            .map(|_| {
-                KVCache::new_with_storage(
-                    n_kv_heads,
-                    head_dim,
-                    max_seq,
-                    KVStorage::F32,
-                )
-            })
+            .map(|_| KVCache::new_with_storage(n_kv_heads, head_dim, max_seq, KVStorage::F32))
             .collect();
 
         let mut bs = BatchScratch {
@@ -1175,23 +1141,39 @@ impl LlamaModel {
             bs.k_heads[..seq_len * nkv].copy_from_slice(&bs.k_buf[..seq_len * nkv]);
             bs.v_heads[..seq_len * nkv].copy_from_slice(&bs.v_buf[..seq_len * nkv]);
 
-            if self.tensors.contains_key(&format!("{}.attn_q_norm.weight", p)) {
+            if self
+                .tensors
+                .contains_key(&format!("{}.attn_q_norm.weight", p))
+            {
                 let q_norm = self.get_1d(&format!("{}.attn_q_norm.weight", p), head_dim)?;
                 for s in 0..seq_len {
                     for h in 0..n_heads {
                         let off = s * nq + h * head_dim;
                         let tmp = bs.q_heads[off..off + head_dim].to_vec();
-                        self.norm(&tmp, q_norm, self.config.rms_norm_eps, &mut bs.q_heads[off..off + head_dim]);
+                        self.norm(
+                            &tmp,
+                            q_norm,
+                            self.config.rms_norm_eps,
+                            &mut bs.q_heads[off..off + head_dim],
+                        );
                     }
                 }
             }
-            if self.tensors.contains_key(&format!("{}.attn_k_norm.weight", p)) {
+            if self
+                .tensors
+                .contains_key(&format!("{}.attn_k_norm.weight", p))
+            {
                 let k_norm = self.get_1d(&format!("{}.attn_k_norm.weight", p), head_dim)?;
                 for s in 0..seq_len {
                     for h in 0..n_kv_heads {
                         let off = s * nkv + h * head_dim;
                         let tmp = bs.k_heads[off..off + head_dim].to_vec();
-                        self.norm(&tmp, k_norm, self.config.rms_norm_eps, &mut bs.k_heads[off..off + head_dim]);
+                        self.norm(
+                            &tmp,
+                            k_norm,
+                            self.config.rms_norm_eps,
+                            &mut bs.k_heads[off..off + head_dim],
+                        );
                     }
                 }
             }
@@ -1201,27 +1183,13 @@ impl LlamaModel {
                 let pos = s;
                 for h in 0..n_heads {
                     let off = s * nq + h * head_dim;
-                    ops::rope(
-                        &mut bs.q_heads[off..off + rope_dim],
-                        pos,
-                        rope_dim,
-                        self.config.rope_theta,
-                        scaling_type,
-                        scaling_factor,
-                        orig_ctx,
-                    );
+                    self.rope_cache
+                        .apply(&mut bs.q_heads[off..off + rope_dim], pos);
                 }
                 for h in 0..n_kv_heads {
                     let off = s * nkv + h * head_dim;
-                    ops::rope(
-                        &mut bs.k_heads[off..off + rope_dim],
-                        pos,
-                        rope_dim,
-                        self.config.rope_theta,
-                        scaling_type,
-                        scaling_factor,
-                        orig_ctx,
-                    );
+                    self.rope_cache
+                        .apply(&mut bs.k_heads[off..off + rope_dim], pos);
                 }
             }
 
@@ -1353,7 +1321,12 @@ impl LlamaModel {
         for s in 0..seq_len {
             let off = s * d;
             let tmp = bs.hidden[off..off + d].to_vec();
-            self.norm(&tmp, out_norm, self.config.rms_norm_eps, &mut hidden_states[off..off + d]);
+            self.norm(
+                &tmp,
+                out_norm,
+                self.config.rms_norm_eps,
+                &mut hidden_states[off..off + d],
+            );
         }
 
         let pooled: Vec<f32> = (0..d)
@@ -2060,27 +2033,46 @@ impl LlamaModel {
 
         let mut sc = self.scratch.lock().unwrap();
         let mut rb = self.row_buf.lock().unwrap();
-        let _bs = self.batch.lock().unwrap();
+        let mut bs = self.batch.lock().unwrap();
 
-        for (i, &tid) in input_ids.iter().enumerate() {
-            if cancel.load(Ordering::Relaxed) {
-                return Ok(());
+        if input_ids.len() > 1 && !use_gpu {
+            let t0 = std::time::Instant::now();
+            self.forward_batch(
+                &input_ids,
+                &mut caches,
+                &mut logits,
+                cancel,
+                &mut bs,
+                &mut rb,
+            )?;
+            let us = t0.elapsed().as_micros();
+            eprintln!(
+                "[prefill] {} tokens in {}ms ({:.1}ms/tok)",
+                input_ids.len(),
+                us / 1000,
+                us as f64 / input_ids.len() as f64 / 1000.0
+            );
+        } else {
+            for (i, &tid) in input_ids.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if use_gpu {
+                    self.forward_gpu(&[tid], i, &mut caches, &mut logits, cancel)?;
+                } else {
+                    self.forward(
+                        &[tid],
+                        i,
+                        &mut caches,
+                        &mut logits,
+                        cancel,
+                        &mut sc,
+                        &mut rb,
+                    )?;
+                }
             }
-            if use_gpu {
-                self.forward_gpu(&[tid], i, &mut caches, &mut logits, cancel)?;
-            } else {
-                self.forward(
-                    &[tid],
-                    i,
-                    &mut caches,
-                    &mut logits,
-                    cancel,
-                    &mut sc,
-                    &mut rb,
-                )?;
-            }
-            total_tokens += 1;
         }
+        total_tokens += input_ids.len();
         past_tokens.push(input_ids[input_ids.len() - 1]);
 
         let mut generated = 0;
