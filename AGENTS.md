@@ -10,6 +10,10 @@
 
 **IMPORTANT: ALWAYS update BUG_TRACKER.md and at the end of each session completely rewrite RESUME.MD with things to try during the next session!!!
 
+**File purposes:** `RESUME.md` = detailed implementation instructions for the NEXT session (what to do). `BUG_TRACKER.md` = historical record of what was done (perf table, change log, what didn't work). Keep both concise — token efficiency matters for context limits.
+
+**BENCHMARK MANDATE: Always benchmark before-and-after on every session.** Run all 6 models (1.7B/4B/8B Q1_0 + Q2_0) one at a time. Compare tok/s to session baseline in BUG_TRACKER.md. If any model degrades, revert the change — do not merge regressions. Benchmark command: `& ".\target\release\hearth-chat-cli.exe" "$model" --temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`
+
 ## Key paths
 - Repo: `C:\Users\ericl\Documents\hearth`
 - Ref (Prism fork): `$env:TEMP\llama.cpp-prism`

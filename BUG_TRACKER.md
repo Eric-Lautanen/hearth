@@ -13,7 +13,16 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 6 — SIMD RoPE)
+## Current status (2026-06-02, Session 7 — attn_out quant fusion REVERTED)
+
+### Fuse attn_out quant into attention kernel: REVERTED
+Tried replacing the f32 `out[head_dim]` buffer in `attention()` and `attention_batch()` with direct Q8_0 block writes. Two loop orders tested:
+1. Block-outer (process 32 elements across all positions, quantize, repeat) — avoids f32 buffer but causes strided v_cache access
+2. Pos-outer with stack-local `[f32; 128]` — retains original cache-friendly loop, then inline quantize
+
+Both versions also wired pre-quantized Q8_0 into `matmul()`/`matmul_batch()` via `x_q8: Option<&[u8]>`, skipping `quantize_act()`.
+
+**Result:** Q1_0 models neutral, but 1.7B Q2_0 regressed 10-25% (36ms→40-45ms avg_cpu_overhead, 20-token). Root cause unclear — possibly the reused `sc.attn_q8` buffer address causes cache conflicts, or the inline scalar quant loop lacks the auto-vectorization from `hearth-quant`'s `q8_0::quantize()`. Reverted.
 
 ### SIMD RoPE with precomputed sin/cos: DONE
 `RopeCache` struct was already defined but never wired into the model. The standalone `ops::rope()` function recomputed `theta.powf()` and `sin_cos()` on every token — 6,912 trig calls per forward (36 layers × 2 head groups × 80 dim ÷ 2 halves × 2 Q+K). 
@@ -45,7 +54,7 @@ From `[timing]` output (decode tokens):
 - attn_output_matmul ~9-12%
 - lm_head_matmul ~4-8%
 
-Next target: Fuse attn_out quant into attention kernel (est 3-5%).
+Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
 | Model | Hearth | Ref | H/Ref | Forward |
 |---|---|---|---|---|
@@ -124,7 +133,7 @@ QKV fusion: <3% gain (diminishing returns)
 Reference-style AVX2 kernel rewrite: ~0% gain (LLVM already optimized)
 Kernel hsum optimization (FMA accumulate across blocks, single hsum per row): marginal
 LM head F32: both 1.7B models have Q1_0/Q2_0 lm_head, not F32 (can't skip dequant)
-Q8_0 quant fusion: negligible (<0.5% of forward pass)
+Q8_0 quant fusion (attn_out): REVERTED — 10-25% Q2_0 regression, root cause unknown but suspected cache conflict from reused buffer or missing vectorization in inline quant loop
 MSVC FFI kernel: 4-6× slower than LLVM + target-cpu=native
 Raw std::thread::scope: catastrophic on Windows (5.2/2.8 tok/s)
 Spin-wait pool (no yield): 100% CPU, starved main thread
@@ -143,6 +152,7 @@ Q2_0 is 3-5× faster than reference at all sizes
 LLVM generates better AVX2 code than MSVC SSE2 for quant kernels
 10 workers helps large models (4B/8B Q2_0: +11%/+41%) but kills small ones
 RopeCache was dead code — struct defined but never instantiated; ops::rope() recomputed trig every token
+High system variance on Q2_0 models (up to 5× between runs), likely thermal/power management — complicates regression detection. Always measure baseline in same session before comparing.
 
 ## Per-token forward pass (warm, non-prefill)
 

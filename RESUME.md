@@ -1,56 +1,94 @@
-# Session 6 Resume — SIMD RoPE with precomputed sin/cos
+# Session 8: Pre-expand Q1_0 weight rows to i8 sign arrays
 
-## Done
+**Goal:** Eliminate bit-unpacking from the Q1_0 dot-product hot loop by expanding weights at load time. Q1_0 packs 128 1-bit signs into 18 bytes per block. Every matmul call unpacks these on-the-fly. Pre-expanding to 128 i8 bytes (128B/block) turns the kernel into a trivial `i8×i8→i32` dot product — no bit manipulation, no shuffle, just multiply-accumulate.
 
-| # | Opportunity | Gain | Status |
-|---|---|---|---|
-| 1 | Scratch Q8 buffer reuse | 5-10% (neutral) | Sess 3 — `ForwardScratch` reuse |
-| 3 | KV cache `.to_vec()` removal | 2-5% (+29% on 4B) | Sess 3 — `k_slice_dequant_into` |
-| 4 | Gen counter spin-wait (was Option B) | 5-15% (+33%) | Sess 3 — replaced park/unpark |
-| 5 | Batched prefill for prompt processing | 10-22% TTFT | Sess 5 — DONE |
-| 6 | **SIMD RoPE with precomputed sin/cos** | **2-4% (rope: ~960µs→~10µs)** | **Sess 6 — DONE** |
-| 7 | Shuffle-based Q1_0 AVX2 kernel | 5-15% (+25%) | Sess 3 — `dot_q1_0g128_q8_0_ptr_avx2` |
+**Estimated impact:** 15-25% tok/s on small models (1.7B, 4B). 8B may show less or regress from bandwidth pressure (7× more weight data to read).
 
-## Session 6 — SIMD RoPE
+---
 
-**What changed:**
-- `ops.rs`: Re-laid-out `RopeCache` table from interleaved `[sin, cos, sin, cos, ...]` to contiguous `[sin0..sin63, cos0..cos63]` per position, enabling SIMD loads
-- `ops.rs`: `RopeCache::apply` now uses `f32x8` to process 8 complex pairs per iteration (was scalar loop with per-element sin/cos calc)
-- `mod.rs`: Wired `RopeCache` into `LlamaModel` — initialized at load time, replaced all 6 `ops::rope()` calls (3 forward paths: `forward()`, `forward_batch()`, `encode_text()`)
-- Removed unused `scaling_type`/`scaling_factor`/`orig_ctx` locals where they were only used by rope
+## Implementation plan
 
-**Results (4B Q1_0, single-token decode):**
-- `rope` timing: 5-13µs per forward pass (was ~960µs when sin_cos computed per element)
-- Net forward time reduction: ~950µs → ~47ms → net ~2% improvement
-- Removed 192 sin_cos calls per layer (36 layers × 2 heads × 80 dim) = 6,912 trig calls/token
+### Step 1 — Understand current Q1_0 block format
 
-**Key insight:** `RopeCache` struct was already defined but never wired into the model. The `ops::rope()` standalone function recomputed `theta.powf(2*i/dim)` and `sin_cos()` on every call. Precomputation at load time eliminated all trig from the hot path.
+Read `crates/hearth-quant/src/q1_0g128.rs`. The Q1_0_G128 block is 18 bytes for 128 elements:
+- Bytes 0-1: f16 scale (same as Q8_0)
+- Byte 2: 8 sign bits for elements 0-7 (bit=0 → +1, bit=1 → -1)
+- ...continues for all 128 elements packed into 16 sign bytes (128 bits total)
 
-## Not tried — ranked by estimated impact
+The current `dot_q1_0g128_q8_0` function iterates each byte, extracts 8 sign bits, looks up in `Q1V[256]` (a 2KB LUT), then multiplies with Q8_0 values. This shuffle + LUT pattern is the hot loop.
 
-### 1. Fuse attn_out quant into attention kernel [Tier 1, #2]
-**Est:** 3-5%
-**Files:** `ops.rs:301`, `mod.rs:560-574`
-**What:** `attn_out` is computed in `ops::attention()` then separately quantized to Q8_0. Fuse quant into the attention value-accumulation step — avoid the separate pass.
+### Step 2 — Add expanded weight storage
 
-### 2. Pre-expand weight rows to sign arrays [Tier 3, #8]
-**Est:** 15-25% on small models
-**What:** At load time, expand Q1_0 weight rows from bit-packed 18B/128el to raw i8 sign arrays (128B/block). 8× memory trade (e.g., 1.7B Q1_0: 37MB→265MB). Eliminates all bit-unpacking from hot loop.
-
-### 3. Coarsen ThreadPool: group QKV into single dispatch [Tier 1, #4 Option A]
-**Est:** 1-3%
-**What:** Currently Q, K, V matmuls are 3 separate `par_dot_rows()` calls. Each gen-counter increment + spin-wait adds ~1-3µs overhead.
-
-### 4. Remaining Tier 4 items
-- NEON kernel paths for ARM
-- AVX-512 VNNI (`VPDPBUSD`) kernel
-- CPU flash attention (tiled softmax)
-- Software prefetch for weight rows
-
-## Build & verify
-```powershell
-cargo build --release
-cargo fmt
-cargo clippy -p hearth-quant -- -D warnings
-cargo test -p hearth-quant -- --test-threads=1
+In `crates/hearth-llm/src/model/mod.rs`, add to `LlamaModel`:
+```rust
+expanded_q1_weights: HashMap<String, Vec<i8>>,
 ```
+
+Populate during `load_model()` (in the tensor-loading loop around line 150-200): for each Q1_0 or Q1_0_G128 tensor, unpack the entire tensor into `Vec<i8>` (one `i8` per weight element, value -1 or +1). Store keyed by tensor name.
+
+Memory: each Q1_0 weight grows from 18B/128el (0.14B/el) to 128B/128el (1B/el) = 7.1×. For 1.7B: ~37MB → ~265MB. For 8B: ~1.1GB → ~7.8GB (may not fit). **Conditional flag**: only expand if `d_model < 4096` (skip 8B).
+
+### Step 3 — Write the expanded dot kernel
+
+In `crates/hearth-quant/src/q1_0g128.rs`, add:
+```rust
+pub fn dot_q1_0g128_q8_0_expanded(w: &[i8], a: &[u8], n: usize) -> f32
+```
+That's just: for each Q8_0 block, `sum += w[i] * q8_val[i] * scale`. No bit unpacking needed — `w[i]` is already -1 or +1.
+
+Add a raw-pointer variant `dot_q1_0g128_q8_0_expanded_ptr` for the thread-pool dispatch.
+
+### Step 4 — Wire into matmul path
+
+In `crates/hearth-llm/src/model/matmul.rs`:
+
+In `matmul()` under the `Q1_0_G128 | Q1_0` branches: if `self.expanded_q1_weights` contains the weight name, use the expanded dot kernel with the pre-expanded row pointer instead of the packed row pointer. Pass the expanded row's raw pointer to `par_dot_rows`.
+
+**Important:** The expanded row pointer needs to work with `par_dot_rows` which passes the same `row_bytes` (stride) to the worker functions. With expanded weights, each row is `n_cols` bytes (1 i8 per element), not the packed `n_cols/128*18` bytes. You'll need to either:
+- Pass the expanded data with `row_bytes = n_cols` and let the dot kernel iterate n_cols elements, OR
+- Create a separate dispatch path for expanded weights
+
+The simplest approach: a separate `par_dot_rows_expanded` variant in `pool.rs` that iterates with `row_bytes = n_cols` and calls the expanded dot kernel.
+
+### Step 5 — Update `matmul_batch` similarly
+
+If expanded weights exist for a tensor, use the expanded dot kernel in the batch path too.
+
+---
+
+## Files to modify
+
+| File | Changes |
+|---|---|
+| `crates/hearth-quant/src/q1_0g128.rs` | Add `dot_q1_0g128_q8_0_expanded` / `_ptr` functions |
+| `crates/hearth-quant/src/lib.rs` | Export the new functions |
+| `crates/hearth-llm/src/pool.rs` | Add `par_dot_rows_expanded` or parameterize `row_stride` |
+| `crates/hearth-llm/src/model/mod.rs` | Add `expanded_q1_weights: HashMap<String, Vec<i8>>`, populate at load time |
+| `crates/hearth-llm/src/model/matmul.rs` | Dispatch to expanded kernel when weights exist |
+
+---
+
+## Benchmark & verify
+
+1. Build: `cargo build --release`
+2. Run all 6 models one at a time (warm, at least 2 runs each):
+   - `& ".\target\release\hearth-chat-cli.exe" "$model" --temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`
+3. Compare avg_cpu_overhead tok/s to Session 7 baseline below.
+4. **If any model degrades, revert.** Particularly watch 8B Q1_0 — the 7× memory increase may cause swapping or bandwidth collapse.
+
+**Session 7 baselines (20-token, warm, second run):**
+| Model | avg_cpu_overhead (µs/tok) | tok/s |
+|---|---|---|
+| 1.7B Q1_0 | 21,778 | 45.9 |
+| 1.7B Q2_0 | 35,863 | 27.9 |
+| 4B Q1_0 | 42,736 | 23.4 |
+| 4B Q2_0 | — | ~11 (BUG_TRACKER) |
+| 8B Q1_0 | 73,736 | 13.6 |
+| 8B Q2_0 | — | ~5 (BUG_TRACKER) |
+
+---
+
+## Key references
+- `crates/hearth-quant/src/q1_0g128.rs` — current packed dot kernel (study the sign-bit extraction pattern)
+- `crates/hearth-quant/src/q8_0.rs` — simple reference: Q8_0 dot is `i8×i8×scale×scale`, no bit packing. Expanded Q1_0 should look similar.
+- `crates/hearth-llm/src/pool.rs` — `par_dot_rows` with `row_bytes` stride parameter
