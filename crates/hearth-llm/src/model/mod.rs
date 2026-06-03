@@ -509,18 +509,23 @@ impl LlamaModel {
             };
             if !gpu_attn {
                 if caches[layer].is_q8_0() {
+                    let blocks_per_pos = head_dim.div_ceil(32);
+                    let q8_row = blocks_per_pos * 34;
+                    let q8_stride = caches[layer].max_seq_len * q8_row;
                     for kvh in 0..n_kv_heads {
-                        let ks = caches[layer].k_slice_dequant(kvh, seq_len).to_vec();
-                        let vs = caches[layer].v_slice_dequant(kvh, seq_len).to_vec();
+                        let head_off = kvh * q8_stride;
+                        let head_len = seq_len * q8_row;
+                        let k_q8 = &caches[layer].k_q8[head_off..head_off + head_len];
+                        let v_q8 = &caches[layer].v_q8[head_off..head_off + head_len];
                         for r in 0..kv_repeat {
                             let qh = kvh * kv_repeat + r;
                             let qs = qh * head_dim;
                             let os = qh * head_dim;
                             sc.norm_tmp[..head_dim].copy_from_slice(&sc.q_heads[qs..qs + head_dim]);
-                            ops::attention(
+                            ops::attention_q8_0(
                                 &sc.norm_tmp[..head_dim],
-                                &ks,
-                                &vs,
+                                k_q8,
+                                v_q8,
                                 seq_len,
                                 head_dim,
                                 &mut sc.attn_out[os..os + head_dim],
@@ -797,26 +802,18 @@ impl LlamaModel {
             }
             let p = format!("blk.{}", layer);
 
-            bs.norm_tmp[..seq_len * d].copy_from_slice(&bs.hidden[..seq_len * d]);
             let attn_norm = self.get_1d(&format!("{}.attn_norm.weight", p), d)?;
-            self.norm_batch(
-                &bs.norm_tmp[..seq_len * d],
+            let aq8_needed = seq_len * (d.div_ceil(32) * 34);
+            if bs.batch_q8.len() < aq8_needed {
+                bs.batch_q8.resize(aq8_needed, 0u8);
+            }
+            ops::rms_norm_q8_batch(
+                &bs.hidden[..seq_len * d],
                 attn_norm,
                 self.config.rms_norm_eps,
-                &mut bs.residual[..seq_len * d],
+                &mut bs.batch_q8[..aq8_needed],
                 seq_len,
                 d,
-            );
-
-            let q8_needed = seq_len * (d.div_ceil(32) * 34);
-            if bs.batch_q8.len() < q8_needed {
-                bs.batch_q8.resize(q8_needed, 0u8);
-            }
-            self.pool.par_quantize(
-                seq_len,
-                d,
-                bs.residual.as_ptr() as usize,
-                bs.batch_q8.as_mut_ptr() as usize,
             );
             self.matmul_batch(
                 &format!("{}.attn_q.weight", p),
@@ -921,25 +918,10 @@ impl LlamaModel {
             }
 
             if caches[layer].is_q8_0() {
-                let kv_total = n_kv_heads * max_seq * head_dim;
-                if bs.k_heads.len() < kv_total {
-                    bs.k_heads.resize(kv_total, 0.0f32);
-                }
-                if bs.v_heads.len() < kv_total {
-                    bs.v_heads.resize(kv_total, 0.0f32);
-                }
-                for h in 0..n_kv_heads {
-                    let ks = caches[layer].k_slice_dequant(h, seq_len).to_vec();
-                    let vs = caches[layer].v_slice_dequant(h, seq_len).to_vec();
-                    let k_off = h * max_seq * head_dim;
-                    let v_off = h * max_seq * head_dim;
-                    bs.k_heads[k_off..k_off + seq_len * head_dim].copy_from_slice(&ks);
-                    bs.v_heads[v_off..v_off + seq_len * head_dim].copy_from_slice(&vs);
-                }
-                ops::attention_batch(
+                ops::attention_batch_q8_0(
                     &bs.q_heads[..seq_len * nq],
-                    &bs.k_heads,
-                    &bs.v_heads,
+                    &caches[layer].k_q8,
+                    &caches[layer].v_q8,
                     seq_len,
                     n_heads,
                     n_kv_heads,
@@ -949,7 +931,11 @@ impl LlamaModel {
                     &mut bs.attn_scores,
                 );
             } else {
-                ops::attention_batch(
+                let scratch_needed = self.pool.num_threads() * max_seq;
+                if bs.attn_scores.len() < scratch_needed {
+                    bs.attn_scores.resize(scratch_needed, 0.0f32);
+                }
+                ops::attention_batch_parallel(
                     &bs.q_heads[..seq_len * nq],
                     &caches[layer].k,
                     &caches[layer].v,
@@ -960,6 +946,7 @@ impl LlamaModel {
                     max_seq,
                     &mut bs.attn_out[..seq_len * nq],
                     &mut bs.attn_scores,
+                    &self.pool,
                 );
             }
 
@@ -988,31 +975,22 @@ impl LlamaModel {
                 bs.hidden[i] += bs.q_buf[i];
             }
 
-            bs.norm_tmp[..seq_len * d].copy_from_slice(&bs.hidden[..seq_len * d]);
             let ffn_norm = self.get_1d(&format!("{}.ffn_norm.weight", p), d)?;
-            self.norm_batch(
-                &bs.norm_tmp[..seq_len * d],
+            let fq8_needed = seq_len * (d.div_ceil(32) * 34);
+            if bs.batch_q8.len() < fq8_needed {
+                bs.batch_q8.resize(fq8_needed, 0u8);
+            }
+            ops::rms_norm_q8_batch(
+                &bs.hidden[..seq_len * d],
                 ffn_norm,
                 self.config.rms_norm_eps,
-                &mut bs.residual[..seq_len * d],
+                &mut bs.batch_q8[..fq8_needed],
                 seq_len,
                 d,
-            );
-
-            let rq8 = d.div_ceil(32) * 34;
-            let gate_q8_needed = seq_len * rq8;
-            if bs.batch_q8.len() < gate_q8_needed {
-                bs.batch_q8.resize(gate_q8_needed, 0u8);
-            }
-            self.pool.par_quantize(
-                seq_len,
-                d,
-                bs.residual.as_ptr() as usize,
-                bs.batch_q8.as_mut_ptr() as usize,
             );
             self.matmul_batch(
                 &format!("{}.ffn_gate.weight", p),
-                &bs.residual[..seq_len * d],
+                &bs.hidden[..seq_len * d],
                 &mut bs.gate[..seq_len * ffn_dim],
                 rb,
                 ffn_dim,
@@ -1031,30 +1009,23 @@ impl LlamaModel {
                 Some(&bs.batch_q8[..]),
             )?;
 
+            let fd_q8_needed = seq_len * (ffn_dim.div_ceil(32) * 34);
+            if bs.batch_q8.len() < fd_q8_needed {
+                bs.batch_q8.resize(fd_q8_needed, 0u8);
+            }
+            let fd_q8row = ffn_dim / 32 * 34;
             for s in 0..seq_len {
                 let off = s * ffn_dim;
-                ops::silu(&mut bs.gate[off..off + ffn_dim]);
-                ops::mul_elem(
+                ops::silu_mul_q8(
                     &bs.gate[off..off + ffn_dim],
                     &bs.up[off..off + ffn_dim],
-                    &mut bs.ffn_tmp[off..off + ffn_dim],
+                    &mut bs.batch_q8[s * fd_q8row..(s + 1) * fd_q8row],
+                    ffn_dim,
                 );
             }
-
-            let fq8 = ffn_dim.div_ceil(32) * 34;
-            let ffn_q8_needed = seq_len * fq8;
-            if bs.batch_q8.len() < ffn_q8_needed {
-                bs.batch_q8.resize(ffn_q8_needed, 0u8);
-            }
-            self.pool.par_quantize(
-                seq_len,
-                ffn_dim,
-                bs.ffn_tmp.as_ptr() as usize,
-                bs.batch_q8.as_mut_ptr() as usize,
-            );
             self.matmul_batch(
                 &format!("{}.ffn_down.weight", p),
-                &bs.ffn_tmp[..seq_len * ffn_dim],
+                &bs.gate[..seq_len * ffn_dim],
                 &mut bs.q_buf[..seq_len * d],
                 rb,
                 d,
@@ -1159,27 +1130,18 @@ impl LlamaModel {
         for layer in 0..n_layers {
             let p = format!("blk.{}", layer);
 
-            bs.norm_tmp[..seq_len * d].copy_from_slice(&bs.hidden[..seq_len * d]);
             let attn_norm = self.get_1d(&format!("{}.attn_norm.weight", p), d)?;
-            self.norm_batch(
-                &bs.norm_tmp[..seq_len * d],
+            let eaq8_needed = seq_len * (d.div_ceil(32) * 34);
+            if bs.batch_q8.len() < eaq8_needed {
+                bs.batch_q8.resize(eaq8_needed, 0u8);
+            }
+            ops::rms_norm_q8_batch(
+                &bs.hidden[..seq_len * d],
                 attn_norm,
                 self.config.rms_norm_eps,
-                &mut bs.residual[..seq_len * d],
+                &mut bs.batch_q8[..eaq8_needed],
                 seq_len,
                 d,
-            );
-
-            let erq8 = d.div_ceil(32) * 34;
-            let eqkv_needed = seq_len * erq8;
-            if bs.batch_q8.len() < eqkv_needed {
-                bs.batch_q8.resize(eqkv_needed, 0u8);
-            }
-            self.pool.par_quantize(
-                seq_len,
-                d,
-                bs.residual.as_ptr() as usize,
-                bs.batch_q8.as_mut_ptr() as usize,
             );
             self.matmul_batch(
                 &format!("{}.attn_q.weight", p),
@@ -1284,25 +1246,10 @@ impl LlamaModel {
             }
 
             if caches[layer].is_q8_0() {
-                let kv_total = n_kv_heads * max_seq * head_dim;
-                if bs.k_heads.len() < kv_total {
-                    bs.k_heads.resize(kv_total, 0.0f32);
-                }
-                if bs.v_heads.len() < kv_total {
-                    bs.v_heads.resize(kv_total, 0.0f32);
-                }
-                for h in 0..n_kv_heads {
-                    let ks = caches[layer].k_slice_dequant(h, seq_len).to_vec();
-                    let vs = caches[layer].v_slice_dequant(h, seq_len).to_vec();
-                    let k_off = h * max_seq * head_dim;
-                    let v_off = h * max_seq * head_dim;
-                    bs.k_heads[k_off..k_off + seq_len * head_dim].copy_from_slice(&ks);
-                    bs.v_heads[v_off..v_off + seq_len * head_dim].copy_from_slice(&vs);
-                }
-                ops::attention_batch(
+                ops::attention_batch_q8_0(
                     &bs.q_heads[..seq_len * nq],
-                    &bs.k_heads,
-                    &bs.v_heads,
+                    &caches[layer].k_q8,
+                    &caches[layer].v_q8,
                     seq_len,
                     n_heads,
                     n_kv_heads,
@@ -1351,31 +1298,22 @@ impl LlamaModel {
                 bs.hidden[i] += bs.q_buf[i];
             }
 
-            bs.norm_tmp[..seq_len * d].copy_from_slice(&bs.hidden[..seq_len * d]);
             let ffn_norm = self.get_1d(&format!("{}.ffn_norm.weight", p), d)?;
-            self.norm_batch(
-                &bs.norm_tmp[..seq_len * d],
+            let efnq8_needed = seq_len * (d.div_ceil(32) * 34);
+            if bs.batch_q8.len() < efnq8_needed {
+                bs.batch_q8.resize(efnq8_needed, 0u8);
+            }
+            ops::rms_norm_q8_batch(
+                &bs.hidden[..seq_len * d],
                 ffn_norm,
                 self.config.rms_norm_eps,
-                &mut bs.residual[..seq_len * d],
+                &mut bs.batch_q8[..efnq8_needed],
                 seq_len,
                 d,
-            );
-
-            let erg8 = d.div_ceil(32) * 34;
-            let egate_q8_needed = seq_len * erg8;
-            if bs.batch_q8.len() < egate_q8_needed {
-                bs.batch_q8.resize(egate_q8_needed, 0u8);
-            }
-            self.pool.par_quantize(
-                seq_len,
-                d,
-                bs.residual.as_ptr() as usize,
-                bs.batch_q8.as_mut_ptr() as usize,
             );
             self.matmul_batch(
                 &format!("{}.ffn_gate.weight", p),
-                &bs.residual[..seq_len * d],
+                &bs.hidden[..seq_len * d],
                 &mut bs.gate[..seq_len * ffn_dim],
                 &mut rb,
                 ffn_dim,
@@ -1394,30 +1332,23 @@ impl LlamaModel {
                 Some(&bs.batch_q8[..]),
             )?;
 
+            let efd_q8_needed = seq_len * (ffn_dim.div_ceil(32) * 34);
+            if bs.batch_q8.len() < efd_q8_needed {
+                bs.batch_q8.resize(efd_q8_needed, 0u8);
+            }
+            let efd_q8row = ffn_dim / 32 * 34;
             for s in 0..seq_len {
                 let off = s * ffn_dim;
-                ops::silu(&mut bs.gate[off..off + ffn_dim]);
-                ops::mul_elem(
+                ops::silu_mul_q8(
                     &bs.gate[off..off + ffn_dim],
                     &bs.up[off..off + ffn_dim],
-                    &mut bs.ffn_tmp[off..off + ffn_dim],
+                    &mut bs.batch_q8[s * efd_q8row..(s + 1) * efd_q8row],
+                    ffn_dim,
                 );
             }
-
-            let efq8 = ffn_dim.div_ceil(32) * 34;
-            let effn_q8_needed = seq_len * efq8;
-            if bs.batch_q8.len() < effn_q8_needed {
-                bs.batch_q8.resize(effn_q8_needed, 0u8);
-            }
-            self.pool.par_quantize(
-                seq_len,
-                ffn_dim,
-                bs.ffn_tmp.as_ptr() as usize,
-                bs.batch_q8.as_mut_ptr() as usize,
-            );
             self.matmul_batch(
                 &format!("{}.ffn_down.weight", p),
-                &bs.ffn_tmp[..seq_len * ffn_dim],
+                &bs.gate[..seq_len * ffn_dim],
                 &mut bs.q_buf[..seq_len * d],
                 &mut rb,
                 d,
