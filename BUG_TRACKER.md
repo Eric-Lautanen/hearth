@@ -13,7 +13,7 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 10 — AVX-512 VNNI Q2_0 kernel)
+## Current status (2026-06-02, Session 11 — Shuffle kernel rejection)
 
 ### AVX-512 VNNI Q2_0 kernel: DONE (Session 10)
 Added `dot_q2_0_q8_0_vnni_avx512` using `vpdpbusd` (u8 × i8 → i32 dot product) for the Q2_0×Q8_0 kernel.
@@ -125,6 +125,12 @@ Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on s
 
 ### 2026-06-02 AVX-512 VNNI Q2_0 kernel (vpdpbusd, correct, neutral/~±3%): ~49 tok/s
 
+### 2026-06-02 Session 11: No kernel changes survived review
+- Attempted SSE4.1 shuffle Q2_0 kernel (inline 2-bit extraction, no LUT): **REJECTED** — stride-4 alignment mismatch between extracted weight values (stride-4 from same-bit-position extraction) and contiguous activations
+- Attempted AVX2 shuffle Q2_0 kernel: **REJECTED** — same stride-4 issue, plus the 2-bit extraction requires 10+ SIMD instructions vs 8 L1 LUT loads
+- Attempted Q8_0 format change (38 bytes/block for precomputed sum_act): **REVERTED** — too invasive (~100 locations across 10+ files), marginal benefit for VNNI kernel only
+- Key finding: Q2_0 LUT approach is fundamentally optimal. The 1-bit Q1_0 shuffle kernel works because sign expansion via cmpeq+xor+sub directly maps to contiguous {-1,+1}. No equivalent exists for 2-bit {-1,0,1,2}.
+
 ### 2026-06-02 Software prefetch (pool.rs _mm_prefetch): REVERTED (~5-11% Q1_0 regression)
 
 ### 1.7B Q2_0
@@ -184,6 +190,8 @@ Pre-expand Q1_0 weights to i8 signs (7.2× memory): 3× tok/s regression on all 
 Model-size-aware thread count (10 workers) with spin-loop pool: catastrophic regressions on all models (3-7×)
 Raw std::thread::scope: catastrophic on Windows (5.2/2.8 tok/s)
 Spin-wait pool (no yield): 100% CPU, starved main thread
+SSE4.1/AVX2 shuffle Q2_0 kernel (inline 2-bit extraction): **REJECTED** — stride-4 alignment issue. Extracting bits-0-1 from 8 packed bytes gives weight values at positions [0,4,8,12,16,20,24,28] but activations are contiguous [a0..a7]. madd_epi16 pairs a[0]*w[0] + a[1]*w[4] instead of correct a[0]*w[0] + a[4]*w[4]. The 1-bit Q1_0 shuffle works because sign expansion via cmpeq produces contiguous {-1,+1} values directly with no stride issue.
+Q8_0 format change for precomputed sum_act (38 bytes/block): **REVERTED** — requires updating ~100 block-size calculations across 10+ files for marginal VNNI kernel benefit
 LLVM codegen flags: +-slow-unaligned-mem-256 not recognized by Rust LLVM
 6 workers: worse on all models tested (4B Q2_0: 10.8→8.4, 8B Q2_0: 4.6→3.5)
 10 workers with 1.7B models: catastrophic (36→8 tok/s, d=2048 too small)
@@ -223,7 +231,7 @@ ffn_gate_up_matmul 46% | ffn_down_matmul 25% | qkv_matmul 16% | attn_output_matm
 
 ## Next up
 
-- Precompute sum_act in Q8_0 quantizer to eliminate second vpdpbusd call in VNNI kernel
-- AVX-512 512-bit Q2_0 kernel: process 2 Q8_0 sub-blocks at once with vpdpbusd on 512-bit
-- Q1_0 shuffle kernel with _mm512_permutexvar_epi8 (vpermb) for cross-lane sign expansion
-- Eliminate LUT loads entirely: pre-expand Q2_0 weight bytes to u8 at load time (trade memory for compute)
+- AVX-512 512-bit Q2_0 kernel: process 2 Q8_0 sub-blocks at once with vpdpbusd on 512-bit. Main benefit: reduced instruction count, fewer scale conversions. Requires avx512f+avx512vnni.
+- Higher-level matmul batching: process multiple weight rows per dot call to amortize quantize_act() overhead and improve activation cache reuse. Currently each row re-reads the activation data from L1; with batching, stay hot in registers.
+- Check lm_head quantization format (may differ from model weights, enabling separate optimization)
+- Revisit pre-expanded Q2_0 weights for 1.7B Q2_0 only (3.8× memory, compute-bound model may benefit)

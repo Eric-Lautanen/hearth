@@ -1,46 +1,53 @@
-# Session 10: AVX-512 VNNI Q2_0 kernel
+# Session 11: Shuffle kernel exploration (negative result)
 
-**Session 10 result:** Added `dot_q2_0_q8_0_vnni_avx512` using `vpdpbusd` for Q2_0×Q8_0 dot product. Correct (22/22 tests pass), neutral performance (±3% within system variance). The vpdpbusd arithmetic saves ~2 µops per sub-block vs the AVX2 LUT kernel, but LUT load overhead (8 loads/sub-block) dominates.
+**Session 11 result:** Attempted to replace LUT-based Q2_0 kernels with SIMD inline 2-bit extraction (shuffle kernels) to eliminate LUT loads. Both SSE4.1 and AVX2 versions were **REJECTED** due to the stride-4 alignment issue.
 
-**Key insight:** The Q2_0 kernel is LUT-load-bound, not arithmetic-bound. The 8 LUT loads per sub-block (Q2V_U8[byte] for unpacking 2-bit values) dominate the inner loop. Replacing arithmetic (`cvtepi8 + madd`) with `vpdpbusd` doesn't help because the memory loads are the bottleneck.
+**Key insight (why shuffle doesn't work for Q2_0):** Extracting 2-bit values from packed bytes by bit position (e.g., all bits-0-1 from 8 packed bytes) produces 8 weight values at stride-4 positions (0,4,8,12,16,20,24,28), but Q8_0 activations are contiguous. The `_mm_madd_epi16` pairs these incorrectly. For Q1_0, the shuffle kernel works because the 1-bit sign expansion via `cmpeq` + `xor` + `sub` directly maps 1-bit values to contiguous {-1,+1} without stride issues — fundamentally different from the 2-bit case.
 
-**Prefetch experiment:** Software prefetch (`_mm_prefetch` with `_MM_HINT_T1`) in the worker loop regressed Q1_0 by 5-11%. The Zen 4 hardware prefetcher already handles sequential weight access well.
+**The LUT-based approach is optimal for Q2_0** because:
+- Q2V_U8 (1KB) / Q2V_I16 (2KB) fits in L1 cache
+- 8 LUT loads per sub-block (from L1, ~4 cycles each) are faster than the ~20 SIMD instructions needed for inline 2-bit extraction + stride correction
+- The stride-4 alignment between extracted values and contiguous activations requires complex shuffle/gather that adds more latency than it saves
+
+**Also attempted (reverted):** Precompute sum_act in Q8_0 quantizer to eliminate the second `vpdpbusd` in the VNNI kernel. Reverted because it requires updating Q8_0 format (34→38 bytes/block) across ~100 locations in 10+ files, for marginal benefit.
 
 ---
 
-## Session 10 benchmarks (50-token, warmup included)
+## Session 11 benchmarks (50-token, warm)
 
-System was warm after multiple runs — expect ±5-10% variance from thermal throttling.
-
-| Model | tok/s | avg_cpu_overhead (µs/tok) | vs S9 baseline |
+| Model | tok/s | avg_cpu_overhead (µs/tok) | vs S10 baseline |
 |---|---|---|---|
-| 1.7B Q1_0 | 43.8 | 22,704 | -11.5% (system variance — Q1_0 not modified) |
-| 1.7B Q2_0 | 26.4 | 37,247 | -8.0% (within noise) |
-| 4B Q1_0 | 19.7 | 50,385 | -16.2% (system variance — Q1_0 not modified) |
-| 4B Q2_0 | 13.1 | 75,447 | +0.8% (neutral) |
-| 8B Q1_0 | 11.0 | 90,580 | -17.9% (system variance) |
-| 8B Q2_0 | 6.5 | 152,617 | -8.5% (within noise) |
+| 1.7B Q1_0 | 35.9 | 27,685 | -18% (cold start) |
+| 1.7B Q2_0 | 23.5 | 42,321 | -11% (within variance) |
+| 4B Q1_0 | 22.3 | 44,799 | +13% (warm improvement) |
+| 4B Q2_0 | 11.8 | 84,039 | -10% (within variance) |
+| 8B Q1_0 | 11.1 | 90,636 | +1% (neutral) |
+| 8B Q2_0 | 6.0 | 165,563 | -8% (within variance) |
 
-Note: Q1_0 models were NOT modified — all regressions are system variance. Q2_0 models use the new VNNI kernel. Performance is ±8% vs S9 baseline, all within typical system variance for this hardware.
+Note: No kernel changes survived review. All variance is thermal/system.
 
 ---
 
-## Next optimization targets
+## Next optimization targets (reprioritized)
 
-### Target 1: Precompute Q8_0 activation sum for VNNI correction
-The current VNNI kernel computes `sum_act = vpdpbusd(ones, act)` per sub-block — a second `vpdpbusd` call that doubles the inner-loop overhead. Precompute `sum_act` during Q8_0 quantization and store it alongside the block data (or as a separate array), eliminating the second call.
+### Target 1: Process multiple Q8_0 sub-blocks in VNNI kernel
+The current VNNI kernel processes 1 sub-block (32 elements) per iteration. Using 512-bit AVX-512 would process 2 sub-blocks (64 elements) per iteration. On Zen 4 (double-pumped 256-bit FPU), the main benefit is reduced instruction count and fewer scale conversions. Requires `avx512f` + `avx512vnni`.
 
-### Target 2: 512-bit AVX-512 Q2_0 kernel (process 2 Q8_0 blocks at once)
-With `avx512vbmi` available (confirmed), use `_mm512_permutexvar_epi8` (vpermb) for cross-lane byte permutation. Process 2 × 32-element Q8_0 sub-blocks (64 elements) per 512-bit iteration, halving the inner loop count. Requires contiguous activation data or two 256-bit loads.
+### Target 2: Higher-level matmul optimization
+Instead of calling the dot kernel once per row, process batches of rows together. This could amortize the quantize_act() overhead and improve cache utilization for activation data. Currently each row re-reads the activation data; with batching, the activation data would stay in L1.
 
-### Target 3: Eliminate Q2_0 LUT loads via pre-expansion
-Pack Q2_0 weight bytes at load time to store raw u8 values {0,1,2,3} in 128 bytes per 128-element block (vs current 34 bytes with 2-bit packing). Cost: 3.8× memory traffic. Benefit: zero LUT loads in the inner loop. Only viable for compute-bound models (1.7B Q2_0). Use `Vec<u8>` expansion at load time, not format change.
+### Target 3: Investigate lm_head quantization format
+The lm_head tensor may use a different quantization format than the model weights. If it's Q8_0 or higher precision, we could potentially optimize its matmul separately. Check the GGUF tensor metadata.
 
-### Target 4: AVX-512 Q1_0 shuffle kernel
-Port the shuffle kernel to 512-bit vectors using `_mm512_broadcast_i32x4` + `_mm512_shuffle_epi8` for sign expansion. Process 64 elements per batch (2 Q8_0 sub-blocks). The main challenge is handling 2 different activation scales within one 512-bit batch — requires splitting the accumulator into lower/upper 256-bit halves.
+### Target 4: Eliminate Q2_0 LUT loads via pre-expansion (revisit for 1.7B Q2_0 only)
+Earlier attempt failed for Q1_0 (7.2× memory, 3× regression). For Q2_0, the expansion ratio is only 3.8× (34→128 bytes/block). The 1.7B Q2_0 model (554 MB → 2085 MB expanded) might see compute-bound behavior where LUT elimination helps. Risk: memory traffic increase overwhelms compute savings.
 
 ---
 
 ## Key files
-- `crates/hearth-quant/src/q2_0.rs` — `dot_q2_0_q8_0_vnni_avx512` (VNNI kernel), `Q2V_U8` LUT, dispatch updated
-- `crates/hearth-llm/src/pool.rs` — Worker loop with `_mm_prefetch` (REVERTED)
+- `crates/hearth-quant/src/q2_0.rs` — Dispatch: VNNI > AVX2 LUT > SSE4.1 LUT > scalar (no changes from S10)
+- `crates/hearth-quant/src/q8_0.rs` — Q8_0 quantize/dequantize (no changes from S10)
+
+## Key ref files (Prism fork)
+- `ggml/src/ggml-cpu/quants.c:177` — `ggml_vec_dot_q2_0_q8_0_generic` (purely scalar, no SIMD path for Q2_0)
+- `ggml/src/ggml-common.h:187-192` — `block_q2_0` struct (128 elements, 34 bytes)
