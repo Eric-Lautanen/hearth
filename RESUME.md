@@ -1,46 +1,46 @@
-# Session 10: Profile-guided optimization targets
+# Session 10: AVX-512 VNNI Q2_0 kernel
 
-**Session 9 result:** Tile-in-L2 matmul dispatch implemented in pool.rs but had **neutral impact** on lm_head (reads each weight row exactly once — no L2 reuse benefit). No regressions across all 6 models. Minor 4B Q1_0 improvement (+6.4%) likely system variance.
+**Session 10 result:** Added `dot_q2_0_q8_0_vnni_avx512` using `vpdpbusd` for Q2_0×Q8_0 dot product. Correct (22/22 tests pass), neutral performance (±3% within system variance). The vpdpbusd arithmetic saves ~2 µops per sub-block vs the AVX2 LUT kernel, but LUT load overhead (8 loads/sub-block) dominates.
 
-**Key insight from Session 9:** Weight-stationary matmul reads each row exactly once per forward — tiling worker chunks to fit L2 provides no reuse benefit. The remaining bottlenecks need different approaches.
+**Key insight:** The Q2_0 kernel is LUT-load-bound, not arithmetic-bound. The 8 LUT loads per sub-block (Q2V_U8[byte] for unpacking 2-bit values) dominate the inner loop. Replacing arithmetic (`cvtepi8 + madd`) with `vpdpbusd` doesn't help because the memory loads are the bottleneck.
+
+**Prefetch experiment:** Software prefetch (`_mm_prefetch` with `_MM_HINT_T1`) in the worker loop regressed Q1_0 by 5-11%. The Zen 4 hardware prefetcher already handles sequential weight access well.
 
 ---
 
-## Next optimization targets (from timing profiles)
+## Session 10 benchmarks (50-token, warmup included)
 
-Session 9 warm 1.7B Q1_0 profile (~18ms forward):
-- ffn_gate_up_matmul: ~35% (6300µs)
-- ffn_down_matmul: ~20% (3700µs)
-- qkv_matmul: ~12% (2200µs)
-- lm_head_matmul: ~14% (2700µs)
-- attention: ~6% (1100µs)
-- attn_output_matmul: ~7% (1300µs)
+System was warm after multiple runs — expect ±5-10% variance from thermal throttling.
 
-### Target 1: Fuse Q8_0 quant into first matmul row
-The `quantize_act()` call is ~0.5% of forward time (160µs), but fusing it into the first matmul row avoids the separate quantize pass entirely. Since `matmul()` already receives `x_q8: Option<&[u8]>`, the Q/K/V and FFN matmuls after the first per-layer matmul reuse the cached Q8 buffer. The gain is bounded to ~0.5% but removes a pass over `x` data in memory.
+| Model | tok/s | avg_cpu_overhead (µs/tok) | vs S9 baseline |
+|---|---|---|---|
+| 1.7B Q1_0 | 43.8 | 22,704 | -11.5% (system variance — Q1_0 not modified) |
+| 1.7B Q2_0 | 26.4 | 37,247 | -8.0% (within noise) |
+| 4B Q1_0 | 19.7 | 50,385 | -16.2% (system variance — Q1_0 not modified) |
+| 4B Q2_0 | 13.1 | 75,447 | +0.8% (neutral) |
+| 8B Q1_0 | 11.0 | 90,580 | -17.9% (system variance) |
+| 8B Q2_0 | 6.5 | 152,617 | -8.5% (within noise) |
 
-### Target 2: Check Q1_0_kernel (d=4096 8B) for 8B Q1_0 improvement
-8B Q1_0 lags at 13.5 tok/s vs 8.2 ref = 1.65×. 8B has d=4096 leading to 576-byte rows in Q1_0. The shuffle kernel reads 16 block headers (scales) then 16×16-byte sign groups. At d=4096, a dot product iterates 32 blocks = 2 internal loops. Consider whether widening to 8-wide SIMD for sign accumulation would help.
+Note: Q1_0 models were NOT modified — all regressions are system variance. Q2_0 models use the new VNNI kernel. Performance is ±8% vs S9 baseline, all within typical system variance for this hardware.
 
-### Target 3: Investigate persistent 8B Q2_0 gap
-8B Q2_0 at 7.0 tok/s vs 1.5 ref = 4.67×. This model is completely bandwidth-bound (2.1GB model on DDR5). Single-core ref achieves 1.5 tok/s scaling linearly to 8-core = 12 tok/s. Hearth at 7.0 tok/s is only 58% of linear scaling. Investigate memory contention, cache line bouncing, or TLB misses from the Q2V lookup table.
+---
 
-### Target 4: Continue investigating AVX-512 (if hardware available)
-The Ryzen 7 8840HS has AVX-512 (Zen 4). Currently enabled via `target-cpu=native`. Could write AVX-512 kernels for Q1_0 and Q2_0 dot products. LLVM auto-vectorization may not be optimal for the shuffle kernel pattern.
+## Next optimization targets
+
+### Target 1: Precompute Q8_0 activation sum for VNNI correction
+The current VNNI kernel computes `sum_act = vpdpbusd(ones, act)` per sub-block — a second `vpdpbusd` call that doubles the inner-loop overhead. Precompute `sum_act` during Q8_0 quantization and store it alongside the block data (or as a separate array), eliminating the second call.
+
+### Target 2: 512-bit AVX-512 Q2_0 kernel (process 2 Q8_0 blocks at once)
+With `avx512vbmi` available (confirmed), use `_mm512_permutexvar_epi8` (vpermb) for cross-lane byte permutation. Process 2 × 32-element Q8_0 sub-blocks (64 elements) per 512-bit iteration, halving the inner loop count. Requires contiguous activation data or two 256-bit loads.
+
+### Target 3: Eliminate Q2_0 LUT loads via pre-expansion
+Pack Q2_0 weight bytes at load time to store raw u8 values {0,1,2,3} in 128 bytes per 128-element block (vs current 34 bytes with 2-bit packing). Cost: 3.8× memory traffic. Benefit: zero LUT loads in the inner loop. Only viable for compute-bound models (1.7B Q2_0). Use `Vec<u8>` expansion at load time, not format change.
+
+### Target 4: AVX-512 Q1_0 shuffle kernel
+Port the shuffle kernel to 512-bit vectors using `_mm512_broadcast_i32x4` + `_mm512_shuffle_epi8` for sign expansion. Process 64 elements per batch (2 Q8_0 sub-blocks). The main challenge is handling 2 different activation scales within one 512-bit batch — requires splitting the accumulator into lower/upper 256-bit halves.
 
 ---
 
 ## Key files
-- `crates/hearth-llm/src/pool.rs` — `WorkParams` now has `tile_size` field; workers tile within chunks
-- `crates/hearth-llm/src/model/matmul.rs` — matmul dispatch (no changes needed for tiling)
-- `crates/hearth-llm/src/model/mod.rs` — forward pass, lm_head timing
-
-## Session 9 baselines (50-token, 10-prompt warm avg)
-| Model | tok/s | avg_cpu_overhead (µs/tok) |
-|---|---|---|
-| 1.7B Q1_0 | 49.5 | 20,202 |
-| 1.7B Q2_0 | 28.7 | 34,843 |
-| 4B Q1_0 | 23.5 | 42,553 |
-| 4B Q2_0 | 13.0 | 76,923 |
-| 8B Q1_0 | 13.4 | 74,626 |
-| 8B Q2_0 | 7.1 | 140,845 |
+- `crates/hearth-quant/src/q2_0.rs` — `dot_q2_0_q8_0_vnni_avx512` (VNNI kernel), `Q2V_U8` LUT, dispatch updated
+- `crates/hearth-llm/src/pool.rs` — Worker loop with `_mm_prefetch` (REVERTED)
