@@ -1,94 +1,82 @@
-# Session 8: Pre-expand Q1_0 weight rows to i8 sign arrays
+# Session 9: LM head tile-in-L2 matmul
 
-**Goal:** Eliminate bit-unpacking from the Q1_0 dot-product hot loop by expanding weights at load time. Q1_0 packs 128 1-bit signs into 18 bytes per block. Every matmul call unpacks these on-the-fly. Pre-expanding to 128 i8 bytes (128B/block) turns the kernel into a trivial `i8×i8→i32` dot product — no bit manipulation, no shuffle, just multiply-accumulate.
+**Goal:** Improve lm_head matmul throughput by dispatching cache-friendly tiles instead of contiguous row chunks. The lm_head is 151669 × 2048 = 310M elements = 43.7MB packed Q1_0. Current pool dispatches 18959-row contiguous chunks per worker — each chunk is 5.5MB, far exceeding the 1MB L2 cache.
 
-**Estimated impact:** 15-25% tok/s on small models (1.7B, 4B). 8B may show less or regress from bandwidth pressure (7× more weight data to read).
+By processing ~3555-row tiles per worker (tile size = 1MB L2 / 288 bytes per row), each tile stays hot in L2, reducing cache misses from ~80% to near-zero per tile.
+
+**Estimated impact:** 10-20% on 1.7B Q1_0 lm_head (currently ~5% of forward time), 5-10% on 4B. 8B already bandwidth-limited from L3.
 
 ---
 
 ## Implementation plan
 
-### Step 1 — Understand current Q1_0 block format
+### Step 1 — Read current pool.rs and matmul.rs
 
-Read `crates/hearth-quant/src/q1_0g128.rs`. The Q1_0_G128 block is 18 bytes for 128 elements:
-- Bytes 0-1: f16 scale (same as Q8_0)
-- Byte 2: 8 sign bits for elements 0-7 (bit=0 → +1, bit=1 → -1)
-- ...continues for all 128 elements packed into 16 sign bytes (128 bits total)
+The `par_dot_rows` function in `pool.rs` dispatches contiguous chunks. Change the per-worker iteration to loop over tiles within its chunk:
 
-The current `dot_q1_0g128_q8_0` function iterates each byte, extracts 8 sign bits, looks up in `Q1V[256]` (a 2KB LUT), then multiplies with Q8_0 values. This shuffle + LUT pattern is the hot loop.
-
-### Step 2 — Add expanded weight storage
-
-In `crates/hearth-llm/src/model/mod.rs`, add to `LlamaModel`:
+Current:
 ```rust
-expanded_q1_weights: HashMap<String, Vec<i8>>,
+for row in begin..end {
+    *out[row] = dot_fn(w_base + row * row_bytes, a_ptr, n_cols);
+}
 ```
 
-Populate during `load_model()` (in the tensor-loading loop around line 150-200): for each Q1_0 or Q1_0_G128 tensor, unpack the entire tensor into `Vec<i8>` (one `i8` per weight element, value -1 or +1). Store keyed by tensor name.
-
-Memory: each Q1_0 weight grows from 18B/128el (0.14B/el) to 128B/128el (1B/el) = 7.1×. For 1.7B: ~37MB → ~265MB. For 8B: ~1.1GB → ~7.8GB (may not fit). **Conditional flag**: only expand if `d_model < 4096` (skip 8B).
-
-### Step 3 — Write the expanded dot kernel
-
-In `crates/hearth-quant/src/q1_0g128.rs`, add:
+Target:
 ```rust
-pub fn dot_q1_0g128_q8_0_expanded(w: &[i8], a: &[u8], n: usize) -> f32
+let tile_rows = 3555;  // ~1MB of weight data
+let r_begin = begin;
+let r_end = end;
+let mut r = r_begin;
+while r < r_end {
+    let tile_end = (r + tile_rows).min(r_end);
+    for row in r..tile_end {
+        *out[row] = dot_fn(w_base + row * row_bytes, a_ptr, n_cols);
+    }
+    r = tile_end;
+}
 ```
-That's just: for each Q8_0 block, `sum += w[i] * q8_val[i] * scale`. No bit unpacking needed — `w[i]` is already -1 or +1.
 
-Add a raw-pointer variant `dot_q1_0g128_q8_0_expanded_ptr` for the thread-pool dispatch.
+The tile loop introduces no memory overhead — just changes the access pattern so each tile's weight data is hot in L2 before moving to the next tile.
 
-### Step 4 — Wire into matmul path
+**Important:** The tile size must be tuned. 1MB L2 / 288 bytes = 3555 rows for Q1_0. For Q2_0: 1MB / 544 bytes = 1925 rows.
 
-In `crates/hearth-llm/src/model/matmul.rs`:
+### Step 2 — Add tile_size parameter to WorkParams
 
-In `matmul()` under the `Q1_0_G128 | Q1_0` branches: if `self.expanded_q1_weights` contains the weight name, use the expanded dot kernel with the pre-expanded row pointer instead of the packed row pointer. Pass the expanded row's raw pointer to `par_dot_rows`.
+In `pool.rs`:
+- Add `tile_size: usize` to `WorkParams` (default = `usize::MAX` = no tiling)
+- In `par_dot_rows`, pass the tile_size
+- Workers use tile_size for inner loop
 
-**Important:** The expanded row pointer needs to work with `par_dot_rows` which passes the same `row_bytes` (stride) to the worker functions. With expanded weights, each row is `n_cols` bytes (1 i8 per element), not the packed `n_cols/128*18` bytes. You'll need to either:
-- Pass the expanded data with `row_bytes = n_cols` and let the dot kernel iterate n_cols elements, OR
-- Create a separate dispatch path for expanded weights
+### Step 3 — Set tile_size in matmul.rs
 
-The simplest approach: a separate `par_dot_rows_expanded` variant in `pool.rs` that iterates with `row_bytes = n_cols` and calls the expanded dot kernel.
+When dispatching lm_head matmuls, set `tile_size = l2_cache_per_core / row_bytes`:
+- For Q1_0: 1024*1024 / (2048/128*18) ≈ 3700 rows/tile
+- For Q2_0: 1024*1024 / (2048/128*34) ≈ 1900 rows/tile
+- For Q8_0: 1024*1024 / (2048/32*34) ≈ 470 rows/tile
 
-### Step 5 — Update `matmul_batch` similarly
+### Step 4 — Measure
 
-If expanded weights exist for a tensor, use the expanded dot kernel in the batch path too.
+Compare tok/s for `lm_head_matmul` timing before and after. The rest of the forward pass should be unchanged.
 
 ---
 
-## Files to modify
-
-| File | Changes |
-|---|---|
-| `crates/hearth-quant/src/q1_0g128.rs` | Add `dot_q1_0g128_q8_0_expanded` / `_ptr` functions |
-| `crates/hearth-quant/src/lib.rs` | Export the new functions |
-| `crates/hearth-llm/src/pool.rs` | Add `par_dot_rows_expanded` or parameterize `row_stride` |
-| `crates/hearth-llm/src/model/mod.rs` | Add `expanded_q1_weights: HashMap<String, Vec<i8>>`, populate at load time |
-| `crates/hearth-llm/src/model/matmul.rs` | Dispatch to expanded kernel when weights exist |
-
----
-
-## Benchmark & verify
+## Benchmark
 
 1. Build: `cargo build --release`
-2. Run all 6 models one at a time (warm, at least 2 runs each):
-   - `& ".\target\release\hearth-chat-cli.exe" "$model" --temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`
-3. Compare avg_cpu_overhead tok/s to Session 7 baseline below.
-4. **If any model degrades, revert.** Particularly watch 8B Q1_0 — the 7× memory increase may cause swapping or bandwidth collapse.
+2. Run 1.7B Q1_0 and 1.7B Q2_0 (they have the largest lm_head relative to total model size)
+3. Check the `lm_head_matmul` timing section
+4. Run all 6 models to verify no regression
 
-**Session 7 baselines (20-token, warm, second run):**
-| Model | avg_cpu_overhead (µs/tok) | tok/s |
+**Session 8 baselines (50-token, warm):**
+| Model | tok/s | avg_cpu_overhead (µs/tok) |
 |---|---|---|
-| 1.7B Q1_0 | 21,778 | 45.9 |
-| 1.7B Q2_0 | 35,863 | 27.9 |
-| 4B Q1_0 | 42,736 | 23.4 |
-| 4B Q2_0 | — | ~11 (BUG_TRACKER) |
-| 8B Q1_0 | 73,736 | 13.6 |
-| 8B Q2_0 | — | ~5 (BUG_TRACKER) |
+| 1.7B Q1_0 | 47.9 | 20,835 |
+| 1.7B Q2_0 | 27.8 | 36,006 |
+| 4B Q1_0 | 21.9 | 45,805 |
+| 4B Q2_0 | 12.8 | 77,919 |
+| 8B Q1_0 | 13.1 | 76,114 |
+| 8B Q2_0 | 7.1 | 140,533 |
 
----
-
-## Key references
-- `crates/hearth-quant/src/q1_0g128.rs` — current packed dot kernel (study the sign-bit extraction pattern)
-- `crates/hearth-quant/src/q8_0.rs` — simple reference: Q8_0 dot is `i8×i8×scale×scale`, no bit packing. Expanded Q1_0 should look similar.
-- `crates/hearth-llm/src/pool.rs` — `par_dot_rows` with `row_bytes` stride parameter
+## Key files
+- `crates/hearth-llm/src/pool.rs` — `WorkParams`, `par_dot_rows`, worker loop
+- `crates/hearth-llm/src/model/matmul.rs` — lm_head dispatch in matmul() `GgmlDType::Q1_0_G128` / `GgmlDType::Q1_0` branches
