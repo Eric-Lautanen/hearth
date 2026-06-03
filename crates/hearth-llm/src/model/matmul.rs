@@ -504,6 +504,7 @@ impl LlamaModel {
         _n_rows: usize,
         n_cols: usize,
         seq_len: usize,
+        x_q8: Option<&[u8]>,
     ) -> Result<(), String> {
         let entry = self
             .tensors
@@ -530,10 +531,20 @@ impl LlamaModel {
                 GgmlDType::Q2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
                 _ => dot_q1_0g128_fast,
             };
-            let mut q8_buf = Vec::with_capacity(seq_len * q8_size);
-            for s in 0..seq_len {
-                hearth_quant::quantize_q8_0(&input[s * k..(s + 1) * k], &mut q8_buf);
-            }
+            let _q8_hold;
+            let q8_buf: &[u8] = if let Some(data) = x_q8 {
+                if data.len() < seq_len * q8_size {
+                    return Err("matmul_batch: x_q8 too small".into());
+                }
+                data
+            } else {
+                let mut buf = Vec::with_capacity(seq_len * q8_size);
+                for s in 0..seq_len {
+                    hearth_quant::quantize_q8_0(&input[s * k..(s + 1) * k], &mut buf);
+                }
+                _q8_hold = buf;
+                &_q8_hold[..]
+            };
             self.pool.par_dot_rows_batched(
                 m,
                 seq_len,
