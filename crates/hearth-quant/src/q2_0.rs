@@ -270,7 +270,7 @@ unsafe fn dot_q2_0_q8_0_lut_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -
     hsum_float_8(acc_global)
 }
 
-/// SSE4.1 kernel: 8 elements per batch, 4 batches per sub-block.
+/// SSE4.1 LUT kernel: 8 elements per batch, 4 batches per sub-block.
 #[cfg(target_arch = "x86_64")]
 unsafe fn dot_q2_0_q8_0_ptr_sse41(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     let blocks = n / BLOCK_SIZE;
@@ -352,7 +352,7 @@ unsafe fn dot_q2_0_q8_0_ptr_scalar(w_ptr: *const u8, a_ptr: *const u8, n: usize)
     sum
 }
 
-/// Raw-pointer dispatch: AVX-512 VNNI > AVX2 LUT > SSE4.1 > scalar.
+/// Raw-pointer dispatch: AVX-512 VNNI > AVX2 LUT > SSE4.1 LUT > scalar.
 /// # Safety
 /// w_ptr valid for n/128*34 bytes, a_ptr valid for n/32*34 bytes.
 pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
