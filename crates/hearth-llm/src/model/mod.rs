@@ -957,6 +957,10 @@ impl LlamaModel {
                 );
             }
 
+            bs.batch_q8.clear();
+            for s in 0..seq_len {
+                hearth_quant::quantize_q8_0(&bs.attn_out[s * nq..(s + 1) * nq], &mut bs.batch_q8);
+            }
             self.matmul_batch(
                 &format!("{}.attn_output.weight", p),
                 &bs.attn_out[..seq_len * nq],
@@ -965,7 +969,7 @@ impl LlamaModel {
                 d,
                 nq,
                 seq_len,
-                None,
+                Some(&bs.batch_q8[..]),
             )?;
             for i in 0..seq_len * d {
                 bs.hidden[i] += bs.q_buf[i];
@@ -1141,6 +1145,10 @@ impl LlamaModel {
                 d,
             );
 
+            bs.batch_q8.clear();
+            for s in 0..seq_len {
+                hearth_quant::quantize_q8_0(&bs.residual[s * d..(s + 1) * d], &mut bs.batch_q8);
+            }
             self.matmul_batch(
                 &format!("{}.attn_q.weight", p),
                 &bs.residual[..seq_len * d],
@@ -1149,7 +1157,7 @@ impl LlamaModel {
                 nq,
                 d,
                 seq_len,
-                None,
+                Some(&bs.batch_q8[..]),
             )?;
             self.matmul_batch(
                 &format!("{}.attn_k.weight", p),
@@ -1159,7 +1167,7 @@ impl LlamaModel {
                 nkv,
                 d,
                 seq_len,
-                None,
+                Some(&bs.batch_q8[..]),
             )?;
             self.matmul_batch(
                 &format!("{}.attn_v.weight", p),
@@ -1169,7 +1177,7 @@ impl LlamaModel {
                 nkv,
                 d,
                 seq_len,
-                None,
+                Some(&bs.batch_q8[..]),
             )?;
 
             bs.q_heads[..seq_len * nq].copy_from_slice(&bs.q_buf[..seq_len * nq]);
@@ -1284,6 +1292,10 @@ impl LlamaModel {
                 );
             }
 
+            bs.batch_q8.clear();
+            for s in 0..seq_len {
+                hearth_quant::quantize_q8_0(&bs.attn_out[s * nq..(s + 1) * nq], &mut bs.batch_q8);
+            }
             self.matmul_batch(
                 &format!("{}.attn_output.weight", p),
                 &bs.attn_out[..seq_len * nq],
@@ -1292,7 +1304,7 @@ impl LlamaModel {
                 d,
                 nq,
                 seq_len,
-                None,
+                Some(&bs.batch_q8[..]),
             )?;
             for i in 0..seq_len * d {
                 bs.hidden[i] += bs.q_buf[i];
@@ -1309,6 +1321,10 @@ impl LlamaModel {
                 d,
             );
 
+            bs.batch_q8.clear();
+            for s in 0..seq_len {
+                hearth_quant::quantize_q8_0(&bs.residual[s * d..(s + 1) * d], &mut bs.batch_q8);
+            }
             self.matmul_batch(
                 &format!("{}.ffn_gate.weight", p),
                 &bs.residual[..seq_len * d],
@@ -1317,7 +1333,7 @@ impl LlamaModel {
                 ffn_dim,
                 d,
                 seq_len,
-                None,
+                Some(&bs.batch_q8[..]),
             )?;
             self.matmul_batch(
                 &format!("{}.ffn_up.weight", p),
@@ -1327,7 +1343,7 @@ impl LlamaModel {
                 ffn_dim,
                 d,
                 seq_len,
-                None,
+                Some(&bs.batch_q8[..]),
             )?;
 
             for s in 0..seq_len {
@@ -1340,6 +1356,13 @@ impl LlamaModel {
                 );
             }
 
+            bs.batch_q8.clear();
+            for s in 0..seq_len {
+                hearth_quant::quantize_q8_0(
+                    &bs.ffn_tmp[s * ffn_dim..(s + 1) * ffn_dim],
+                    &mut bs.batch_q8,
+                );
+            }
             self.matmul_batch(
                 &format!("{}.ffn_down.weight", p),
                 &bs.ffn_tmp[..seq_len * ffn_dim],
@@ -1348,7 +1371,7 @@ impl LlamaModel {
                 d,
                 ffn_dim,
                 seq_len,
-                None,
+                Some(&bs.batch_q8[..]),
             )?;
             for i in 0..seq_len * d {
                 bs.hidden[i] += bs.q_buf[i];

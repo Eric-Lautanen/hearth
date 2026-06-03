@@ -178,8 +178,6 @@ impl ThreadPool {
         for w in &self.workers {
             w.done_flag.store(false, Ordering::Relaxed);
         }
-        // Release store ensures the params write and done_flag reset are visible
-        // to workers that see the gen change via Acquire load.
         self.gen.fetch_add(1, Ordering::Release);
         for w in &self.workers {
             while !w.done_flag.load(Ordering::Acquire) {
