@@ -15,7 +15,7 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 15 — Q1_0 AVX-512 VNNI kernel, REVERTED)
+## Current status (2026-06-02, Session 16 — Batched prefill dispatch, NEUTRAL)
 
 ### Q1_0 AVX-512 VNNI kernel: REVERTED (not dispatched)
 
@@ -138,14 +138,14 @@ From `[timing]` output (decode tokens):
 
 Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
-| Model | S13 warm (50tok) | S13 cold | S14 (50tok) | S15 (50tok) |
-|---|---|---|---|---|---|---|
-| 1.7B Q1_0 | **50.7** | 32.5 | **43.8** | **45.3** |
-| 1.7B Q2_0 | **29.6** | 23.0 | **25.6** | **27.7** |
-| 4B Q1_0 | — | 19.2 | **20.7** | **22.2** |
-| 4B Q2_0 | — | 12.5 | **11.3** | **12.8** |
-| 8B Q1_0 | — | 12.3 | **9.4** | **12.9** |
-| 8B Q2_0 | — | 7.6 | **5.6** | **6.2** |
+| Model | S13 warm (50tok) | S13 cold | S14 (50tok) | S15 (50tok) | S16 (50tok) |
+|---|---|---|---|---|---|---|---|
+| 1.7B Q1_0 | **50.7** | 32.5 | **43.8** | **45.3** | **46.3** |
+| 1.7B Q2_0 | **29.6** | 23.0 | **25.6** | **27.7** | **27.7** |
+| 4B Q1_0 | — | 19.2 | **20.7** | **22.2** | **22.3** |
+| 4B Q2_0 | — | 12.5 | **11.3** | **12.8** | **12.5** |
+| 8B Q1_0 | — | 12.3 | **9.4** | **12.9** | **9.3** |
+| 8B Q2_0 | — | 7.6 | **5.6** | **6.2** | **5.7** |
 
 **S15 session variance note:** All models at or above S14 baseline (+3-37%). No code changes affect inference (VNNI kernels added but NOT dispatched). Variance driven by CPU frequency scaling (chip at 31-33°C, 85-100% perf state). 8B Q1_0 at 12.9 tok/s vs 9.4 in S14 reflects CPU running at higher sustained frequency after warmup. |
 
@@ -178,6 +178,12 @@ Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on s
 2026-06-02 i16 LUT (no Q1_0 changes): ~36 tok/s (system variance)
 
 ### 2026-06-02 AVX-512 VNNI Q2_0 kernel (vpdpbusd, correct, neutral/~±3%): ~49 tok/s
+
+### Session 16 change log
+- Added `par_dot_rows_batched` to ThreadPool — single dispatch for all seq_len tokens against shared weight matrix, replacing the sequential per-token `par_dot_rows` loop in `matmul_batch`
+- Modified worker loop to iterate over `seq_len` tokens with per-token activation stride (`q8_stride`) and output offset (`s * n`)
+- Preserved backward compatibility: `par_dot_rows` sets `seq_len=1, q8_stride=0`, worker loop has trivial `for s in 0..1` overhead
+- **Result:** No decode regression on any model (all within ±system variance). Prefill 10 tokens in 158ms (15.9ms/tok) for 1.7B Q1_0. Reduces gen-counter handshake overhead from seq_len dispatches to 1 per matmul_batch call.
 
 ### 2026-06-02 Session 13: Batch-2 Q1_0 kernel (reverted), lm_head dtype investigation
 - Implemented batch-2 AVX2 Q1_0g128 dot kernel (`dot_q1_0g128_q8_0_batch2_avx2`) that processes 2 weight rows against shared activation, reducing activation read traffic by 2×
@@ -298,8 +304,7 @@ ffn_gate_up_matmul 46% | ffn_down_matmul 25% | qkv_matmul 16% | attn_output_matm
 
 ## Next up
 
-- Q1_0 AVX-512 VNNI kernel: map {-1,+1} to u8 {0,1} with `(w + 1)/2` → correction `2*prod - sum_act`. The shuffle kernel is already efficient; VNNI may reduce instruction count by 1-2/block.
-- Batched prefill quantize: batch Q8_0 quantize across all prompt tokens instead of per-token serial loop in `matmul_batch`. Could improve TTFT by 10-30%.
+- Pre-quantize activation once for Q/K/V matmul_batch calls in forward_batch — currently each matmul_batch quantizes the same residual independently, wasting 2/3 of quantize work per layer
 - Investigate `attention()`/`attention_batch()` replacement of `f32x8` with raw AVX2 intrinsics. Currently ~5-7% of total time.
 - Q2_0 pre-expansion revisit: 3.8× memory increase (130 bytes/128-el block). Unlikely to help on bandwidth-bound system, but worth microbenchmarking a single expanded row.
 - Prefetch tuning with `_MM_HINT_T0` (L1) for large models (d>=2560) only. Previously only T1 (L2) was tried.
