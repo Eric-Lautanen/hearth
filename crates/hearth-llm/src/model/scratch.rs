@@ -80,4 +80,5 @@ pub(crate) struct BatchScratch {
     pub(crate) norm_tmp: Vec<f32>,
     pub(crate) attn_scores: Vec<f32>,
     pub(crate) batch_q8: Vec<u8>,
+    pub(crate) head_norm_tmp: Vec<f32>,
 }
