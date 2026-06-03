@@ -2054,6 +2054,34 @@ impl LlamaModel {
         let mut rb = self.row_buf.lock().unwrap();
         let mut bs = self.batch.lock().unwrap();
 
+        // CPU warmup: run one forward pass to get clock frequency up before timed work.
+        // Windows 11 frequency scaling can take ~16ms to ramp from base to boost.
+        if !use_gpu {
+            let warmup_t0 = std::time::Instant::now();
+            // Use BOS token (0) or first prompt token as warmup, at pos=0
+            let warmup_tok = input_ids[0];
+            let warmup_logits = &mut vec![0.0f32; vocab_size];
+            let mut warmup_caches: Vec<KVCache> = (0..n_layers)
+                .map(|_| KVCache::new_with_storage(
+                    self.config.n_kv_heads as usize,
+                    self.config.head_dim as usize,
+                    self.config.max_seq_len as usize,
+                    KVStorage::F32,
+                ))
+                .collect();
+            self.forward(
+                &[warmup_tok],
+                0,
+                &mut warmup_caches,
+                warmup_logits,
+                cancel,
+                &mut sc,
+                &mut rb,
+            )?;
+            let warmup_us = warmup_t0.elapsed().as_micros();
+            eprintln!("[warmup] CPU clock ramp: {}ms", warmup_us / 1000);
+        }
+
         if input_ids.len() > 1 && !use_gpu {
             let t0 = std::time::Instant::now();
             self.forward_batch(
