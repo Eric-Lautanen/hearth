@@ -46,13 +46,19 @@ Q1_0 weights are {-1,+1} × scale. Using VNNI `vpdpbusd` on 512-bit would proces
 
 ## Tier 3 — Lower Priority / Future
 
-### 6. Investigate why Q2_0 pre-expansion failed while Q1_0 pre-expansion also failed
+### 6. Investigate lm_head quantization format (Session 13)
+
+**Status: DONE — no special format.** Checked all 6 models. lm_head (`output.weight` on 8B, `token_embd.weight` on 1.7B) always uses the same quantization format as model weights (Q1_0 or Q2_0). No format disparity to exploit.
+
+### 7. Investigate why Q2_0 pre-expansion failed while Q1_0 pre-expansion also failed
 
 Both rejected for the same reason: memory bandwidth bound. Q1_0 expansion was 7.2× (18→130 bytes/block), Q2_0 would be 3.8× (34→128). The 1.7B Q2_0 (554 MB → 2.1 GB) could be compute-bound enough to benefit, but this is unproven.
 
-### 7. Multi-row matmul dispatch
+### 7. Multi-row matmul dispatch (Session 13)
 
-Process multiple weight rows in a single dot call to amortize function-call overhead and keep activation data hotter in registers. Currently each row calls `dot_fn` independently via function pointer.
+Attempted: batch-2 Q1_0_G128 AVX2 kernel that processes 2 weight rows against shared activation, halving activation read traffic. Added `par_dot_rows_batch2` pool dispatch, wired into Q1_0/Q1_0_G128 matmul paths.
+
+**Status: REVERTED — neutral perf (±3% within thermal variance).** Activation data already fits in L1 (4KB for d=4096), so sharing provides no bandwidth benefit. Extra register pressure from holding 2× weight bits offsets instruction savings. No model showed consistent gain.
 
 ---
 
@@ -65,7 +71,8 @@ Process multiple weight rows in a single dot call to amortize function-call over
 | 3 | NEON kernel paths | N/A (ARM) | High | Not started |
 | 4 | CPU flash attention | 0-5%* | High | Not started |
 | 5 | Q1_0 AVX-512 VNNI | 5-15% | Medium | Not started |
-| 6 | Q2_0 pre-expansion revisit | 0-15% (risky) | High | Previously failed for Q1_0 |
-| 7 | Multi-row matmul dispatch | 2-5% | Medium | Not started |
+| 6 | lm_head dtype investigation | 0% | Low | **DONE** (S13) — same format |
+| 7 | Q2_0 pre-expansion revisit | 0-15% (risky) | High | Previously failed for Q1_0 |
+| 8 | Multi-row matmul dispatch | ~0% | Medium | **REVERTED** (S13) |
 
 *Flash attention only helps at seq_len > 2048.

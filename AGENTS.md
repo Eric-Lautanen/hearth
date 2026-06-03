@@ -127,6 +127,23 @@ All matmul-adjacent optimizations (buffer reuse, thread counts, dispatch strateg
 
 For models with different architectures (e.g., larger vocab, deeper layers, alternative quantization), the threshold may shift — benchmark before and after when adding new model families.
 
+## System monitoring
+
+CPU temperature and frequency can be read via Windows performance counters (no admin rights needed):
+
+```powershell
+# CPU temperature (in °C, divide by 10)
+Get-Counter "\Thermal Zone Information(*)\Temperature" | Select-Object -ExpandProperty CounterSamples | % { "$([math]::Round($_.CookedValue/10,1))°C" }
+
+# CPU frequency / performance state (134 = 134% of base = boosting)
+Get-Counter "\Processor Information(_total)\% Processor Performance" | Select-Object -ExpandProperty CounterSamples | % CookedValue
+
+# Sample both at once
+$t = Get-Counter "\Thermal Zone Information(*)\Temperature"; $p = Get-Counter "\Processor Information(_total)\% Processor Performance"; "$([math]::Round($t.CounterSamples[0].CookedValue/10,1))°C, $([math]::Round($p.CounterSamples[0].CookedValue,0))% perf"
+```
+
+This system stays at 31-37°C even under sustained LLM inference load — the 10-15% tok/s variance previously blamed on "thermal throttling" is actually Windows CPU frequency scaling ramp-up. Always do a warmup run before benchmarking.
+
 ## Rust version
 Workspace uses `half = "2.6"`, `wide = "1.4"`, `bytemuck = "1"`. `const fn` with `while` loops OK.
 

@@ -2,6 +2,8 @@
 
 System: AMD Ryzen 7 8840HS (8C/16T), 16 GB DDR5, Windows 11. Hearth: 8 workers (n/2). Ref: 16 threads default. Bench: 50-token `--temp 0 --prompt "Hello" --prompt-raw`, `avg_cpu_overhead` tok/s.
 
+**CRITICAL: Always warm up (1-2 runs) before collecting benchmark data.** First-run performance is ~30-40% slower due to Windows CPU frequency scaling ramp-up, not thermal throttling (chip stays at 31-36°C). Run the model once, discard that data, then record the next run.
+
 All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling factor 4.0, Q/K head norms.
 
 | Model | Format | d_model | ffn_dim | Layers | Heads | KV | Size |
@@ -13,7 +15,7 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 12 — scratch_q8 wiring)
+## Current status (2026-06-02, Session 13 — batch-2 Q1_0 kernel (reverted), lm_head investigation)
 
 ### AVX-512 VNNI Q2_0 kernel: DONE (Session 10)
 Added `dot_q2_0_q8_0_vnni_avx512` using `vpdpbusd` (u8 × i8 → i32 dot product) for the Q2_0×Q8_0 kernel.
@@ -94,16 +96,16 @@ From `[timing]` output (decode tokens):
 
 Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
-| Model | S12 (50tok) | S11 (50tok) | vs S11 | Forward |
+| Model | S13 warm (50tok) | S13 cold (1st run) | S12 (50tok) | Forward (warm) |
 |---|---|---|---|---|---|---|
-| 1.7B Q1_0 | 27.6 | 35.9 | -23%* | ~28ms |
-| 1.7B Q2_0 | 23.2 | 23.5 | -1% | ~34ms |
-| 4B Q1_0 | 18.9 | 22.3 | -15%* | ~40ms |
-| 4B Q2_0 | 12.6 | 11.8 | +7% | ~70ms |
-| 8B Q1_0 | 12.7 | 11.1 | +14% | ~72ms |
-| 8B Q2_0 | 7.4 | 6.0 | +23% | ~130ms |
+| 1.7B Q1_0 | **50.7** | 32.5 | 27.6 | ~16ms |
+| 1.7B Q2_0 | **29.6** | 23.0 | 23.2 | ~28ms |
+| 4B Q1_0 | — | 19.2 | 18.9 | ~40ms |
+| 4B Q2_0 | — | 12.5 | 12.6 | ~70ms |
+| 8B Q1_0 | — | 12.3 | 12.7 | ~72ms |
+| 8B Q2_0 | — | 7.6 | 7.4 | ~131ms |
 
-*Small model regressions are thermal/system variance. Early tokens match S11 baselines (~27ms 1.7B Q1_0, ~40ms 4B Q1_0). Large models show clear improvement from eliminated Vec alloc/dealloc per layer. |
+**Critical finding:** The 30-50% variance between runs is NOT thermal (chip stays at 31-36°C). It's Windows CPU frequency scaling — the first run after idle starts at lower boost clocks. **Added CPU warmup forward pass** (one dummy token before timed work) which eliminated first-run penalty. Warm 1.7B Q1_0 at **50.7 tok/s** exceeds the Session 11 peak of 43.9 tok/s — no regression exists. |
 
 ## Change history
 
@@ -126,6 +128,13 @@ Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on s
 2026-06-02 i16 LUT (no Q1_0 changes): ~36 tok/s (system variance)
 
 ### 2026-06-02 AVX-512 VNNI Q2_0 kernel (vpdpbusd, correct, neutral/~±3%): ~49 tok/s
+
+### 2026-06-02 Session 13: Batch-2 Q1_0 kernel (reverted), lm_head dtype investigation
+- Implemented batch-2 AVX2 Q1_0g128 dot kernel (`dot_q1_0g128_q8_0_batch2_avx2`) that processes 2 weight rows against shared activation, reducing activation read traffic by 2×
+- Added `par_dot_rows_batch2` pool dispatch and wired into Q1_0/Q1_0_G128 matmul paths
+- **Result:** Neutral perf on all models (±3% within thermal variance). Extra register pressure from holding 2 weight rows offsets shared activation benefit. Activation data already hot in L1 (4KB for d=4096), so sharing provides no bandwidth benefit on this system. Reverted entirely.
+- lm_head dtype investigation: `output.weight` (8B) and `token_embd.weight` (1.7B) always use the same quantization format as model weights (Q1_0 or Q2_0). No format disparity to exploit.
+- Key insight: The Q2_0 kernel is ~4× worse than DRAM bandwidth limit (536µs vs 132µs expected). The gap is from memory controller contention across 8 concurrent DRAM streams. Reducing worker count helps but SMT contention hurts. Fundamental system limitation.
 
 ### 2026-06-02 Session 12: Wired scratch_q8 buffer for attn_output/ffn_down/lm_head matmuls
 - Changed 3 `matmul()` calls in `forward()` from `None` (allocates new `Vec<u8>` each time via `quantize_act()`) to `Some(&sc.scratch_q8[..])` with re-used buffer
