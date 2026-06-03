@@ -2062,12 +2062,14 @@ impl LlamaModel {
             let warmup_tok = input_ids[0];
             let warmup_logits = &mut vec![0.0f32; vocab_size];
             let mut warmup_caches: Vec<KVCache> = (0..n_layers)
-                .map(|_| KVCache::new_with_storage(
-                    self.config.n_kv_heads as usize,
-                    self.config.head_dim as usize,
-                    self.config.max_seq_len as usize,
-                    KVStorage::F32,
-                ))
+                .map(|_| {
+                    KVCache::new_with_storage(
+                        self.config.n_kv_heads as usize,
+                        self.config.head_dim as usize,
+                        self.config.max_seq_len as usize,
+                        KVStorage::F32,
+                    )
+                })
                 .collect();
             self.forward(
                 &[warmup_tok],
