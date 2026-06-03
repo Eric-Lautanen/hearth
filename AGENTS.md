@@ -4,7 +4,16 @@
 
 ***ALWAYS*** keep bug reports updated and compilation errors and warnings clean.  NEVER USE allow blocks!  NEVER git commit/push unless explicitly asked — this is a working copy, not a shared repo.
 
-**IMPORTANT: Never run tests in parallel (`cargo test` without `--test-threads=1`).** The quant tests share global LUT arrays (`Q2V`, `Q1V`) and race on initialization if run concurrently, producing flaky failures.
+## ⚠️ ABSOLUTELY NO PARALLEL EXECUTION ⚠️
+
+**NEVER** launch multiple commands in parallel. This includes:
+- **DO NOT** send multiple `bash` tool calls in a single message
+- **DO NOT** run benchmarks concurrently — each model must run alone with no other processes competing for CPU
+- **DO NOT** parallelize `cargo test` — always use `--test-threads=1`
+- **DO NOT** run builds in parallel with other work
+- **ALWAYS** send one command at a time, wait for it to complete, then send the next
+
+Running anything in parallel on this 8C/16T CPU causes thermal throttling and SMT contention that invalidates benchmark results and corrupts test output. One command per message. Period.
 
 **IMPORTANT: Never push code to github.  Only use git for diffs if noticable performance degredation.
 
@@ -12,7 +21,7 @@
 
 **File purposes:** `RESUME.md` = detailed implementation instructions for the NEXT session (what to do). `BUG_TRACKER.md` = historical record of what was done (perf table, change log, what didn't work). Keep both concise — token efficiency matters for context limits.
 
-**BENCHMARK MANDATE: Always benchmark before-and-after on every session.** Run all 6 models (1.7B/4B/8B Q1_0 + Q2_0) one at a time. Compare tok/s to session baseline in BUG_TRACKER.md. If any model degrades, revert the change — do not merge regressions. Benchmark command: `& ".\target\release\hearth-chat-cli.exe" "$model" --temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`
+**BENCHMARK MANDATE: Always benchmark before-and-after on every session.** Run all 6 models one at a time — NEVER launch multiple benchmarks in the same message. Each model must run alone with no other processes competing for CPU. Compare tok/s to session baseline in BUG_TRACKER.md. If any model degrades, revert the change — do not merge regressions. Benchmark command: `& ".\target\release\hearth-chat-cli.exe" "$model" --temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`
 
 ## Key paths
 - Repo: `C:\Users\ericl\Documents\hearth`

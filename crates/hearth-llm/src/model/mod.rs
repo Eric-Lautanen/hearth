@@ -266,11 +266,7 @@ impl LlamaModel {
             "token_embd.weight".to_string()
         };
 
-        let pool = ThreadPool::new(
-            std::thread::available_parallelism()
-                .map(|n| (n.get() - 1).max(1))
-                .unwrap_or(1),
-        );
+        let pool = ThreadPool::new(8);
 
         let rope_cache = ops::RopeCache::new(
             max_seq,

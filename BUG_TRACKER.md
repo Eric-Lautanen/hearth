@@ -13,9 +13,22 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 7 — attn_out quant fusion REVERTED)
+## Current status (2026-06-02, Session 8 — thread count fix, expanded weights REVERTED)
 
-### Fuse attn_out quant into attention kernel: REVERTED
+### Thread pool worker count: FIXED
+The previous session's pool rewrite (park/unpark → spin-loop gen counter) preserved the thread count formula `available_parallelism - 1` = 15 workers on this 8C/16T CPU. Session 3 had established 8 workers as optimal. 15 workers caused massive SMT contention: 1.7B Q1_0 dropped from ~45 tok/s to 12.6 tok/s (3.6×). Fixed to 8 workers, restoring performance.
+
+### Pre-expand Q1_0 weight rows: REVERTED
+Tried eliminating bit-unpacking from the Q1_0 dot-product hot loop by expanding packed 18-byte/128-el blocks to 2B scale + 128B signs (130 bytes/block) at load time. Added expanded AVX2 kernel (no shuffle, no bit masks, just `vpmovsxbw` + `vpmaddwd`). 
+**Result:** 3× tok/s regression on all models. The 7.2× memory traffic increase (18→130 bytes/block) swamped compute savings on this bandwidth-bound system. The shuffle kernel's bit-manipulation overhead is negligible compared to memory read cost. Reverted entirely.
+
+### Model-size-aware thread count: REVERTED
+Tried 10 workers for d>=2560 (4B/8B models). Both 4B and 8B models catastrophically regressed (3-7× slower) with the spin-loop gen-counter pool. The park/unpark pool from Session 7 may have handled SMT contention better, but with the current spin-loop pool, 10 workers creates excessive contention. Sticking with 8 workers.
+
+### Spin-loop gen-counter pool: PERFORMANT
+The Session 8 pool rewrite (gen counter + spin/yield, replacing park/unpark) performs well at 8 workers. The gen counter avoids per-dispatch syscalls (no park/unpark). At 8 workers there's no SMT contention. Benchmarks match or exceed Session 7 levels.
+
+### SIMD RoPE with precomputed sin/cos: DONE (from Session 7)
 Tried replacing the f32 `out[head_dim]` buffer in `attention()` and `attention_batch()` with direct Q8_0 block writes. Two loop orders tested:
 1. Block-outer (process 32 elements across all positions, quantize, repeat) — avoids f32 buffer but causes strided v_cache access
 2. Pos-outer with stack-local `[f32; 128]` — retains original cache-friendly loop, then inline quantize
@@ -56,14 +69,14 @@ From `[timing]` output (decode tokens):
 
 Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
-| Model | Hearth | Ref | H/Ref | Forward |
-|---|---|---|---|---|
-| 1.7B Q1_0 | ~36 | 32.0 | 1.13× | ~22ms |
-| 1.7B Q2_0 | ~24 | 5.1 | 4.70× | ~37ms |
-| 4B Q1_0 | ~18 | 17.4 | 1.03× | ~48ms |
-| 4B Q2_0 | ~11 | 2.8 | 3.86× | ~90ms |
-| 8B Q1_0 | ~10.5 | 8.2 | 1.28× | ~90ms |
-| 8B Q2_0 | ~5 | 1.5 | 3.07× | ~260ms |
+| Model | Hearth (50tok) | Ref (20tok) | H/Ref | Forward |
+|---|---|---|---|---|---|
+| 1.7B Q1_0 | 47.9 | 32.0 | 1.50× | ~21ms |
+| 1.7B Q2_0 | 27.8 | 5.1 | 5.45× | ~36ms |
+| 4B Q1_0 | 21.9 | 17.4 | 1.26× | ~44ms |
+| 4B Q2_0 | 12.8 | 2.8 | 4.57× | ~78ms |
+| 8B Q1_0 | 13.1 | 8.2 | 1.60× | ~73ms |
+| 8B Q2_0 | 7.1 | 1.5 | 4.73× | ~141ms |
 
 ## Change history
 
@@ -94,6 +107,8 @@ Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on s
 2026-06-02 Gen counter + 8 workers + yield (Sess 3): 19.3→24.5 tok/s (+27%)
 2026-06-02 i16 LUT (Q2V_I16 pre-extended, skip sign extension): ~24 tok/s (within noise)
 2026-06-02 SIMD RoPE (precomputed sin/cos table + f32x8 apply): rope 960µs→10µs
+2026-06-02 Gen counter pool w/ spin-loop (replaces park/unpark): 24→27.8 tok/s (+16%)
+2026-06-02 Thread pool rewrite (gen counter, no park syscalls): S7 baseline levels restored
 
 ### 4B Q1_0
 
@@ -135,6 +150,8 @@ Kernel hsum optimization (FMA accumulate across blocks, single hsum per row): ma
 LM head F32: both 1.7B models have Q1_0/Q2_0 lm_head, not F32 (can't skip dequant)
 Q8_0 quant fusion (attn_out): REVERTED — 10-25% Q2_0 regression, root cause unknown but suspected cache conflict from reused buffer or missing vectorization in inline quant loop
 MSVC FFI kernel: 4-6× slower than LLVM + target-cpu=native
+Pre-expand Q1_0 weights to i8 signs (7.2× memory): 3× tok/s regression on all models — bandwidth-bound, compute savings negligible vs memory cost
+Model-size-aware thread count (10 workers) with spin-loop pool: catastrophic regressions on all models (3-7×)
 Raw std::thread::scope: catastrophic on Windows (5.2/2.8 tok/s)
 Spin-wait pool (no yield): 100% CPU, starved main thread
 LLVM codegen flags: +-slow-unaligned-mem-256 not recognized by Rust LLVM
@@ -176,5 +193,6 @@ ffn_gate_up_matmul 46% | ffn_down_matmul 25% | qkv_matmul 16% | attn_output_matm
 
 ## Next up
 
-Fuse Q8_0 activation quant into first matmul row: eliminates full-vector read per dispatch. Marginal (~5%)
-Model-size-aware thread count: d>=2560 → 10 workers, d<2560 → 8 workers
+Fuse Q8_0 activation quant into first matmul row: marginal (~5%), quantize is only 0.87% of total.
+Better pool synchronization: main thread spin-waits worker completion — could use futex/condition variable to reduce power during matmul.
+LM_head tile-in-L2 dispatch: process 3555-row tiles per worker to fit 1MB L2 (vs current 18959-row contiguous chunks that miss L2).
