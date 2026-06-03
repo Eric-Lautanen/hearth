@@ -16,6 +16,7 @@ pub struct WorkParams {
     pub row_bytes: usize,
     pub n_cols: usize,
     pub dot_fn: DotFn,
+    pub tile_size: usize,
 }
 
 struct Worker {
@@ -43,6 +44,7 @@ impl ThreadPool {
             row_bytes: 0,
             n_cols: 0,
             dot_fn: dummy_dot_fn,
+            tile_size: usize::MAX,
         });
         let params = Arc::new(AtomicPtr::new(&mut *params_box));
         let gen = Arc::new(AtomicU64::new(0));
@@ -70,14 +72,20 @@ impl ThreadPool {
                         let chunk = wp.n.div_ceil(nt);
                         let begin = i * chunk;
                         let end = (begin + chunk).min(wp.n);
-                        for row in begin..end {
-                            unsafe {
-                                *((wp.out_ptr + row * 4) as *mut f32) = (wp.dot_fn)(
-                                    (wp.w_base + row * wp.row_bytes) as *const u8,
-                                    wp.a_ptr as *const u8,
-                                    wp.n_cols,
-                                );
+                        let tile_size = wp.tile_size;
+                        let mut r = begin;
+                        while r < end {
+                            let tile_end = (r + tile_size).min(end);
+                            for row in r..tile_end {
+                                unsafe {
+                                    *((wp.out_ptr + row * 4) as *mut f32) = (wp.dot_fn)(
+                                        (wp.w_base + row * wp.row_bytes) as *const u8,
+                                        wp.a_ptr as *const u8,
+                                        wp.n_cols,
+                                    );
+                                }
                             }
+                            r = tile_end;
                         }
                         done_clone.store(true, Ordering::Release);
                     } else {
@@ -124,17 +132,24 @@ impl ThreadPool {
             return;
         }
         if self.num_threads <= 1 || n <= 1 {
-            for row in 0..n {
-                unsafe {
-                    *((out_ptr + row * 4) as *mut f32) = (dot_fn)(
-                        (w_base + row * row_bytes) as *const u8,
-                        a_ptr as *const u8,
-                        n_cols,
-                    );
+            let tile_size = (1048576 / row_bytes).max(1);
+            let mut r = 0;
+            while r < n {
+                let tile_end = (r + tile_size).min(n);
+                for row in r..tile_end {
+                    unsafe {
+                        *((out_ptr + row * 4) as *mut f32) = (dot_fn)(
+                            (w_base + row * row_bytes) as *const u8,
+                            a_ptr as *const u8,
+                            n_cols,
+                        );
+                    }
                 }
+                r = tile_end;
             }
             return;
         }
+        let tile_size = (1048576 / row_bytes).max(1);
         unsafe {
             *self.params.load(Ordering::Relaxed) = WorkParams {
                 n,
@@ -144,6 +159,7 @@ impl ThreadPool {
                 row_bytes,
                 n_cols,
                 dot_fn,
+                tile_size,
             };
         }
         for w in &self.workers {

@@ -13,7 +13,7 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 8 — thread count fix, expanded weights REVERTED)
+## Current status (2026-06-02, Session 9 — tile-in-L2 matmul dispatch)
 
 ### Thread pool worker count: FIXED
 The previous session's pool rewrite (park/unpark → spin-loop gen counter) preserved the thread count formula `available_parallelism - 1` = 15 workers on this 8C/16T CPU. Session 3 had established 8 workers as optimal. 15 workers caused massive SMT contention: 1.7B Q1_0 dropped from ~45 tok/s to 12.6 tok/s (3.6×). Fixed to 8 workers, restoring performance.
@@ -27,6 +27,13 @@ Tried 10 workers for d>=2560 (4B/8B models). Both 4B and 8B models catastrophica
 
 ### Spin-loop gen-counter pool: PERFORMANT
 The Session 8 pool rewrite (gen counter + spin/yield, replacing park/unpark) performs well at 8 workers. The gen counter avoids per-dispatch syscalls (no park/unpark). At 8 workers there's no SMT contention. Benchmarks match or exceed Session 7 levels.
+
+### Tile-in-L2 matmul dispatch: DONE (Session 9)
+Changed `par_dot_rows` worker loop from `for row in begin..end` (contiguous chunk per worker) to `while r < end { for row in r..tile_end }` where `tile_size = 1MB / row_bytes`. Each worker processes its chunk in L2-sized tiles, keeping weight data hot in cache.
+
+**Key insight:** lm_head reads each weight row exactly once — no reuse benefit from L2 tiling. But the tile loop adds negligible overhead (one while iteration per ~3640 rows) and may improve prefetcher behavior. Other matmuls (qkv, ffn) with large row counts may see minor cache benefits.
+
+**Result:** No regression on any model. Minor improvements on 4B Q1_0 (+6.4%) possibly from system variance or improved prefetch. All others within noise (±3%).
 
 ### SIMD RoPE with precomputed sin/cos: DONE (from Session 7)
 Tried replacing the f32 `out[head_dim]` buffer in `attention()` and `attention_batch()` with direct Q8_0 block writes. Two loop orders tested:
@@ -70,13 +77,13 @@ From `[timing]` output (decode tokens):
 Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
 | Model | Hearth (50tok) | Ref (20tok) | H/Ref | Forward |
-|---|---|---|---|---|---|
-| 1.7B Q1_0 | 47.9 | 32.0 | 1.50× | ~21ms |
-| 1.7B Q2_0 | 27.8 | 5.1 | 5.45× | ~36ms |
-| 4B Q1_0 | 21.9 | 17.4 | 1.26× | ~44ms |
-| 4B Q2_0 | 12.8 | 2.8 | 4.57× | ~78ms |
-| 8B Q1_0 | 13.1 | 8.2 | 1.60× | ~73ms |
-| 8B Q2_0 | 7.1 | 1.5 | 4.73× | ~141ms |
+|---|---|---|---|---|---|---|
+| 1.7B Q1_0 | 49.4 | 32.0 | 1.54× | ~18ms |
+| 1.7B Q2_0 | 28.5 | 5.1 | 5.59× | ~35ms |
+| 4B Q1_0 | 23.3 | 17.4 | 1.34× | ~41ms |
+| 4B Q2_0 | 12.9 | 2.8 | 4.61× | ~77ms |
+| 8B Q1_0 | 13.5 | 8.2 | 1.65× | ~71ms |
+| 8B Q2_0 | 7.0 | 1.5 | 4.67× | ~143ms |
 
 ## Change history
 
@@ -97,6 +104,8 @@ Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on s
 2026-06-02 Shuffle kernel (replaces LUT, fixes 8B collapse): 34.4→43 tok/s (+25%)
 2026-06-02 Scratch buffer reuse (3 fewer allocs/forward): neutral
 2026-06-02 i16 LUT (no Q1_0 changes): ~36 tok/s (system variance)
+
+### 2026-06-02 Tile-in-L2 dispatch (pool.rs tile_size, neutral): ~49.4 tok/s
 
 ### 1.7B Q2_0
 
