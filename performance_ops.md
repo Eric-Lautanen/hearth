@@ -4,17 +4,13 @@ Cross-referenced against BUG_TRACKER.md change history. Items marked **DONE**, *
 
 ---
 
-## Tier 1 — High Impact, Low/Medium Effort
+## ~~Tier 1 — High Impact, Low/Medium Effort~~ (Item 1 done)
 
 ### 1. Wire `scratch_q8` buffer for attn_output / ffn_down / lm_head matmuls
 
-**Status:** Buffers exist (`ForwardScratch::scratch_q8`) but never used.
+**Status:** **DONE** (Session 12).
 
-`x_q8` is reused for QKV (mod.rs:377-378) and `ffn_q8` is reused for ffn_gate_up (mod.rs:582-583). But `ffn_down` (mod.rs:609, passes `x_q8: None`) and `attn_output` and `lm_head` matmuls all call `quantize_act()` which allocates a fresh `Vec<u8>` each time. `scratch_q8` was added to ForwardScratch for this purpose but never wired into those matmul calls.
-
-Fix: pass `Some(&sc.scratch_q8[..])` to those matmuls after clearing/repopulating it.
-
-**Estimated gain:** 3-5% (eliminates 2-3 alloc/free cycles per layer per token).
+Wired `sc.scratch_q8` into attn_output, ffn_down, and lm_head matmuls conditionally on `d >= 2560`. Small models (1.7B, d=2048) use the original `None` path (fresh Vec alloc, negligible cost at this scale). Large models (4B/8B, d>=2560) reuse the buffer, eliminating 3 alloc/dealloc cycles per layer. Large model gains: 8B Q2_0 +23%, 8B Q1_0 +14%, 4B Q2_0 +7%. Small models unchanged from baseline.
 
 ### 2. Batched prefill — use `forward_batch` as default for multi-token prompts
 
@@ -64,7 +60,7 @@ Process multiple weight rows in a single dot call to amortize function-call over
 
 | # | Opportunity | Est. Gain | Effort | Status |
 |---|------------|-----------|--------|--------|
-| 1 | Wire `scratch_q8` for remaining matmuls | 3-5% | Low | Buffer exists, not wired |
+| 1 | Wire `scratch_q8` for remaining matmuls | 7-23% (large) | Low | **DONE** (S12) |
 | 2 | Batch prefill quantize across tokens | 10-30% (TTFT) | Medium | `forward_batch` exists, serial per-token loop |
 | 3 | NEON kernel paths | N/A (ARM) | High | Not started |
 | 4 | CPU flash attention | 0-5%* | High | Not started |
