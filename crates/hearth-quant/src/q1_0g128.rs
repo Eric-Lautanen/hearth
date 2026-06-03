@@ -3,6 +3,25 @@ use half::f16;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+/// Precomputed lookup: for each byte, extract 8 sign mask values {0xFF, 0x00}
+/// bit=0 → 0xFF (w=-1), bit=1 → 0x00 (w=+1) for xor/sub sign correction.
+/// Used by the 512-bit VNNI kernel (LUT expansion path).
+#[allow(dead_code)]
+const Q1V_SM: [[u8; 8]; 256] = {
+    let mut table = [[0u8; 8]; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut j = 0;
+        while j < 8 {
+            let bit = (b >> j) & 1;
+            table[b][j] = if bit != 0 { 0x00 } else { 0xFF };
+            j += 1;
+        }
+        b += 1;
+    }
+    table
+};
+
 /// Precomputed lookup: for each byte, extract 8 sign values {1, -1} based on bits
 const Q1V: [[i8; 8]; 256] = {
     let mut table = [[0i8; 8]; 256];
@@ -327,6 +346,160 @@ unsafe fn dot_q1_0g128_q8_0_ptr_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usiz
     }
 
     hsum_float_8(acc)
+}
+
+/// AVX-512 256-bit VNNI kernel for Q1_0_G128 (128-element blocks).
+/// Uses shuffle's SIMD bit expansion to get sign-corrected activations `sy`,
+/// then replaces maddubs+madd with a single vpdpbusd: dpbusd(1, sy) = Σ sy_i.
+///
+/// NOTE: Not dispatched by default — ~33% regression on Zen 4 vs shuffle.
+/// vpdpbusd saves 1 μop per sub-block but LUT stores + 512-bit double-pumping
+/// add more overhead than the shuffle kernel's SIMD-only pipeline.
+/// Keep for future CPUs with native 512-bit VNNI units.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512vnni")]
+#[allow(dead_code)]
+unsafe fn dot_q1_0g128_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
+    let q1_blocks = n / 128;
+    let ones_8 = _mm256_set1_epi8(1);
+    let zero = _mm256_setzero_si256();
+    let byte_shuf = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
+        3, 3,
+    );
+    let bit_masks: __m256i = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        1, 2, 4, 8, 16, 32, 64, -128,
+    );
+
+    let mut acc_global = _mm256_setzero_ps();
+
+    for b in 0..q1_blocks {
+        let w_off = b * 18;
+        let w_scale: f32 = f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32();
+        let w_bits = w_ptr.add(w_off + 2);
+
+        let qs0 = core::ptr::read_unaligned(w_bits as *const u32);
+        let qs1 = core::ptr::read_unaligned(w_bits.add(4) as *const u32);
+        let qs2 = core::ptr::read_unaligned(w_bits.add(8) as *const u32);
+        let qs3 = core::ptr::read_unaligned(w_bits.add(12) as *const u32);
+
+        let mut acc_block = _mm256_setzero_ps();
+
+        let qs_arr = [qs0, qs1, qs2, qs3];
+        for (sub, &qs) in qs_arr.iter().enumerate() {
+            let a_off = (b * 4 + sub) * 34;
+            let a_scale: f32 =
+                f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+            let a_vals = a_ptr.add(a_off + 2);
+
+            // SIMD bit expansion (same as shuffle kernel)
+            let x = _mm256_set1_epi32(qs as i32);
+            let w = _mm256_shuffle_epi8(x, byte_shuf);
+            let bmask = _mm256_and_si256(w, bit_masks);
+            let sm = _mm256_cmpeq_epi8(bmask, zero);
+
+            // sign-corrected activations (same as shuffle kernel)
+            let act = _mm256_loadu_si256(a_vals as *const __m256i);
+            let sy = _mm256_sub_epi8(_mm256_xor_si256(act, sm), sm);
+
+            // VNNI: dpbusd(1, sy) = Σ sy_i = Σ(w=+1) act_i - Σ(w=-1) act_i
+            let s32 = _mm256_dpbusd_epi32(zero, ones_8, sy);
+            let a_scale_ps = _mm256_set1_ps(a_scale);
+
+            acc_block = _mm256_fmadd_ps(a_scale_ps, _mm256_cvtepi32_ps(s32), acc_block);
+        }
+
+        let w_scale_ps = _mm256_set1_ps(w_scale);
+        acc_global = _mm256_fmadd_ps(w_scale_ps, acc_block, acc_global);
+    }
+
+    hsum_float_8(acc_global)
+}
+
+/// AVX-512 512-bit VNNI kernel: processes 2 Q8_0 sub-blocks (64 elements) per iteration.
+/// Uses LUT-based sign mask expansion (Q1V_SM) for xor/sub sign correction,
+/// then _mm512_dpbusd_epi32(ones, sy) = Σ sy_i. Requires avx512dq for vextracti64x4.
+///
+/// NOTE: Not dispatched by default — ~33% regression on Zen 4 vs shuffle.
+/// LUT stores + 512-bit double-pumping outweigh loop-count reduction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512vnni")]
+#[target_feature(enable = "avx512dq")]
+#[allow(dead_code)]
+unsafe fn dot_q1_0g128_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
+    let q1_blocks = n / 128;
+    let ones_8 = _mm512_set1_epi8(1);
+    let zero = _mm512_setzero_si512();
+
+    let mut acc_global = _mm256_setzero_ps();
+
+    for b in 0..q1_blocks {
+        let w_off = b * 18;
+        let w_scale = f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32();
+        let w_bits = w_ptr.add(w_off + 2);
+
+        let mut acc_block_lo = _mm256_setzero_ps();
+        let mut acc_block_hi = _mm256_setzero_ps();
+
+        for pair in 0..2 {
+            let sub0 = pair * 2;
+            let sub1 = pair * 2 + 1;
+
+            let a_off_0 = (b * 4 + sub0) * 34;
+            let a_off_1 = (b * 4 + sub1) * 34;
+            let a_scale_0 =
+                f16::from_le_bytes([*a_ptr.add(a_off_0), *a_ptr.add(a_off_0 + 1)]).to_f32();
+            let a_scale_1 =
+                f16::from_le_bytes([*a_ptr.add(a_off_1), *a_ptr.add(a_off_1 + 1)]).to_f32();
+            let a_vals_0 = a_ptr.add(a_off_0 + 2);
+            let a_vals_1 = a_ptr.add(a_off_1 + 2);
+
+            // LUT expand 8 weight bytes to 64 sign mask bytes {0xFF, 0x00}
+            let mut sm_buf: [u8; 64] = [0u8; 64];
+            for j in 0..4usize {
+                let b0 = *w_bits.add(sub0 * 4 + j) as usize;
+                let b1 = *w_bits.add(sub1 * 4 + j) as usize;
+                core::ptr::copy_nonoverlapping(
+                    Q1V_SM[b0].as_ptr(),
+                    sm_buf.as_mut_ptr().add(j * 8),
+                    8,
+                );
+                core::ptr::copy_nonoverlapping(
+                    Q1V_SM[b1].as_ptr(),
+                    sm_buf.as_mut_ptr().add(32 + j * 8),
+                    8,
+                );
+            }
+
+            // Copy activation bytes contiguously
+            let mut a_buf: [u8; 64] = [0u8; 64];
+            core::ptr::copy_nonoverlapping(a_vals_0, a_buf.as_mut_ptr(), 32);
+            core::ptr::copy_nonoverlapping(a_vals_1, a_buf.as_mut_ptr().add(32), 32);
+
+            // sy = xor(act, sm) - sm (same as shuffle kernel)
+            let act = _mm512_loadu_si512(a_buf.as_ptr() as *const __m512i);
+            let sm = _mm512_loadu_si512(sm_buf.as_ptr() as *const __m512i);
+            let sy = _mm512_sub_epi8(_mm512_xor_si512(act, sm), sm);
+
+            // dpbusd(1, sy) = Σ sy_i
+            let s32 = _mm512_dpbusd_epi32(zero, ones_8, sy);
+
+            let s32_lo_ps = _mm256_cvtepi32_ps(_mm512_castsi512_si256(s32));
+            let s32_hi_ps = _mm256_cvtepi32_ps(_mm512_extracti64x4_epi64::<1>(s32));
+
+            acc_block_lo = _mm256_fmadd_ps(_mm256_set1_ps(a_scale_0), s32_lo_ps, acc_block_lo);
+            acc_block_hi = _mm256_fmadd_ps(_mm256_set1_ps(a_scale_1), s32_hi_ps, acc_block_hi);
+        }
+
+        let acc_block = _mm256_add_ps(acc_block_lo, acc_block_hi);
+        acc_global = _mm256_fmadd_ps(_mm256_set1_ps(w_scale), acc_block, acc_global);
+    }
+
+    hsum_float_8(acc_global)
 }
 
 /// SSE4.1/AVX2 horizontal sum of 4 × i32 in __m128i
@@ -875,6 +1048,123 @@ mod tests {
         }
         // F32 dot
         x.iter().zip(dq.iter()).map(|(a, b)| a * b).sum()
+    }
+
+    /// Microbenchmark: compare shuffle vs 256-bit VNNI vs 512-bit VNNI kernels
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn bench_q1_0_vnni_vs_shuffle() {
+        if !std::arch::is_x86_feature_detected!("avx512f")
+            || !std::arch::is_x86_feature_detected!("avx512vnni")
+        {
+            eprintln!("Skipping VNNI benchmark (no AVX-512 VNNI)");
+            return;
+        }
+        let has_dq = std::arch::is_x86_feature_detected!("avx512dq");
+        let dims = [2048usize, 4096, 6144, 9728];
+        let iters = 5_000;
+
+        for &n in &dims {
+            let n_blocks = n / 128;
+            let mut w = vec![0u8; n_blocks * 18];
+            let mut a = vec![0u8; n_blocks * 4 * 34];
+
+            for b in 0..n_blocks {
+                let bo = b * 18;
+                let scale = ((b as f32 + 1.0) * 0.1).sin().abs() * 0.5 + 0.01;
+                let s = half::f16::from_f32(scale).to_le_bytes();
+                w[bo] = s[0];
+                w[bo + 1] = s[1];
+                for j in 0..16 {
+                    w[bo + 2 + j] = ((b * 16 + j).wrapping_mul(37) ^ 0xAB) as u8;
+                }
+            }
+            for b in 0..n_blocks * 4 {
+                let bo = b * 34;
+                let scale = ((b as f32 + 1.0) * 0.05).cos().abs() * 0.5 + 0.01;
+                let s = half::f16::from_f32(scale).to_le_bytes();
+                a[bo] = s[0];
+                a[bo + 1] = s[1];
+                for j in 0..32 {
+                    a[bo + 2 + j] = ((b * 32 + j).wrapping_mul(53) ^ 0xCD) as u8;
+                }
+            }
+
+            // Warmup shuffle
+            unsafe {
+                let _ = dot_q1_0g128_q8_0_ptr_avx2(w.as_ptr(), a.as_ptr(), n);
+            }
+
+            // Benchmark shuffle
+            let t0 = std::time::Instant::now();
+            let mut sum_shuf = 0.0f32;
+            for _ in 0..iters {
+                sum_shuf += unsafe { dot_q1_0g128_q8_0_ptr_avx2(w.as_ptr(), a.as_ptr(), n) };
+            }
+            let ns_shuf = t0.elapsed().as_nanos() as f64 / iters as f64;
+
+            // Benchmark 256-bit VNNI
+            unsafe {
+                let _ = dot_q1_0g128_q8_0_vnni_avx512(w.as_ptr(), a.as_ptr(), n);
+            }
+            let t0 = std::time::Instant::now();
+            let mut sum_vnni = 0.0f32;
+            for _ in 0..iters {
+                sum_vnni += unsafe { dot_q1_0g128_q8_0_vnni_avx512(w.as_ptr(), a.as_ptr(), n) };
+            }
+            let ns_vnni = t0.elapsed().as_nanos() as f64 / iters as f64;
+
+            if has_dq {
+                unsafe {
+                    let _ = dot_q1_0g128_q8_0_vnni_avx512_2sub(w.as_ptr(), a.as_ptr(), n);
+                }
+                let t0 = std::time::Instant::now();
+                let mut sum_vnni2 = 0.0f32;
+                for _ in 0..iters {
+                    sum_vnni2 +=
+                        unsafe { dot_q1_0g128_q8_0_vnni_avx512_2sub(w.as_ptr(), a.as_ptr(), n) };
+                }
+                let ns_vnni2 = t0.elapsed().as_nanos() as f64 / iters as f64;
+                eprintln!(
+                    "n={:5}: Shuffle={:7.1}ns  VNNI256={:7.1}ns {:+.1}%  VNNI512={:7.1}ns {:+.1}% (sum_shuf={}, sum_vnni={}, sum_vnni2={})",
+                    n, ns_shuf, ns_vnni, (ns_vnni / ns_shuf - 1.0) * 100.0,
+                    ns_vnni2, (ns_vnni2 / ns_shuf - 1.0) * 100.0,
+                    sum_shuf, sum_vnni, sum_vnni2
+                );
+            } else {
+                eprintln!(
+                    "n={:5}: Shuffle={:7.1}ns  VNNI256={:7.1}ns {:+.1}%  VNNI512=N/A (no avx512dq)",
+                    n,
+                    ns_shuf,
+                    ns_vnni,
+                    (ns_vnni / ns_shuf - 1.0) * 100.0
+                );
+            }
+
+            // Correctness check: VNNI results must match shuffle
+            let ref_val = unsafe { dot_q1_0g128_q8_0_ptr_avx2(w.as_ptr(), a.as_ptr(), n) };
+            let vnni_val = unsafe { dot_q1_0g128_q8_0_vnni_avx512(w.as_ptr(), a.as_ptr(), n) };
+            let err = (ref_val - vnni_val).abs();
+            assert!(
+                err < 0.1 || err / ref_val.abs().max(1.0) < 0.01,
+                "VNNI256 mismatch: ref={} vnni={} err={}",
+                ref_val,
+                vnni_val,
+                err
+            );
+            if has_dq {
+                let vnni2_val =
+                    unsafe { dot_q1_0g128_q8_0_vnni_avx512_2sub(w.as_ptr(), a.as_ptr(), n) };
+                let err = (ref_val - vnni2_val).abs();
+                assert!(
+                    err < 0.1 || err / ref_val.abs().max(1.0) < 0.01,
+                    "VNNI512 mismatch: ref={} vnni={} err={}",
+                    ref_val,
+                    vnni2_val,
+                    err
+                );
+            }
+        }
     }
 
     #[test]

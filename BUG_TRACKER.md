@@ -15,7 +15,26 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 14 — AVX-512 512-bit Q2_0 VNNI kernel)
+## Current status (2026-06-02, Session 15 — Q1_0 AVX-512 VNNI kernel, REVERTED)
+
+### Q1_0 AVX-512 VNNI kernel: REVERTED (not dispatched)
+
+Added 256-bit and 512-bit VNNI kernels for Q1_0_G128 dot product. Both use `_mm256_dpbusd_epi32` to replace maddubs+madd with a single vpdpbusd. The 256-bit kernel reuses the shuffle kernel's SIMD bit expansion (no LUT), computing `sy = xor(act, sm) - sm` then `dpbusd(1, sy) = Σ sy_i`. The 512-bit kernel uses LUT-based sign mask expansion (Q1V_SM) processing 2 sub-blocks (64 elements) per iteration.
+
+**Microbenchmark results (debug mode, `test` profile):**
+| Dimension | Shuffle | VNNI256 | VNNI512 |
+|-----------|---------|---------|---------|
+| 2048      | 24000ns | 21000ns (-12%) | 18700ns (-19%) |
+| 4096      | 47300ns | 41800ns (-12%) | 38900ns (-18%) |
+| 6144      | 71300ns | 62400ns (-12%) | 58100ns (-18%) |
+| 9728      | 112400ns | 99200ns (-12%) | 92100ns (-18%) |
+
+**Release mode end-to-end (with VNNI512 dispatched):** 1.7B Q1_0 dropped from ~45 to 29.3 tok/s (-33% regression). VNNI adds ~30% more µops on Zen 4 (512-bit double-pumped) vs shuffle kernel's purely SIMD pipeline.
+
+**Result:** Correct (all tests pass, per-iteration results match shuffle), but ~33% regression on Zen 4. Not dispatched. Kernels kept as `#[allow(dead_code)]` for future CPUs with native 512-bit VNNI units.
+
+### Key lesson: `vpdpbusd(~sm & 2, act) - vpdpbusd(1, act)` is WRONG for Q1_0 VNNI
+The formula `true_dot = vpdpbusd(~sm & 2, act) - sum_act` produced 1.89× the correct value. Root cause: dpbusd computes Σ u8 * i8 per dword lane, but the byte boundaries in the packed weight expansion don't align correctly with the activations when using the expanded w_u8 directly. The correct approach is to compute `sy = xor(act, sm) - sm` (sign-corrected activations, same as shuffle kernel) then `dpbusd(1, sy) = Σ sy_i`.
 
 ### AVX-512 512-bit Q2_0 VNNI kernel: DONE (Session 14)
 Added `dot_q2_0_q8_0_vnni_avx512_2sub` using `_mm512_dpbusd_epi32` to process 64 elements (2 Q8_0 sub-blocks) per iteration.
@@ -119,18 +138,26 @@ From `[timing]` output (decode tokens):
 
 Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
-| Model | S13 warm (50tok) | S13 cold | S14 (50tok) | Forward (warm) |
-|---|---|---|---|---|---|---|---|
-| 1.7B Q1_0 | **50.7** | 32.5 | **43.8** | ~22ms |
-| 1.7B Q2_0 | **29.6** | 23.0 | **25.6** | ~40ms |
-| 4B Q1_0 | — | 19.2 | **20.7** | ~48ms |
-| 4B Q2_0 | — | 12.5 | **11.3** | ~88ms |
-| 8B Q1_0 | — | 12.3 | **9.4** | ~106ms |
-| 8B Q2_0 | — | 7.6 | **5.6** | ~178ms |
+| Model | S13 warm (50tok) | S13 cold | S14 (50tok) | S15 (50tok) |
+|---|---|---|---|---|---|---|
+| 1.7B Q1_0 | **50.7** | 32.5 | **43.8** | **45.3** |
+| 1.7B Q2_0 | **29.6** | 23.0 | **25.6** | **27.7** |
+| 4B Q1_0 | — | 19.2 | **20.7** | **22.2** |
+| 4B Q2_0 | — | 12.5 | **11.3** | **12.8** |
+| 8B Q1_0 | — | 12.3 | **9.4** | **12.9** |
+| 8B Q2_0 | — | 7.6 | **5.6** | **6.2** |
 
-**S14 session variance note:** All Q2_0 models within ±10-26% of S13 baseline, matching the 14% drop seen in the unaffected Q1_0 models (shuffle kernel unchanged). The 512-bit VNNI kernel change is neutral. System variance driven by Windows CPU frequency scaling (chip at 31-36°C throughout). |
+**S15 session variance note:** All models at or above S14 baseline (+3-37%). No code changes affect inference (VNNI kernels added but NOT dispatched). Variance driven by CPU frequency scaling (chip at 31-33°C, 85-100% perf state). 8B Q1_0 at 12.9 tok/s vs 9.4 in S14 reflects CPU running at higher sustained frequency after warmup. |
 
 ## Change history
+
+### Session 15 change log
+- Added `dot_q1_0g128_q8_0_vnni_avx512` — 256-bit VNNI kernel (SIMD bit expansion + dpbusd)
+- Added `dot_q1_0g128_q8_0_vnni_avx512_2sub` — 512-bit VNNI kernel (LUT expansion + dpbusd)
+- Added `bench_q1_0_vnni_vs_shuffle` — microbenchmark comparing all 3 kernels
+- Discovered `dpbusd(~sm & 2, act) - sum_act` formula produces wrong results (1.89× correct)
+  - Fix: use shuffle's `sy = xor(act, sm) - sm` then `dpbusd(1, sy) = Σ sy_i`
+- **Result:** Correct but ~33% regression on Zen 4. NOT dispatched. Kept as dead_code.
 
 ### 1.7B Q1_0
 
