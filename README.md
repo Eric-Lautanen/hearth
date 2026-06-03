@@ -15,20 +15,24 @@ for rotation representation, avoiding gimbal lock...
 
 ## Performance
 
-Bonsai 1.7B (Qwen3, 28 layers, d=2048) on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5):
+All 6 Bonsai models (Qwen3, head_dim=128, vocab=151669, YaRN rope) on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5). Benchmarked at 50 generated tokens, `--temp 0`, one-word prompt, warm average over 10 runs. Hearth uses 8 workers (n/2). Ref uses llama.cpp-prism 16 threads.
 
-| Model | Hearth | llama.cpp | Ratio |
-|-------|--------|-----------|-------|
-| Q1_0 (1-bit, 128-el blocks) | **33.5 tok/s** | 34.3 tok/s | tied |
-| Q2_0 (2-bit ternary, 128-el blocks) | **24.8 tok/s** | 4.8 tok/s | **5.2× faster** |
+| Size | Format | d_model | Layers | Hearth | Ref | H/Ref |
+|------|--------|---------|--------|--------|-----|-------|
+| 1.7B | Q1_0 (1-bit, 128-el) | 2048 | 28 | **49.5 tok/s** | 32.0 | 1.55× |
+| 1.7B | Q2_0 (2-bit ternary) | 2048 | 28 | **28.7 tok/s** | 5.1 | 5.63× |
+| 4B | Q1_0 (1-bit, 128-el) | 2560 | 36 | **23.5 tok/s** | 17.4 | 1.35× |
+| 4B | Q2_0 (2-bit ternary) | 2560 | 36 | **13.0 tok/s** | 2.8 | 4.64× |
+| 8B | Q1_0 (1-bit, 128-el) | 4096 | 36 | **13.4 tok/s** | 8.2 | 1.63× |
+| 8B | Q2_0 (2-bit ternary) | 4096 | 36 | **7.1 tok/s** | 1.5 | 4.73× |
 
-Full benchmarks with raw data: [`BENCHMARKS.md`](BENCHMARKS.md)
+Full benchmarks with raw data: [`BUG_TRACKER.md`](BUG_TRACKER.md)
 
 ## Features
 
 - **Pure Rust stack** — GGUF parser, BPE tokenizer, samplers, quant kernels, KV cache, thread pool. No C, no CMake, no `libllama`.
 - **Hand-tuned AVX2 kernels** — Q1_0, Q2_0, Q8_0 dot products with lookup-table acceleration and FMA accumulation. SSE4.1 + scalar fallbacks for non-AVX2 CPUs.
-- **Custom thread pool** — replaces Rayon with `std::thread::park`/`unpark`. Workers sleep at 0% CPU idle, wake in <1µs. Static work partitioning — no work-stealing overhead. Scales 5.93× on 8 cores (OpenMP: 4.38×).
+- **Custom thread pool** — replaces Rayon with a generation-counter spin-loop pool. Zero syscalls per dispatch, <100ns wake latency. Static work partitioning with L2-sized tile iteration — no work-stealing overhead. Scales 5.93× on 8 cores (OpenMP: 4.38×).
 - **Q8_0 KV cache** — quantized key/value cache reduces memory by 4× with negligible accuracy loss.
 - **Chat with templates** — PrismML Bonsai (Qwen3 architecture) chat templates parsed from GGUF metadata. Interactive and single-shot modes.
 - **Sampler controls** — temperature, top-k, top-p, min-p, repetition penalty.
@@ -133,11 +137,11 @@ Each crate is self-contained — you can use `hearth-gguf` to parse GGUF files, 
 
 Hearth replaces Rayon with a custom `ThreadPool` (`crates/hearth-llm/src/pool.rs`):
 
-1. **Startup**: N-1 OS threads are spawned (one core reserved for main thread). Workers immediately `park()` — zero CPU idle.
-2. **Dispatch**: Matmul calls write a `WorkParams` struct (7× `usize` + function pointer) to a pre-allocated shared buffer. Zero allocation per call.
-3. **Signal**: Main thread sets per-worker atomic flags and calls `thread::unpark()`. Workers wake in <1µs.
-4. **Execute**: Each worker processes its static chunk of rows sequentially. No work-stealing — matmul rows are perfectly balanced.
-5. **Sync**: Main thread spin-waits on per-worker done flags. Workers `park()` again.
+1. **Startup**: N-1 OS threads are spawned (one core reserved for main thread). Workers spin-wait on a generation counter — zero syscalls per dispatch.
+2. **Dispatch**: Matmul calls write a `WorkParams` struct (8× `usize` + function pointer + `tile_size`) to a pre-allocated shared buffer. Zero allocation per call.
+3. **Signal**: Main thread increments an atomic generation counter. Workers see the change via `Acquire` load and latch the new params.
+4. **Execute**: Each worker processes its static chunk of rows in L2-sized tiles. No work-stealing — matmul rows are perfectly balanced.
+5. **Sync**: Main thread spin-waits on per-worker done flags. Workers spin-loop with occasional `yield_now()` to avoid starving the main thread.
 
 Results: 5.93× parallel scaling on 8 cores vs Rayon's 3.26× and OpenMP's 4.38×.
 
