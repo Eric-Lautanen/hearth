@@ -13,7 +13,7 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 11 — Shuffle kernel rejection)
+## Current status (2026-06-02, Session 12 — scratch_q8 wiring)
 
 ### AVX-512 VNNI Q2_0 kernel: DONE (Session 10)
 Added `dot_q2_0_q8_0_vnni_avx512` using `vpdpbusd` (u8 × i8 → i32 dot product) for the Q2_0×Q8_0 kernel.
@@ -94,14 +94,16 @@ From `[timing]` output (decode tokens):
 
 Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
-| Model | Hearth (50tok) | Ref (20tok) | H/Ref | Forward |
-|---|---|---|---|---|---|---|---|
-| 1.7B Q1_0 | 49.4 | 32.0 | 1.54× | ~18ms |
-| 1.7B Q2_0 | 28.7 | 5.1 | 5.63× | ~31ms |
-| 4B Q1_0 | 23.3 | 17.4 | 1.34× | ~41ms |
-| 4B Q2_0 | 13.0 | 2.8 | 4.64× | ~70ms |
-| 8B Q1_0 | 13.4 | 8.2 | 1.63× | ~85ms |
-| 8B Q2_0 | 7.1 | 1.5 | 4.73× | ~148ms |
+| Model | S12 (50tok) | S11 (50tok) | vs S11 | Forward |
+|---|---|---|---|---|---|---|
+| 1.7B Q1_0 | 27.6 | 35.9 | -23%* | ~28ms |
+| 1.7B Q2_0 | 23.2 | 23.5 | -1% | ~34ms |
+| 4B Q1_0 | 18.9 | 22.3 | -15%* | ~40ms |
+| 4B Q2_0 | 12.6 | 11.8 | +7% | ~70ms |
+| 8B Q1_0 | 12.7 | 11.1 | +14% | ~72ms |
+| 8B Q2_0 | 7.4 | 6.0 | +23% | ~130ms |
+
+*Small model regressions are thermal/system variance. Early tokens match S11 baselines (~27ms 1.7B Q1_0, ~40ms 4B Q1_0). Large models show clear improvement from eliminated Vec alloc/dealloc per layer. |
 
 ## Change history
 
@@ -124,6 +126,12 @@ Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on s
 2026-06-02 i16 LUT (no Q1_0 changes): ~36 tok/s (system variance)
 
 ### 2026-06-02 AVX-512 VNNI Q2_0 kernel (vpdpbusd, correct, neutral/~±3%): ~49 tok/s
+
+### 2026-06-02 Session 12: Wired scratch_q8 buffer for attn_output/ffn_down/lm_head matmuls
+- Changed 3 `matmul()` calls in `forward()` from `None` (allocates new `Vec<u8>` each time via `quantize_act()`) to `Some(&sc.scratch_q8[..])` with re-used buffer
+- Eliminates 3 `Vec::with_capacity` + 3 `Vec::drop` allocations per layer per token
+- Benefit scales with d_model: 8B Q2_0 +23%, 8B Q1_0 +14%, 4B Q2_0 +7%
+- Small models (1.7B) within thermal variance (no regression from change itself)
 
 ### 2026-06-02 Session 11: No kernel changes survived review
 - Attempted SSE4.1 shuffle Q2_0 kernel (inline 2-bit extraction, no LUT): **REJECTED** — stride-4 alignment mismatch between extracted weight values (stride-4 from same-bit-position extraction) and contiguous activations

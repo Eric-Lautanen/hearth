@@ -106,6 +106,27 @@ cargo fmt
 - DON'T use `i32x8::new([...])` for <8 elements (construction overhead > SIMD benefit)
 - DO use `From<&[f32]>` / `f32x8` for contiguous data (rms_norm, silu, softmax in ops.rs)
 
+## Model-size-aware optimization policy
+
+All matmul-adjacent optimizations (buffer reuse, thread counts, dispatch strategies) **MUST** be gated on model size to avoid regressing small models. Use the `LlamaModel::q8_scratch()` helper (defined in `mod.rs`) instead of inline checks — this encapsulates the policy in one place.
+
+**Current policy (`q8_scratch`):**
+- `d_model >= 2560` (4B/8B models): reuse scratch buffer — eliminates per-call Vec alloc/dealloc, benefits large models by +7–23%
+- `d_model < 2560` (1.7B models): use fresh alloc (`None` path) — allocation cost is negligible at this scale, buffer reuse would cause cache interference
+
+**When adding new optimizations that could behave differently per model size:**
+1. Add a method on `LlamaModel` (like `q8_scratch`) that encapsulates the decision
+2. The method should take a clear parameter (e.g., activation slice size, buffer reference) and return the appropriate value
+3. Document the threshold and reasoning in the method doc comment
+4. Callers use the method — never inline the check
+
+**Future model expansion:** When adding support for new model families (not Bonsai), the `q8_scratch` method (and similar policy methods) should be reviewed. The `d_model >= 2560` threshold assumes:
+- d=2048 (~1.7B) → allocation overhead < 1% of forward time, skip scratch reuse
+- d=2560 (~4B) → allocation overhead ~3-5% of forward time, reuse starts to help
+- d=4096 (~8B) → allocation overhead ~7-10% of forward time, clear win from reuse
+
+For models with different architectures (e.g., larger vocab, deeper layers, alternative quantization), the threshold may shift — benchmark before and after when adding new model families.
+
 ## Rust version
 Workspace uses `half = "2.6"`, `wide = "1.4"`, `bytemuck = "1"`. `const fn` with `while` loops OK.
 

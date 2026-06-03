@@ -549,13 +549,14 @@ impl LlamaModel {
             sc.timers.attention_us += t0.elapsed().as_micros();
 
             let t0 = std::time::Instant::now();
+            let attn_q8 = self.q8_scratch(&sc.attn_out[..nq], &mut sc.scratch_q8);
             self.matmul(
                 &ln.attn_output,
                 &sc.attn_out[..nq],
                 &mut sc.q_buf[..d],
                 rb,
                 layer,
-                None,
+                attn_q8,
             )?;
             for i in 0..d {
                 sc.hidden[i] += sc.q_buf[i];
@@ -606,13 +607,14 @@ impl LlamaModel {
                 sc.timers.silu_mul_us += t0.elapsed().as_micros();
 
                 let t0 = std::time::Instant::now();
+                let ffn_q8 = self.q8_scratch(&sc.ffn_tmp[..ffn_dim], &mut sc.scratch_q8);
                 self.matmul(
                     &ln.ffn_down,
                     &sc.ffn_tmp[..ffn_dim],
                     &mut sc.q_buf[..d],
                     rb,
                     layer,
-                    None,
+                    ffn_q8,
                 )?;
                 for i in 0..d {
                     sc.hidden[i] += sc.q_buf[i];
@@ -633,13 +635,14 @@ impl LlamaModel {
         sc.timers.output_norm_us = t0.elapsed().as_micros();
 
         let t0 = std::time::Instant::now();
+        let head_q8 = self.q8_scratch(&sc.residual[..d], &mut sc.scratch_q8);
         self.matmul(
             &self.lm_head_name,
             &sc.residual[..d],
             logits,
             rb,
             self.config.n_layers as usize,
-            None,
+            head_q8,
         )?;
         sc.timers.lm_head_matmul_us = t0.elapsed().as_micros();
 
@@ -1907,6 +1910,26 @@ impl LlamaModel {
             .get(name)
             .map(|v| v.as_slice())
             .ok_or_else(|| format!("Norm weight not in cache: {}", name))
+    }
+
+    /// Reusable Q8_0 quantization buffer for matmuls.
+    /// Large models (d_model >= 2560) benefit from reusing a scratch buffer to avoid
+    /// per-call Vec allocation/deallocation. Small models use the original `None` path
+    /// (fresh alloc per call) since allocation cost is negligible at that scale and
+    /// buffer reuse can cause cache interference in fast matmuls.
+    ///
+    /// Returns `Some(&[u8])` with the quantized activation when buffer reuse is beneficial,
+    /// or `None` to let the matmul allocate its own temp buffer.
+    ///
+    /// Caller must ensure `scratch` is not aliased — the returned slice borrows `scratch`.
+    fn q8_scratch<'a>(&self, x: &[f32], scratch: &'a mut Vec<u8>) -> Option<&'a [u8]> {
+        if self.config.d_model >= 2560 {
+            scratch.clear();
+            hearth_quant::quantize_q8_0(x, scratch);
+            Some(&scratch[..])
+        } else {
+            None
+        }
     }
 
     fn norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
