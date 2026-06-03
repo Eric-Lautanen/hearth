@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+use hearth_quant;
+
 pub type DotFn = unsafe fn(*const u8, *const u8, usize) -> f32;
 
 unsafe fn dummy_dot_fn(_w: *const u8, _a: *const u8, _n: usize) -> f32 {
@@ -19,6 +21,7 @@ pub struct WorkParams {
     pub n_cols: usize,
     pub dot_fn: DotFn,
     pub tile_size: usize,
+    pub is_quantize: bool,
 }
 
 struct Worker {
@@ -49,6 +52,7 @@ impl ThreadPool {
             n_cols: 0,
             dot_fn: dummy_dot_fn,
             tile_size: usize::MAX,
+            is_quantize: false,
         });
         let params = Arc::new(AtomicPtr::new(&mut *params_box));
         let gen = Arc::new(AtomicU64::new(0));
@@ -77,25 +81,43 @@ impl ThreadPool {
                         let begin = i * chunk;
                         let end = (begin + chunk).min(wp.n);
                         let tile_size = wp.tile_size;
-                        let seq_len = wp.seq_len.max(1);
-                        let n = wp.n;
-                        for s in 0..seq_len {
-                            let a = (wp.a_ptr + s * wp.q8_stride) as *const u8;
-                            let out_off = s * n;
-                            let mut r = begin;
-                            while r < end {
-                                let tile_end = (r + tile_size).min(end);
-                                for row in r..tile_end {
-                                    unsafe {
-                                        *((wp.out_ptr + (row + out_off) * 4) as *mut f32) = (wp
-                                            .dot_fn)(
-                                            (wp.w_base + row * wp.row_bytes) as *const u8,
-                                            a,
-                                            wp.n_cols,
-                                        );
-                                    }
+                        if wp.is_quantize {
+                            let q8_size = wp.row_bytes;
+                            let dim = wp.n_cols;
+                            for token in begin..end {
+                                unsafe {
+                                    let src = std::slice::from_raw_parts(
+                                        (wp.w_base + token * dim * 4) as *const f32,
+                                        dim,
+                                    );
+                                    let dst = std::slice::from_raw_parts_mut(
+                                        (wp.a_ptr + token * q8_size) as *mut u8,
+                                        q8_size,
+                                    );
+                                    hearth_quant::quantize_q8_0_into(src, dst);
                                 }
-                                r = tile_end;
+                            }
+                        } else {
+                            let seq_len = wp.seq_len.max(1);
+                            let n = wp.n;
+                            for s in 0..seq_len {
+                                let a = (wp.a_ptr + s * wp.q8_stride) as *const u8;
+                                let out_off = s * n;
+                                let mut r = begin;
+                                while r < end {
+                                    let tile_end = (r + tile_size).min(end);
+                                    for row in r..tile_end {
+                                        unsafe {
+                                            *((wp.out_ptr + (row + out_off) * 4) as *mut f32) =
+                                                (wp.dot_fn)(
+                                                    (wp.w_base + row * wp.row_bytes) as *const u8,
+                                                    a,
+                                                    wp.n_cols,
+                                                );
+                                        }
+                                    }
+                                    r = tile_end;
+                                }
                             }
                         }
                         done_clone.store(true, Ordering::Release);
@@ -126,6 +148,49 @@ impl ThreadPool {
             gen,
             shutdown,
             num_threads,
+        }
+    }
+
+    pub fn par_quantize(&self, seq_len: usize, dim: usize, f32_base: usize, q8_base: usize) {
+        if seq_len == 0 {
+            return;
+        }
+        let q8_size = dim.div_ceil(32) * 34;
+        if self.num_threads <= 1 || seq_len <= 1 {
+            for s in 0..seq_len {
+                let src = unsafe {
+                    std::slice::from_raw_parts((f32_base + s * dim * 4) as *const f32, dim)
+                };
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut((q8_base + s * q8_size) as *mut u8, q8_size)
+                };
+                hearth_quant::quantize_q8_0_into(src, dst);
+            }
+            return;
+        }
+        unsafe {
+            *self.params.load(Ordering::Relaxed) = WorkParams {
+                n: seq_len,
+                seq_len: 1,
+                q8_stride: 0,
+                w_base: f32_base,
+                a_ptr: q8_base,
+                out_ptr: 0,
+                row_bytes: q8_size,
+                n_cols: dim,
+                dot_fn: dummy_dot_fn,
+                tile_size: usize::MAX,
+                is_quantize: true,
+            };
+        }
+        for w in &self.workers {
+            w.done_flag.store(false, Ordering::Relaxed);
+        }
+        self.gen.fetch_add(1, Ordering::Release);
+        for w in &self.workers {
+            while !w.done_flag.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
         }
     }
 
@@ -173,6 +238,7 @@ impl ThreadPool {
                 n_cols,
                 dot_fn,
                 tile_size,
+                is_quantize: false,
             };
         }
         for w in &self.workers {
@@ -233,6 +299,7 @@ impl ThreadPool {
                 n_cols,
                 dot_fn,
                 tile_size,
+                is_quantize: false,
             };
         }
         for w in &self.workers {

@@ -454,21 +454,22 @@ pub fn attention_batch(
 
             softmax(&mut scratch[..attended_len]);
 
-            // Weighted sum of values
-            for pos in 0..attended_len {
-                let att = scratch[pos];
-                let v_start = pos * head_dim;
-                let vatt = f32x8::splat(att);
-                for i in 0..chunks {
-                    let start = i * 8;
-                    let mut vacc = f32x8::from(&out_row[start..start + 8]);
-                    let vv = f32x8::from(&vs[v_start + start..v_start + start + 8]);
-                    vacc = vv.mul_add(vatt, vacc);
-                    out_row[start..start + 8].copy_from_slice(&vacc.to_array());
+            // Weighted sum of values — chunk-outer, position-inner
+            for i in 0..chunks {
+                let start = i * 8;
+                let mut vacc = f32x8::ZERO;
+                for pos in 0..attended_len {
+                    let vv = f32x8::from(&vs[pos * head_dim + start..pos * head_dim + start + 8]);
+                    vacc = vv.mul_add(f32x8::splat(scratch[pos]), vacc);
                 }
-                for i in head_dim - rem..head_dim {
-                    out_row[i] += att * vs[v_start + i];
+                out_row[start..start + 8].copy_from_slice(&vacc.to_array());
+            }
+            for i in head_dim - rem..head_dim {
+                let mut sum = 0.0f32;
+                for pos in 0..attended_len {
+                    sum += scratch[pos] * vs[pos * head_dim + i];
                 }
+                out_row[i] = sum;
             }
         }
     }

@@ -808,15 +808,16 @@ impl LlamaModel {
                 d,
             );
 
-            let q8_size = d.div_ceil(32) * 34;
-            let q8_needed = seq_len * q8_size;
+            let q8_needed = seq_len * (d.div_ceil(32) * 34);
             if bs.batch_q8.len() < q8_needed {
                 bs.batch_q8.resize(q8_needed, 0u8);
             }
-            bs.batch_q8.clear();
-            for s in 0..seq_len {
-                hearth_quant::quantize_q8_0(&bs.residual[s * d..(s + 1) * d], &mut bs.batch_q8);
-            }
+            self.pool.par_quantize(
+                seq_len,
+                d,
+                bs.residual.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
+            );
             self.matmul_batch(
                 &format!("{}.attn_q.weight", p),
                 &bs.residual[..seq_len * d],
@@ -962,10 +963,17 @@ impl LlamaModel {
                 );
             }
 
-            bs.batch_q8.clear();
-            for s in 0..seq_len {
-                hearth_quant::quantize_q8_0(&bs.attn_out[s * nq..(s + 1) * nq], &mut bs.batch_q8);
+            let aq8 = nq.div_ceil(32) * 34;
+            let attn_q8_needed = seq_len * aq8;
+            if bs.batch_q8.len() < attn_q8_needed {
+                bs.batch_q8.resize(attn_q8_needed, 0u8);
             }
+            self.pool.par_quantize(
+                seq_len,
+                nq,
+                bs.attn_out.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
+            );
             self.matmul_batch(
                 &format!("{}.attn_output.weight", p),
                 &bs.attn_out[..seq_len * nq],
@@ -991,10 +999,17 @@ impl LlamaModel {
                 d,
             );
 
-            bs.batch_q8.clear();
-            for s in 0..seq_len {
-                hearth_quant::quantize_q8_0(&bs.residual[s * d..(s + 1) * d], &mut bs.batch_q8);
+            let rq8 = d.div_ceil(32) * 34;
+            let gate_q8_needed = seq_len * rq8;
+            if bs.batch_q8.len() < gate_q8_needed {
+                bs.batch_q8.resize(gate_q8_needed, 0u8);
             }
+            self.pool.par_quantize(
+                seq_len,
+                d,
+                bs.residual.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
+            );
             self.matmul_batch(
                 &format!("{}.ffn_gate.weight", p),
                 &bs.residual[..seq_len * d],
@@ -1026,13 +1041,17 @@ impl LlamaModel {
                 );
             }
 
-            bs.batch_q8.clear();
-            for s in 0..seq_len {
-                hearth_quant::quantize_q8_0(
-                    &bs.ffn_tmp[s * ffn_dim..(s + 1) * ffn_dim],
-                    &mut bs.batch_q8,
-                );
+            let fq8 = ffn_dim.div_ceil(32) * 34;
+            let ffn_q8_needed = seq_len * fq8;
+            if bs.batch_q8.len() < ffn_q8_needed {
+                bs.batch_q8.resize(ffn_q8_needed, 0u8);
             }
+            self.pool.par_quantize(
+                seq_len,
+                ffn_dim,
+                bs.ffn_tmp.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
+            );
             self.matmul_batch(
                 &format!("{}.ffn_down.weight", p),
                 &bs.ffn_tmp[..seq_len * ffn_dim],
@@ -1151,10 +1170,17 @@ impl LlamaModel {
                 d,
             );
 
-            bs.batch_q8.clear();
-            for s in 0..seq_len {
-                hearth_quant::quantize_q8_0(&bs.residual[s * d..(s + 1) * d], &mut bs.batch_q8);
+            let erq8 = d.div_ceil(32) * 34;
+            let eqkv_needed = seq_len * erq8;
+            if bs.batch_q8.len() < eqkv_needed {
+                bs.batch_q8.resize(eqkv_needed, 0u8);
             }
+            self.pool.par_quantize(
+                seq_len,
+                d,
+                bs.residual.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
+            );
             self.matmul_batch(
                 &format!("{}.attn_q.weight", p),
                 &bs.residual[..seq_len * d],
@@ -1300,10 +1326,17 @@ impl LlamaModel {
                 );
             }
 
-            bs.batch_q8.clear();
-            for s in 0..seq_len {
-                hearth_quant::quantize_q8_0(&bs.attn_out[s * nq..(s + 1) * nq], &mut bs.batch_q8);
+            let eaq8 = nq.div_ceil(32) * 34;
+            let eattn_q8_needed = seq_len * eaq8;
+            if bs.batch_q8.len() < eattn_q8_needed {
+                bs.batch_q8.resize(eattn_q8_needed, 0u8);
             }
+            self.pool.par_quantize(
+                seq_len,
+                nq,
+                bs.attn_out.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
+            );
             self.matmul_batch(
                 &format!("{}.attn_output.weight", p),
                 &bs.attn_out[..seq_len * nq],
@@ -1329,10 +1362,17 @@ impl LlamaModel {
                 d,
             );
 
-            bs.batch_q8.clear();
-            for s in 0..seq_len {
-                hearth_quant::quantize_q8_0(&bs.residual[s * d..(s + 1) * d], &mut bs.batch_q8);
+            let erg8 = d.div_ceil(32) * 34;
+            let egate_q8_needed = seq_len * erg8;
+            if bs.batch_q8.len() < egate_q8_needed {
+                bs.batch_q8.resize(egate_q8_needed, 0u8);
             }
+            self.pool.par_quantize(
+                seq_len,
+                d,
+                bs.residual.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
+            );
             self.matmul_batch(
                 &format!("{}.ffn_gate.weight", p),
                 &bs.residual[..seq_len * d],
@@ -1364,13 +1404,17 @@ impl LlamaModel {
                 );
             }
 
-            bs.batch_q8.clear();
-            for s in 0..seq_len {
-                hearth_quant::quantize_q8_0(
-                    &bs.ffn_tmp[s * ffn_dim..(s + 1) * ffn_dim],
-                    &mut bs.batch_q8,
-                );
+            let efq8 = ffn_dim.div_ceil(32) * 34;
+            let effn_q8_needed = seq_len * efq8;
+            if bs.batch_q8.len() < effn_q8_needed {
+                bs.batch_q8.resize(effn_q8_needed, 0u8);
             }
+            self.pool.par_quantize(
+                seq_len,
+                ffn_dim,
+                bs.ffn_tmp.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
+            );
             self.matmul_batch(
                 &format!("{}.ffn_down.weight", p),
                 &bs.ffn_tmp[..seq_len * ffn_dim],

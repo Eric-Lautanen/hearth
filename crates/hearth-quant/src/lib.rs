@@ -275,6 +275,10 @@ pub fn quantize_q8_0(src: &[f32], dst: &mut Vec<u8>) {
     q8_0::quantize(src, dst)
 }
 
+pub fn quantize_q8_0_into(src: &[f32], dst: &mut [u8]) {
+    q8_0::quantize_into(src, dst);
+}
+
 pub fn quantize_f32(dtype: GgmlDType, src: &[f32], dst: &mut Vec<u8>) {
     match dtype {
         GgmlDType::Q8_0 => q8_0::quantize(src, dst),
