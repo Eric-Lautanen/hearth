@@ -2,7 +2,11 @@
 name = "hearth-compute"
 version = "0.1.0"
 edition = "2021"
-description = "GPU compute stubs for hearth-llm type compatibility"
+description = "GPU compute backend via wgpu/WGSL for hearth-llm"
 
 [dependencies]
 hearth-gguf = { workspace = true }
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { workspace = true }
+half = { workspace = true }

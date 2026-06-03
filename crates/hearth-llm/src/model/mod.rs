@@ -918,7 +918,11 @@ impl LlamaModel {
             }
 
             if caches[layer].is_q8_0() {
-                ops::attention_batch_q8_0(
+                let scratch_needed = self.pool.num_threads() * max_seq;
+                if bs.attn_scores.len() < scratch_needed {
+                    bs.attn_scores.resize(scratch_needed, 0.0f32);
+                }
+                ops::attention_batch_q8_0_parallel(
                     &bs.q_heads[..seq_len * nq],
                     &caches[layer].k_q8,
                     &caches[layer].v_q8,
@@ -929,6 +933,7 @@ impl LlamaModel {
                     max_seq,
                     &mut bs.attn_out[..seq_len * nq],
                     &mut bs.attn_scores,
+                    &self.pool,
                 );
             } else {
                 let scratch_needed = self.pool.num_threads() * max_seq;
