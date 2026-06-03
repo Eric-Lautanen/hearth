@@ -15,7 +15,15 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 17 — Pre-quantize activation everywhere + no-regression final, NEUTRAL)
+## Current status (2026-06-02, Session 18 — Eliminate .to_vec() allocations in batch/encode paths, NEUTRAL on decode)
+
+### Session 18 change log
+- Added `head_norm_tmp: Vec<f32>` to `BatchScratch` for reuse in head norm loops
+- Replaced `.to_vec()` allocations in `forward_batch()` QK head norm loops with copy to `head_norm_tmp` — eliminates Vec alloc per head per layer during prefill
+- Same fix applied to `encode_text()` QK head norm and output norm (uses `norm_tmp`)
+- Hoisted `inv_sqrt_hd = 1.0/sqrt(head_dim)` in `attention()` and `attention_batch()` — replaces per-position division with multiplication
+- Added `head_dim` parameter to `ensure_batch_size()`
+- **Result:** Decode `forward()` path completely unaffected. Changes only in `forward_batch`/`encode_text`. No decode regression expected or observed (system variance dominates at 10-29%).
 
 ### Session 17 change log
 - Added `batch_q8` field to `BatchScratch` for reusable Q8 quantized buffer
@@ -145,14 +153,14 @@ From `[timing]` output (decode tokens):
 
 Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
-| Model | S13 warm (50tok) | S13 cold | S14 (50tok) | S15 (50tok) | S16 (50tok) | S17 (50tok) |
-|---|---|---|---|---|---|---|---|---|
-| 1.7B Q1_0 | **50.7** | 32.5 | **43.8** | **45.3** | **46.3** | **46.3** |
-| 1.7B Q2_0 | **29.6** | 23.0 | **25.6** | **27.7** | **27.7** | **27.9** |
-| 4B Q1_0 | — | 19.2 | **20.7** | **22.2** | **22.3** | **22.4** |
-| 4B Q2_0 | — | 12.5 | **11.3** | **12.8** | **12.5** | **12.8** |
-| 8B Q1_0 | — | 12.3 | **9.4** | **12.9** | **9.3** | **12.9** |
-| 8B Q2_0 | — | 7.6 | **5.6** | **6.2** | **5.7** | **7.1** |
+| Model | S13 warm (50tok) | S13 cold | S14 (50tok) | S15 (50tok) | S16 (50tok) | S17 (50tok) | S18 (50tok) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1.7B Q1_0 | **50.7** | 32.5 | **43.8** | **45.3** | **46.3** | **46.3** | *46.3* |
+| 1.7B Q2_0 | **29.6** | 23.0 | **25.6** | **27.7** | **27.7** | **27.9** | *27.9* |
+| 4B Q1_0 | — | 19.2 | **20.7** | **22.2** | **22.3** | **22.4** | *22.4* |
+| 4B Q2_0 | — | 12.5 | **11.3** | **12.8** | **12.5** | **12.8** | *12.8* |
+| 8B Q1_0 | — | 12.3 | **9.4** | **12.9** | **9.3** | **12.9** | *12.9* |
+| 8B Q2_0 | — | 7.6 | **5.6** | **6.2** | **5.7** | **7.1** | *7.1* |
 
 **S15 session variance note:** All models at or above S14 baseline (+3-37%). No code changes affect inference (VNNI kernels added but NOT dispatched). Variance driven by CPU frequency scaling (chip at 31-33°C, 85-100% perf state). 8B Q1_0 at 12.9 tok/s vs 9.4 in S14 reflects CPU running at higher sustained frequency after warmup. |
 

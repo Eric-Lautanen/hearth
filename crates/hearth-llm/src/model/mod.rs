@@ -243,6 +243,7 @@ impl LlamaModel {
             norm_tmp: Vec::new(),
             attn_scores: Vec::new(),
             batch_q8: Vec::new(),
+            head_norm_tmp: Vec::new(),
         };
 
         let layer_names: Vec<LayerTensorNames> = (0..config.n_layers as usize)
@@ -714,6 +715,7 @@ impl LlamaModel {
         nq: usize,
         nkv: usize,
         ffn_dim: usize,
+        head_dim: usize,
         max_seq: usize,
     ) {
         let need = |v: &mut Vec<f32>, n: usize| {
@@ -735,6 +737,7 @@ impl LlamaModel {
         need(&mut bs.ffn_tmp, seq_len * ffn_dim);
         need(&mut bs.norm_tmp, seq_len * d);
         need(&mut bs.attn_scores, max_seq.max(seq_len));
+        need(&mut bs.head_norm_tmp, head_dim);
         let q8_needed = seq_len * (d.div_ceil(32) * 34);
         if bs.batch_q8.len() < q8_needed {
             bs.batch_q8.resize(q8_needed, 0u8);
@@ -763,7 +766,7 @@ impl LlamaModel {
         let nkv = n_kv_heads * head_dim;
         let max_seq = self.config.max_seq_len as usize;
 
-        self.ensure_batch_size(bs, seq_len, d, nq, nkv, ffn_dim, max_seq);
+        self.ensure_batch_size(bs, seq_len, d, nq, nkv, ffn_dim, head_dim, max_seq);
 
         {
             let entry = self
@@ -857,9 +860,10 @@ impl LlamaModel {
                 for s in 0..seq_len {
                     for h in 0..n_heads {
                         let off = s * nq + h * head_dim;
-                        let tmp = bs.q_heads[off..off + head_dim].to_vec();
+                        bs.head_norm_tmp[..head_dim]
+                            .copy_from_slice(&bs.q_heads[off..off + head_dim]);
                         self.norm(
-                            &tmp,
+                            &bs.head_norm_tmp[..head_dim],
                             q_norm,
                             self.config.rms_norm_eps,
                             &mut bs.q_heads[off..off + head_dim],
@@ -875,9 +879,10 @@ impl LlamaModel {
                 for s in 0..seq_len {
                     for h in 0..n_kv_heads {
                         let off = s * nkv + h * head_dim;
-                        let tmp = bs.k_heads[off..off + head_dim].to_vec();
+                        bs.head_norm_tmp[..head_dim]
+                            .copy_from_slice(&bs.k_heads[off..off + head_dim]);
                         self.norm(
-                            &tmp,
+                            &bs.head_norm_tmp[..head_dim],
                             k_norm,
                             self.config.rms_norm_eps,
                             &mut bs.k_heads[off..off + head_dim],
@@ -1104,9 +1109,10 @@ impl LlamaModel {
             norm_tmp: Vec::new(),
             attn_scores: Vec::new(),
             batch_q8: Vec::new(),
+            head_norm_tmp: Vec::new(),
         };
         let mut rb = self.row_buf.lock().unwrap().clone();
-        self.ensure_batch_size(&mut bs, seq_len, d, nq, nkv, ffn_dim, max_seq);
+        self.ensure_batch_size(&mut bs, seq_len, d, nq, nkv, ffn_dim, head_dim, max_seq);
 
         {
             let entry = self
@@ -1192,9 +1198,10 @@ impl LlamaModel {
                 for s in 0..seq_len {
                     for h in 0..n_heads {
                         let off = s * nq + h * head_dim;
-                        let tmp = bs.q_heads[off..off + head_dim].to_vec();
+                        bs.head_norm_tmp[..head_dim]
+                            .copy_from_slice(&bs.q_heads[off..off + head_dim]);
                         self.norm(
-                            &tmp,
+                            &bs.head_norm_tmp[..head_dim],
                             q_norm,
                             self.config.rms_norm_eps,
                             &mut bs.q_heads[off..off + head_dim],
@@ -1210,9 +1217,10 @@ impl LlamaModel {
                 for s in 0..seq_len {
                     for h in 0..n_kv_heads {
                         let off = s * nkv + h * head_dim;
-                        let tmp = bs.k_heads[off..off + head_dim].to_vec();
+                        bs.head_norm_tmp[..head_dim]
+                            .copy_from_slice(&bs.k_heads[off..off + head_dim]);
                         self.norm(
-                            &tmp,
+                            &bs.head_norm_tmp[..head_dim],
                             k_norm,
                             self.config.rms_norm_eps,
                             &mut bs.k_heads[off..off + head_dim],
@@ -1382,9 +1390,9 @@ impl LlamaModel {
         let mut hidden_states = vec![0.0f32; seq_len * d];
         for s in 0..seq_len {
             let off = s * d;
-            let tmp = bs.hidden[off..off + d].to_vec();
+            bs.norm_tmp[..d].copy_from_slice(&bs.hidden[off..off + d]);
             self.norm(
-                &tmp,
+                &bs.norm_tmp[..d],
                 out_norm,
                 self.config.rms_norm_eps,
                 &mut hidden_states[off..off + d],

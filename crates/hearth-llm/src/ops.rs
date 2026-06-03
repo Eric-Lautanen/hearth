@@ -325,6 +325,7 @@ pub fn attention(
     // Use SIMD dot product for each position
     let chunks = head_dim / 8;
     let rem = head_dim % 8;
+    let inv_sqrt_hd = 1.0 / (head_dim as f32).sqrt();
     for pos in 0..seq_len {
         let k_start = pos * head_dim;
         let mut vsum = f32x8::ZERO;
@@ -337,7 +338,7 @@ pub fn attention(
         for i in head_dim - rem..head_dim {
             score += q[i] * k_cache[k_start + i];
         }
-        scratch[pos] = score / (head_dim as f32).sqrt();
+        scratch[pos] = score * inv_sqrt_hd;
     }
 
     // Softmax over scores
@@ -435,6 +436,7 @@ pub fn attention_batch(
             // Dot product Q·K with scaling, causal mask implicit since attended_len = s+1
             let chunks = head_dim / 8;
             let rem = head_dim % 8;
+            let inv_sqrt_hd = 1.0 / (head_dim as f32).sqrt();
             for pos in 0..attended_len {
                 let k_start = pos * head_dim;
                 let mut vsum = f32x8::ZERO;
@@ -447,7 +449,7 @@ pub fn attention_batch(
                 for i in head_dim - rem..head_dim {
                     score += q_row[i] * ks[k_start + i];
                 }
-                scratch[pos] = score / (head_dim as f32).sqrt();
+                scratch[pos] = score * inv_sqrt_hd;
             }
 
             softmax(&mut scratch[..attended_len]);
