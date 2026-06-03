@@ -111,12 +111,14 @@ impl ThreadPool {
                         } else {
                             let seq_len = wp.seq_len.max(1);
                             let n = wp.n;
-                            for s in 0..seq_len {
-                                let a = (wp.a_ptr + s * wp.q8_stride) as *const u8;
-                                let out_off = s * n;
-                                let mut r = begin;
-                                while r < end {
-                                    let tile_end = (r + tile_size).min(end);
+                            // SFC-inspired loop interchange: tile-outer, token-inner
+                            // Keeps weight tile hot in L2 across all seq_len tokens
+                            let mut r = begin;
+                            while r < end {
+                                let tile_end = (r + tile_size).min(end);
+                                for s in 0..seq_len {
+                                    let a = (wp.a_ptr + s * wp.q8_stride) as *const u8;
+                                    let out_off = s * n;
                                     for row in r..tile_end {
                                         unsafe {
                                             *((wp.out_ptr + (row + out_off) * 4) as *mut f32) =
@@ -127,8 +129,8 @@ impl ThreadPool {
                                                 );
                                         }
                                     }
-                                    r = tile_end;
                                 }
+                                r = tile_end;
                             }
                         }
                         done_clone.store(true, Ordering::Release);
@@ -329,20 +331,20 @@ impl ThreadPool {
         }
         if self.num_threads <= 1 || (n <= 1 && seq_len <= 1) {
             let tile_size = (1048576 / row_bytes).max(1);
-            for s in 0..seq_len {
-                let a = (a_ptr + s * q8_stride) as *const u8;
-                let out_off = s * n;
-                let mut r = 0;
-                while r < n {
-                    let tile_end = (r + tile_size).min(n);
+            let mut r = 0;
+            while r < n {
+                let tile_end = (r + tile_size).min(n);
+                for s in 0..seq_len {
+                    let a = (a_ptr + s * q8_stride) as *const u8;
+                    let out_off = s * n;
                     for row in r..tile_end {
                         unsafe {
                             *((out_ptr + (row + out_off) * 4) as *mut f32) =
                                 (dot_fn)((w_base + row * row_bytes) as *const u8, a, n_cols);
                         }
                     }
-                    r = tile_end;
                 }
+                r = tile_end;
             }
             return;
         }
