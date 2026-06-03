@@ -15,7 +15,14 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 16 — Batched prefill dispatch, NEUTRAL)
+## Current status (2026-06-02, Session 17 — Pre-quantize activation for forward_batch, NEUTRAL)
+
+### Session 17 change log
+- Added `batch_q8` field to `BatchScratch` for reusable Q8 quantized buffer
+- Added optional `x_q8: Option<&[u8]>` parameter to `matmul_batch` — when `Some`, skips internal quantize loop and uses the pre-quantized data directly
+- In `forward_batch`, quantize residual once before Q/K/V matmul_batch calls (3 calls → 1 quantize), and once before ffn_gate/ffn_up (2 calls → 1 quantize). Also quantize ffn_down input once.
+- `encode_text` calls pass `None` (unchanged behavior — not on hot path)
+- All 6 models within system variance of S16 baseline. No regression. The quantize overhead was already small (~1% per call, saving 2 out of 3 calls = ~0.7% per layer).
 
 ### Q1_0 AVX-512 VNNI kernel: REVERTED (not dispatched)
 
@@ -138,14 +145,14 @@ From `[timing]` output (decode tokens):
 
 Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
-| Model | S13 warm (50tok) | S13 cold | S14 (50tok) | S15 (50tok) | S16 (50tok) |
-|---|---|---|---|---|---|---|---|
-| 1.7B Q1_0 | **50.7** | 32.5 | **43.8** | **45.3** | **46.3** |
-| 1.7B Q2_0 | **29.6** | 23.0 | **25.6** | **27.7** | **27.7** |
-| 4B Q1_0 | — | 19.2 | **20.7** | **22.2** | **22.3** |
-| 4B Q2_0 | — | 12.5 | **11.3** | **12.8** | **12.5** |
-| 8B Q1_0 | — | 12.3 | **9.4** | **12.9** | **9.3** |
-| 8B Q2_0 | — | 7.6 | **5.6** | **6.2** | **5.7** |
+| Model | S13 warm (50tok) | S13 cold | S14 (50tok) | S15 (50tok) | S16 (50tok) | S17 (50tok) |
+|---|---|---|---|---|---|---|---|---|
+| 1.7B Q1_0 | **50.7** | 32.5 | **43.8** | **45.3** | **46.3** | **46.3** |
+| 1.7B Q2_0 | **29.6** | 23.0 | **25.6** | **27.7** | **27.7** | **27.9** |
+| 4B Q1_0 | — | 19.2 | **20.7** | **22.2** | **22.3** | **22.4** |
+| 4B Q2_0 | — | 12.5 | **11.3** | **12.8** | **12.5** | **12.8** |
+| 8B Q1_0 | — | 12.3 | **9.4** | **12.9** | **9.3** | **12.9** |
+| 8B Q2_0 | — | 7.6 | **5.6** | **6.2** | **5.7** | **7.1** |
 
 **S15 session variance note:** All models at or above S14 baseline (+3-37%). No code changes affect inference (VNNI kernels added but NOT dispatched). Variance driven by CPU frequency scaling (chip at 31-33°C, 85-100% perf state). 8B Q1_0 at 12.9 tok/s vs 9.4 in S14 reflects CPU running at higher sustained frequency after warmup. |
 
