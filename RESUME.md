@@ -35,12 +35,12 @@ The Ryzen 7 8840HS has AVX-512 (Zen 4). Currently enabled via `target-cpu=native
 - `crates/hearth-llm/src/model/matmul.rs` — matmul dispatch (no changes needed for tiling)
 - `crates/hearth-llm/src/model/mod.rs` — forward pass, lm_head timing
 
-## Session 9 baselines (50-token, warm)
+## Session 9 baselines (50-token, 10-prompt warm avg)
 | Model | tok/s | avg_cpu_overhead (µs/tok) |
 |---|---|---|
-| 1.7B Q1_0 | 49.4 | 20,233 |
-| 1.7B Q2_0 | 28.5 | 35,071 |
-| 4B Q1_0 | 23.3 | 42,864 |
-| 4B Q2_0 | 12.9 | 77,367 |
-| 8B Q1_0 | 13.5 | 74,124 |
-| 8B Q2_0 | 7.0 | 142,255 |
+| 1.7B Q1_0 | 49.5 | 20,202 |
+| 1.7B Q2_0 | 28.7 | 34,843 |
+| 4B Q1_0 | 23.5 | 42,553 |
+| 4B Q2_0 | 13.0 | 76,923 |
+| 8B Q1_0 | 13.4 | 74,626 |
+| 8B Q2_0 | 7.1 | 140,845 |
