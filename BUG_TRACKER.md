@@ -15,7 +15,32 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-03, Session 20 — Prefill optimization: parallel batch quantize + attention inner loop, ~13% TTFT reduction)
+## Current status (2026-06-03, Session 23 — Fused SiLU+Mul+Quantize + honest assessment: prefill optimization nearly exhausted)
+
+### Session 23 change log
+- Added `silu_mul_q8()` — fused `silu(gate[i]) * up[i]` + Q8_0 quantize in one pass (skips ffn_tmp f32 intermediate)
+- Wired into `forward_batch()` and `encode_text()` FFN-down path
+- **Result:** Neutral perf (~0.3% prefill improvement). silu+quantize was already <1% of prefill.
+- **Honest assessment:** All prefill non-matmul optimizations collectively <5% of total time. Further <1% gains are diminishing returns. No more low-hanging fruit remains.
+
+### Session 22 change log
+- Added `rms_norm_q8()` and `rms_norm_q8_batch()` to ops.rs — fused norm+quantize: computes RMS norm and quantizes directly to Q8_0 blocks, skipping intermediate f32 residual buffer write+read
+- Eliminated unnecessary `hidden → norm_tmp` copies before norm (norm only reads input, copy was dead code from earlier refactoring)
+- Replaced 2 norm+quantize sites in `forward_batch()` and 2 in `encode_text()` with `ops::rms_norm_q8_batch()` — passes hidden directly as input
+- **Decode result:** All 6 models within ±2% of S21 baseline. No regression.
+- **Prefill result:** 65 tokens in 873ms (13.4ms/tok) — neutral vs S20 (13.5ms/tok)
+- **Key insight:** Norm+quantize is ~1ms total for prefill. Fusing eliminates 2 f32 passes but saves only ~0.1ms. CPU is compute-bound during prefill, not bandwidth-bound, so eliminating f32 intermediate writes has minimal impact at these scales.
+
+### Session 21 change log
+- Added `attention_q8_0()` and `attention_batch_q8_0()` — attention functions with on-the-fly Q8_0 K/V dequant in inner SIMD loops (no allocations)
+- Wired Q8_0 attention into `forward()` decode path — replaces `k_slice_dequant().to_vec()` per KV head per layer with direct byte slice passing to `attention_q8_0()`
+- Wired Q8_0 attention into `forward_batch()`/`encode_text()` prefill paths — replaces dequant-to-Vec+copy+attention_batch with single `attention_batch_q8_0()` call
+- Attempted switching `generate_text()` to `KVStorage::Q8_0` — **REVERTED**
+- **Q8_0 KV benchmark (1.7B Q1_0, 50-tok):** 35.9 tok/s vs 46.0 baseline = **-21% regression**
+- **Root cause:** Q8_0 dequant adds ~80µs/layer/token at seq_len=50 (attention: 5%→17% of total). Memory bandwidth not the bottleneck at this scale.
+- **Break-even estimated at seq_len ≥ 512** — only then does 4× memory reduction offset dequant compute cost
+- `generate_text()` reverted to `KVStorage::F32` — Q8_0 attention path remains in code but not dispatched (guarded by `is_q8_0()` checks)
+- **Key insight confirmed:** F32 KV is optimal for this system at typical decode context lengths. Q8_0 KV is a future optimization for very long contexts or bandwidth-constrained hardware.
 
 ### Session 20 change log
 - Added `quantize_q8_0_into()` — slice-based Q8_0 quantize (no Vec::push) to `hearth-quant`
@@ -174,14 +199,14 @@ From `[timing]` output (decode tokens):
 
 Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
-| Model | S13 warm (50tok) | S13 cold | S14 (50tok) | S15 (50tok) | S16 (50tok) | S17 (50tok) | S18 (50tok) | S19 (50tok) | S20 (50tok) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1.7B Q1_0 | **50.7** | 32.5 | **43.8** | **45.3** | **46.3** | **46.3** | *46.3* | *46.0* | *45.5* |
-| 1.7B Q2_0 | **29.6** | 23.0 | **25.6** | **27.7** | **27.7** | **27.9** | *27.9* | *27.6* | *27.1* |
-| 4B Q1_0 | — | 19.2 | **20.7** | **22.2** | **22.3** | **22.4** | *22.4* | *22.0* | *22.0* |
-| 4B Q2_0 | — | 12.5 | **11.3** | **12.8** | **12.5** | **12.8** | *12.8* | *12.6* | *12.4* |
-| 8B Q1_0 | — | 12.3 | **9.4** | **12.9** | **9.3** | **12.9** | *12.9* | *12.8* | *13.0* |
-| 8B Q2_0 | — | 7.6 | **5.6** | **6.2** | **5.7** | **7.1** | *7.1* | *7.0* | *7.1* |
+| Model | S13 warm (50tok) | S13 cold | S14 (50tok) | S15 (50tok) | S16 (50tok) | S17 (50tok) | S18 (50tok) | S19 (50tok) | S20 (50tok) | S21 (50tok) | S22 (50tok) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1.7B Q1_0 | **50.7** | 32.5 | **43.8** | **45.3** | **46.3** | **46.3** | *46.3* | *46.0* | *45.5* | *46.8* | *46.9* |
+| 1.7B Q2_0 | **29.6** | 23.0 | **25.6** | **27.7** | **27.7** | **27.9** | *27.9* | *27.6* | *27.1* | *27.8* | *27.3* |
+| 4B Q1_0 | — | 19.2 | **20.7** | **22.2** | **22.3** | **22.4** | *22.4* | *22.0* | *22.0* | *21.4* | *21.2* |
+| 4B Q2_0 | — | 12.5 | **11.3** | **12.8** | **12.5** | **12.8** | *12.8* | *12.6* | *12.4* | *12.8* | *12.9* |
+| 8B Q1_0 | — | 12.3 | **9.4** | **12.9** | **9.3** | **12.9** | *12.9* | *12.8* | *13.0* | *13.3* | *13.3* |
+| 8B Q2_0 | — | 7.6 | **5.6** | **6.2** | **5.7** | **7.1** | *7.1* | *7.0* | *7.1* | *7.4* | *7.3* |
 
 **S15 session variance note:** All models at or above S14 baseline (+3-37%). No code changes affect inference (VNNI kernels added but NOT dispatched). Variance driven by CPU frequency scaling (chip at 31-33°C, 85-100% perf state). 8B Q1_0 at 12.9 tok/s vs 9.4 in S14 reflects CPU running at higher sustained frequency after warmup. |
 

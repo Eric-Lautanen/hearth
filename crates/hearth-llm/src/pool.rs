@@ -5,6 +5,7 @@ use std::thread;
 use hearth_quant;
 
 pub type DotFn = unsafe fn(*const u8, *const u8, usize) -> f32;
+pub type ParForFn = unsafe fn(worker_id: usize, begin: usize, end: usize, ctx: usize);
 
 unsafe fn dummy_dot_fn(_w: *const u8, _a: *const u8, _n: usize) -> f32 {
     0.0
@@ -22,6 +23,9 @@ pub struct WorkParams {
     pub dot_fn: DotFn,
     pub tile_size: usize,
     pub is_quantize: bool,
+    pub is_par_for: bool,
+    pub par_for_fn: ParForFn,
+    pub par_for_ctx: usize,
 }
 
 struct Worker {
@@ -53,6 +57,9 @@ impl ThreadPool {
             dot_fn: dummy_dot_fn,
             tile_size: usize::MAX,
             is_quantize: false,
+            is_par_for: false,
+            par_for_fn: |_, _, _, _| {},
+            par_for_ctx: 0,
         });
         let params = Arc::new(AtomicPtr::new(&mut *params_box));
         let gen = Arc::new(AtomicU64::new(0));
@@ -81,7 +88,11 @@ impl ThreadPool {
                         let begin = i * chunk;
                         let end = (begin + chunk).min(wp.n);
                         let tile_size = wp.tile_size;
-                        if wp.is_quantize {
+                        if wp.is_par_for {
+                            unsafe {
+                                (wp.par_for_fn)(i, begin, end, wp.par_for_ctx);
+                            }
+                        } else if wp.is_quantize {
                             let q8_size = wp.row_bytes;
                             let dim = wp.n_cols;
                             for token in begin..end {
@@ -151,6 +162,49 @@ impl ThreadPool {
         }
     }
 
+    pub fn num_threads(&self) -> usize {
+        self.num_threads
+    }
+
+    pub fn par_for(&self, n: usize, func: ParForFn, ctx: usize) {
+        if n == 0 {
+            return;
+        }
+        if self.num_threads <= 1 || n <= 1 {
+            unsafe {
+                (func)(0, 0, n, ctx);
+            }
+            return;
+        }
+        unsafe {
+            *self.params.load(Ordering::Relaxed) = WorkParams {
+                n,
+                seq_len: 1,
+                q8_stride: 0,
+                w_base: 0,
+                a_ptr: 0,
+                out_ptr: 0,
+                row_bytes: 0,
+                n_cols: 0,
+                dot_fn: dummy_dot_fn,
+                tile_size: usize::MAX,
+                is_quantize: false,
+                is_par_for: true,
+                par_for_fn: func,
+                par_for_ctx: ctx,
+            };
+        }
+        for w in &self.workers {
+            w.done_flag.store(false, Ordering::Relaxed);
+        }
+        self.gen.fetch_add(1, Ordering::Release);
+        for w in &self.workers {
+            while !w.done_flag.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
     pub fn par_quantize(&self, seq_len: usize, dim: usize, f32_base: usize, q8_base: usize) {
         if seq_len == 0 {
             return;
@@ -181,6 +235,9 @@ impl ThreadPool {
                 dot_fn: dummy_dot_fn,
                 tile_size: usize::MAX,
                 is_quantize: true,
+                is_par_for: false,
+                par_for_fn: |_, _, _, _| {},
+                par_for_ctx: 0,
             };
         }
         for w in &self.workers {
@@ -239,6 +296,9 @@ impl ThreadPool {
                 dot_fn,
                 tile_size,
                 is_quantize: false,
+                is_par_for: false,
+                par_for_fn: |_, _, _, _| {},
+                par_for_ctx: 0,
             };
         }
         for w in &self.workers {
@@ -300,6 +360,9 @@ impl ThreadPool {
                 dot_fn,
                 tile_size,
                 is_quantize: false,
+                is_par_for: false,
+                par_for_fn: |_, _, _, _| {},
+                par_for_ctx: 0,
             };
         }
         for w in &self.workers {
