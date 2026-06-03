@@ -40,6 +40,24 @@ const Q2V_I16: [[i16; 4]; 256] = {
     table
 };
 
+/// Q2V_U8: 2-bit packed values as u8 {0, 1, 2, 3} for vpdpbusd.
+/// vpdpbusd computes Σ u8 * i8; true Q2V = u8 - 1, so correction subtracts Σ act.
+/// 256 entries × 4 u8 = 1 KB.
+const Q2V_U8: [[u8; 4]; 256] = {
+    let mut table = [[0u8; 4]; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut j = 0;
+        while j < 4 {
+            let q = (b >> (j * 2)) & 3;
+            table[b][j] = q as u8;
+            j += 1;
+        }
+        b += 1;
+    }
+    table
+};
+
 /// Dequantize Q2_0 (type 42): 128-element 2-bit ternary blocks
 /// Format: 2 bytes FP16 scale + 32 bytes packed 2-bit codes (4 per byte)
 /// 2-bit values: 0→-1, 1→0, 2→+1, 3→+2 (unused for ternary)
@@ -112,6 +130,58 @@ unsafe fn hsum_float_8(v: __m256) -> f32 {
 /// One Q2_0 block spans 4 Q8_0 blocks.
 pub fn dot_q2_0_q8_0(weight_row: &[u8], act_data: &[u8], n: usize) -> f32 {
     unsafe { dot_q2_0_q8_0_ptr(weight_row.as_ptr(), act_data.as_ptr(), n) }
+}
+
+/// AVX-512 VNNI kernel: uses vpdpbusd (dot product of u8 × i8 → i32)
+/// for the core dot product. Q2_0 values as u8 {0,1,2,3} minus the
+/// activation sum correction: true_dot = vpdpbusd(w_u8, act) - Σact.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512vnni")]
+unsafe fn dot_q2_0_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
+    use core::arch::x86_64::*;
+    let blocks = n / BLOCK_SIZE;
+    let mut acc_global = _mm256_setzero_ps();
+    let ones = _mm256_set1_epi8(1);
+
+    for b in 0..blocks {
+        let w_off = b * BLOCK_BYTES;
+        let w_scale = f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32();
+        let qs = w_ptr.add(w_off + 2);
+
+        let mut acc_block = _mm256_setzero_ps();
+
+        for sub in 0..4 {
+            let a_off = (b * 4 + sub) * 34;
+            let a_scale = f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+            let a_vals = a_ptr.add(a_off + 2);
+            let qs_sub = qs.add(sub * 8);
+
+            let mut w_buf: [u8; 32] = [0u8; 32];
+            for j in 0..8usize {
+                core::ptr::copy_nonoverlapping(
+                    Q2V_U8[*qs_sub.add(j) as usize].as_ptr(),
+                    w_buf.as_mut_ptr().add(j * 4),
+                    4,
+                );
+            }
+            let w = _mm256_loadu_si256(w_buf.as_ptr() as *const __m256i);
+            let a = _mm256_loadu_si256(a_vals as *const __m256i);
+
+            let zero = _mm256_setzero_si256();
+            let prod = _mm256_dpbusd_epi32(zero, w, a);
+            let sum_a = _mm256_dpbusd_epi32(zero, ones, a);
+            let diff = _mm256_sub_epi32(prod, sum_a);
+
+            let a_scale_ps = _mm256_set1_ps(a_scale);
+            acc_block = _mm256_fmadd_ps(a_scale_ps, _mm256_cvtepi32_ps(diff), acc_block);
+        }
+
+        let w_scale_ps = _mm256_set1_ps(w_scale);
+        acc_global = _mm256_fmadd_ps(w_scale_ps, acc_block, acc_global);
+    }
+
+    hsum_float_8(acc_global)
 }
 
 /// AVX2 LUT kernel: 16 elements per batch, FMA accumulation across all blocks, single hsum per row.
@@ -282,10 +352,21 @@ unsafe fn dot_q2_0_q8_0_ptr_scalar(w_ptr: *const u8, a_ptr: *const u8, n: usize)
     sum
 }
 
-/// Raw-pointer dispatch: AVX2 > SSE4.1 > scalar.
+/// Raw-pointer dispatch: AVX-512 VNNI > AVX2 LUT > SSE4.1 > scalar.
 /// # Safety
 /// w_ptr valid for n/128*34 bytes, a_ptr valid for n/32*34 bytes.
 pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // AVX-512 VNNI: vpdpbusd replaces cvtepi8+madd pair, check both avx512f and vnni
+        #[cfg(target_feature = "avx512f")]
+        #[cfg(target_feature = "avx512vnni")]
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+        {
+            return dot_q2_0_q8_0_vnni_avx512(w_ptr, a_ptr, n);
+        }
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") {

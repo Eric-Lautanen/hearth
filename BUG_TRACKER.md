@@ -13,7 +13,25 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 9 — tile-in-L2 matmul dispatch)
+## Current status (2026-06-02, Session 10 — AVX-512 VNNI Q2_0 kernel)
+
+### AVX-512 VNNI Q2_0 kernel: DONE (Session 10)
+Added `dot_q2_0_q8_0_vnni_avx512` using `vpdpbusd` (u8 × i8 → i32 dot product) for the Q2_0×Q8_0 kernel.
+- Requires `avx512f` + `avx512vnni` features (available on Zen 4 via `target-cpu=native`)
+- Q2V_U8 LUT (1KB) with raw 2-bit values {0,1,2,3}
+- True dot = `vpdpbusd(w_u8, act) - Σact` (sum_act computed via second vpdpbusd with ones)
+- FMA accumulation across sub-blocks and weight blocks (same pattern as AVX2 LUT kernel)
+- Runtime dispatch via `is_x86_feature_detected!("avx512vnni")`
+
+**Result:** Correct (all tests pass), neutral performance (±3% within system variance). The vpdpbusd reduces arithmetic from 4 µops (2× cvtepi8 + 2× madd) to 2 µops (vpdpbusd + sum_act correction), but LUT load overhead dominates the inner loop.
+
+### Software prefetch (pool.rs): REVERTED
+Added `_mm_prefetch(..., _MM_HINT_T1)` in worker loops to prefetch the next weight row into L2. Caused ~5-11% regression on Q1_0 models. Hardware prefetcher on Zen 4 already handles sequential access well. Reverted.
+
+### Remaining bottlenecks
+ffn_gate_up_matmul (35-46%) and ffn_down_matmul (15-25%) dominate. Kernels are LUT-load-bound (8 loads per Q8_0 sub-block). Further gains require either:
+- Eliminating LUT loads via different weight format
+- AVX-512 512-bit kernels that process 2 Q8_0 sub-blocks at once (requires contiguous activation data)
 
 ### Thread pool worker count: FIXED
 The previous session's pool rewrite (park/unpark → spin-loop gen counter) preserved the thread count formula `available_parallelism - 1` = 15 workers on this 8C/16T CPU. Session 3 had established 8 workers as optimal. 15 workers caused massive SMT contention: 1.7B Q1_0 dropped from ~45 tok/s to 12.6 tok/s (3.6×). Fixed to 8 workers, restoring performance.
@@ -77,13 +95,13 @@ From `[timing]` output (decode tokens):
 Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on small models).
 
 | Model | Hearth (50tok) | Ref (20tok) | H/Ref | Forward |
-|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|---|
 | 1.7B Q1_0 | 49.4 | 32.0 | 1.54× | ~18ms |
-| 1.7B Q2_0 | 28.5 | 5.1 | 5.59× | ~35ms |
+| 1.7B Q2_0 | 28.7 | 5.1 | 5.63× | ~31ms |
 | 4B Q1_0 | 23.3 | 17.4 | 1.34× | ~41ms |
-| 4B Q2_0 | 12.9 | 2.8 | 4.61× | ~77ms |
-| 8B Q1_0 | 13.5 | 8.2 | 1.65× | ~71ms |
-| 8B Q2_0 | 7.0 | 1.5 | 4.67× | ~143ms |
+| 4B Q2_0 | 13.0 | 2.8 | 4.64× | ~70ms |
+| 8B Q1_0 | 13.4 | 8.2 | 1.63× | ~85ms |
+| 8B Q2_0 | 7.1 | 1.5 | 4.73× | ~148ms |
 
 ## Change history
 
@@ -105,7 +123,9 @@ Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on s
 2026-06-02 Scratch buffer reuse (3 fewer allocs/forward): neutral
 2026-06-02 i16 LUT (no Q1_0 changes): ~36 tok/s (system variance)
 
-### 2026-06-02 Tile-in-L2 dispatch (pool.rs tile_size, neutral): ~49.4 tok/s
+### 2026-06-02 AVX-512 VNNI Q2_0 kernel (vpdpbusd, correct, neutral/~±3%): ~49 tok/s
+
+### 2026-06-02 Software prefetch (pool.rs _mm_prefetch): REVERTED (~5-11% Q1_0 regression)
 
 ### 1.7B Q2_0
 
@@ -118,6 +138,7 @@ Next target after revert: Pre-expand weight rows to sign arrays (est 15-25% on s
 2026-06-02 SIMD RoPE (precomputed sin/cos table + f32x8 apply): rope 960µs→10µs
 2026-06-02 Gen counter pool w/ spin-loop (replaces park/unpark): 24→27.8 tok/s (+16%)
 2026-06-02 Thread pool rewrite (gen counter, no park syscalls): S7 baseline levels restored
+2026-06-02 AVX-512 VNNI kernel (vpdpbusd, Q2V_U8 LUT): ~28.7 tok/s (within noise)
 
 ### 4B Q1_0
 
@@ -202,6 +223,7 @@ ffn_gate_up_matmul 46% | ffn_down_matmul 25% | qkv_matmul 16% | attn_output_matm
 
 ## Next up
 
-Fuse Q8_0 activation quant into first matmul row: marginal (~5%), quantize is only 0.87% of total.
-Better pool synchronization: main thread spin-waits worker completion — could use futex/condition variable to reduce power during matmul.
-LM_head tile-in-L2 dispatch: process 3555-row tiles per worker to fit 1MB L2 (vs current 18959-row contiguous chunks that miss L2).
+- Precompute sum_act in Q8_0 quantizer to eliminate second vpdpbusd call in VNNI kernel
+- AVX-512 512-bit Q2_0 kernel: process 2 Q8_0 sub-blocks at once with vpdpbusd on 512-bit
+- Q1_0 shuffle kernel with _mm512_permutexvar_epi8 (vpermb) for cross-lane sign expansion
+- Eliminate LUT loads entirely: pre-expand Q2_0 weight bytes to u8 at load time (trade memory for compute)
