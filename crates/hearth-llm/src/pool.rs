@@ -10,6 +10,8 @@ unsafe fn dummy_dot_fn(_w: *const u8, _a: *const u8, _n: usize) -> f32 {
 
 pub struct WorkParams {
     pub n: usize,
+    pub seq_len: usize,
+    pub q8_stride: usize,
     pub w_base: usize,
     pub a_ptr: usize,
     pub out_ptr: usize,
@@ -38,6 +40,8 @@ impl ThreadPool {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut params_box = Box::new(WorkParams {
             n: 0,
+            seq_len: 1,
+            q8_stride: 0,
             w_base: 0,
             a_ptr: 0,
             out_ptr: 0,
@@ -73,19 +77,26 @@ impl ThreadPool {
                         let begin = i * chunk;
                         let end = (begin + chunk).min(wp.n);
                         let tile_size = wp.tile_size;
-                        let mut r = begin;
-                        while r < end {
-                            let tile_end = (r + tile_size).min(end);
-                            for row in r..tile_end {
-                                unsafe {
-                                    *((wp.out_ptr + row * 4) as *mut f32) = (wp.dot_fn)(
-                                        (wp.w_base + row * wp.row_bytes) as *const u8,
-                                        wp.a_ptr as *const u8,
-                                        wp.n_cols,
-                                    );
+                        let seq_len = wp.seq_len.max(1);
+                        let n = wp.n;
+                        for s in 0..seq_len {
+                            let a = (wp.a_ptr + s * wp.q8_stride) as *const u8;
+                            let out_off = s * n;
+                            let mut r = begin;
+                            while r < end {
+                                let tile_end = (r + tile_size).min(end);
+                                for row in r..tile_end {
+                                    unsafe {
+                                        *((wp.out_ptr + (row + out_off) * 4) as *mut f32) = (wp
+                                            .dot_fn)(
+                                            (wp.w_base + row * wp.row_bytes) as *const u8,
+                                            a,
+                                            wp.n_cols,
+                                        );
+                                    }
                                 }
+                                r = tile_end;
                             }
-                            r = tile_end;
                         }
                         done_clone.store(true, Ordering::Release);
                     } else {
@@ -153,6 +164,8 @@ impl ThreadPool {
         unsafe {
             *self.params.load(Ordering::Relaxed) = WorkParams {
                 n,
+                seq_len: 1,
+                q8_stride: 0,
                 w_base,
                 a_ptr,
                 out_ptr,
@@ -167,6 +180,66 @@ impl ThreadPool {
         }
         // Release store ensures the params write and done_flag reset are visible
         // to workers that see the gen change via Acquire load.
+        self.gen.fetch_add(1, Ordering::Release);
+        for w in &self.workers {
+            while !w.done_flag.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    pub fn par_dot_rows_batched(
+        &self,
+        n: usize,
+        seq_len: usize,
+        q8_stride: usize,
+        w_base: usize,
+        a_ptr: usize,
+        out_ptr: usize,
+        row_bytes: usize,
+        n_cols: usize,
+        dot_fn: DotFn,
+    ) {
+        if n == 0 || seq_len == 0 {
+            return;
+        }
+        if self.num_threads <= 1 || (n <= 1 && seq_len <= 1) {
+            let tile_size = (1048576 / row_bytes).max(1);
+            for s in 0..seq_len {
+                let a = (a_ptr + s * q8_stride) as *const u8;
+                let out_off = s * n;
+                let mut r = 0;
+                while r < n {
+                    let tile_end = (r + tile_size).min(n);
+                    for row in r..tile_end {
+                        unsafe {
+                            *((out_ptr + (row + out_off) * 4) as *mut f32) =
+                                (dot_fn)((w_base + row * row_bytes) as *const u8, a, n_cols);
+                        }
+                    }
+                    r = tile_end;
+                }
+            }
+            return;
+        }
+        let tile_size = (1048576 / row_bytes).max(1);
+        unsafe {
+            *self.params.load(Ordering::Relaxed) = WorkParams {
+                n,
+                seq_len,
+                q8_stride,
+                w_base,
+                a_ptr,
+                out_ptr,
+                row_bytes,
+                n_cols,
+                dot_fn,
+                tile_size,
+            };
+        }
+        for w in &self.workers {
+            w.done_flag.store(false, Ordering::Relaxed);
+        }
         self.gen.fetch_add(1, Ordering::Release);
         for w in &self.workers {
             while !w.done_flag.load(Ordering::Acquire) {

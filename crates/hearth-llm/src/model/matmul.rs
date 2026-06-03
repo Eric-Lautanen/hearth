@@ -534,17 +534,17 @@ impl LlamaModel {
             for s in 0..seq_len {
                 hearth_quant::quantize_q8_0(&input[s * k..(s + 1) * k], &mut q8_buf);
             }
-            for s in 0..seq_len {
-                self.pool.par_dot_rows(
-                    m,
-                    entry.data.as_ptr() as usize,
-                    q8_buf[s * q8_size..].as_ptr() as usize,
-                    out[s * m..].as_mut_ptr() as usize,
-                    entry.dtype.byte_size(k),
-                    k,
-                    dot_fn,
-                );
-            }
+            self.pool.par_dot_rows_batched(
+                m,
+                seq_len,
+                q8_size,
+                entry.data.as_ptr() as usize,
+                q8_buf.as_ptr() as usize,
+                out.as_mut_ptr() as usize,
+                entry.dtype.byte_size(k),
+                k,
+                dot_fn,
+            );
         } else {
             for s in 0..seq_len {
                 self.matmul(
