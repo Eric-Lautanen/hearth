@@ -15,14 +15,14 @@ All 6 models: Qwen3 architecture, head_dim=128, vocab=151669, YaRN rope scaling 
 | 8B Q1_0 | Q1_0 128/18 | 4096 | 12288 | 36 | 32 | 8 | 1105 MB |
 | 8B Q2_0 | Q2_0 128/34 | 4096 | 12288 | 36 | 32 | 8 | 2081 MB |
 
-## Current status (2026-06-02, Session 17 — Pre-quantize activation for forward_batch, NEUTRAL)
+## Current status (2026-06-02, Session 17 — Pre-quantize activation everywhere + no-regression final, NEUTRAL)
 
 ### Session 17 change log
 - Added `batch_q8` field to `BatchScratch` for reusable Q8 quantized buffer
 - Added optional `x_q8: Option<&[u8]>` parameter to `matmul_batch` — when `Some`, skips internal quantize loop and uses the pre-quantized data directly
-- In `forward_batch`, quantize residual once before Q/K/V matmul_batch calls (3 calls → 1 quantize), and once before ffn_gate/ffn_up (2 calls → 1 quantize). Also quantize ffn_down input once.
-- `encode_text` calls pass `None` (unchanged behavior — not on hot path)
-- All 6 models within system variance of S16 baseline. No regression. The quantize overhead was already small (~1% per call, saving 2 out of 3 calls = ~0.7% per layer).
+- In `forward_batch`, quantize residual once before Q/K/V matmul_batch calls (3 calls → 1 quantize), once before ffn_gate/ffn_up (2 calls → 1), and once for attn_output/ffn_down
+- Same optimization applied to `encode_text()` — all matmul_batch calls now share `batch_q8`
+- All 6 models within ±system variance of S16 baseline. No regression.
 
 ### Q1_0 AVX-512 VNNI kernel: REVERTED (not dispatched)
 
