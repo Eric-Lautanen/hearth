@@ -17,6 +17,39 @@ pub fn dequantize(data: &[u8], out: &mut [f32]) {
     }
 }
 
+pub fn quantize_into(src: &[f32], dst: &mut [u8]) {
+    let n = src.len();
+    let blocks = n.div_ceil(32);
+    for b in 0..blocks {
+        let start = b * 32;
+        let mut max_abs: f32 = 0.0;
+        for i in 0..32 {
+            let idx = start + i;
+            if idx < n {
+                let v = src[idx].abs();
+                if v > max_abs {
+                    max_abs = v;
+                }
+            }
+        }
+        let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+        let scale_f16 = f16::from_f32(scale);
+        let scale_bytes = scale_f16.to_le_bytes();
+        let off = b * 34;
+        dst[off] = scale_bytes[0];
+        dst[off + 1] = scale_bytes[1];
+        for i in 0..32 {
+            let idx = start + i;
+            let q = if idx < n {
+                (src[idx] / scale).round().clamp(-128.0, 127.0) as i8
+            } else {
+                0
+            };
+            dst[off + 2 + i] = q as u8;
+        }
+    }
+}
+
 pub fn quantize(src: &[f32], dst: &mut Vec<u8>) {
     let n = src.len();
     let blocks = n.div_ceil(32);
