@@ -1,82 +1,46 @@
-# Session 9: LM head tile-in-L2 matmul
+# Session 10: Profile-guided optimization targets
 
-**Goal:** Improve lm_head matmul throughput by dispatching cache-friendly tiles instead of contiguous row chunks. The lm_head is 151669 × 2048 = 310M elements = 43.7MB packed Q1_0. Current pool dispatches 18959-row contiguous chunks per worker — each chunk is 5.5MB, far exceeding the 1MB L2 cache.
+**Session 9 result:** Tile-in-L2 matmul dispatch implemented in pool.rs but had **neutral impact** on lm_head (reads each weight row exactly once — no L2 reuse benefit). No regressions across all 6 models. Minor 4B Q1_0 improvement (+6.4%) likely system variance.
 
-By processing ~3555-row tiles per worker (tile size = 1MB L2 / 288 bytes per row), each tile stays hot in L2, reducing cache misses from ~80% to near-zero per tile.
-
-**Estimated impact:** 10-20% on 1.7B Q1_0 lm_head (currently ~5% of forward time), 5-10% on 4B. 8B already bandwidth-limited from L3.
+**Key insight from Session 9:** Weight-stationary matmul reads each row exactly once per forward — tiling worker chunks to fit L2 provides no reuse benefit. The remaining bottlenecks need different approaches.
 
 ---
 
-## Implementation plan
+## Next optimization targets (from timing profiles)
 
-### Step 1 — Read current pool.rs and matmul.rs
+Session 9 warm 1.7B Q1_0 profile (~18ms forward):
+- ffn_gate_up_matmul: ~35% (6300µs)
+- ffn_down_matmul: ~20% (3700µs)
+- qkv_matmul: ~12% (2200µs)
+- lm_head_matmul: ~14% (2700µs)
+- attention: ~6% (1100µs)
+- attn_output_matmul: ~7% (1300µs)
 
-The `par_dot_rows` function in `pool.rs` dispatches contiguous chunks. Change the per-worker iteration to loop over tiles within its chunk:
+### Target 1: Fuse Q8_0 quant into first matmul row
+The `quantize_act()` call is ~0.5% of forward time (160µs), but fusing it into the first matmul row avoids the separate quantize pass entirely. Since `matmul()` already receives `x_q8: Option<&[u8]>`, the Q/K/V and FFN matmuls after the first per-layer matmul reuse the cached Q8 buffer. The gain is bounded to ~0.5% but removes a pass over `x` data in memory.
 
-Current:
-```rust
-for row in begin..end {
-    *out[row] = dot_fn(w_base + row * row_bytes, a_ptr, n_cols);
-}
-```
+### Target 2: Check Q1_0_kernel (d=4096 8B) for 8B Q1_0 improvement
+8B Q1_0 lags at 13.5 tok/s vs 8.2 ref = 1.65×. 8B has d=4096 leading to 576-byte rows in Q1_0. The shuffle kernel reads 16 block headers (scales) then 16×16-byte sign groups. At d=4096, a dot product iterates 32 blocks = 2 internal loops. Consider whether widening to 8-wide SIMD for sign accumulation would help.
 
-Target:
-```rust
-let tile_rows = 3555;  // ~1MB of weight data
-let r_begin = begin;
-let r_end = end;
-let mut r = r_begin;
-while r < r_end {
-    let tile_end = (r + tile_rows).min(r_end);
-    for row in r..tile_end {
-        *out[row] = dot_fn(w_base + row * row_bytes, a_ptr, n_cols);
-    }
-    r = tile_end;
-}
-```
+### Target 3: Investigate persistent 8B Q2_0 gap
+8B Q2_0 at 7.0 tok/s vs 1.5 ref = 4.67×. This model is completely bandwidth-bound (2.1GB model on DDR5). Single-core ref achieves 1.5 tok/s scaling linearly to 8-core = 12 tok/s. Hearth at 7.0 tok/s is only 58% of linear scaling. Investigate memory contention, cache line bouncing, or TLB misses from the Q2V lookup table.
 
-The tile loop introduces no memory overhead — just changes the access pattern so each tile's weight data is hot in L2 before moving to the next tile.
-
-**Important:** The tile size must be tuned. 1MB L2 / 288 bytes = 3555 rows for Q1_0. For Q2_0: 1MB / 544 bytes = 1925 rows.
-
-### Step 2 — Add tile_size parameter to WorkParams
-
-In `pool.rs`:
-- Add `tile_size: usize` to `WorkParams` (default = `usize::MAX` = no tiling)
-- In `par_dot_rows`, pass the tile_size
-- Workers use tile_size for inner loop
-
-### Step 3 — Set tile_size in matmul.rs
-
-When dispatching lm_head matmuls, set `tile_size = l2_cache_per_core / row_bytes`:
-- For Q1_0: 1024*1024 / (2048/128*18) ≈ 3700 rows/tile
-- For Q2_0: 1024*1024 / (2048/128*34) ≈ 1900 rows/tile
-- For Q8_0: 1024*1024 / (2048/32*34) ≈ 470 rows/tile
-
-### Step 4 — Measure
-
-Compare tok/s for `lm_head_matmul` timing before and after. The rest of the forward pass should be unchanged.
+### Target 4: Continue investigating AVX-512 (if hardware available)
+The Ryzen 7 8840HS has AVX-512 (Zen 4). Currently enabled via `target-cpu=native`. Could write AVX-512 kernels for Q1_0 and Q2_0 dot products. LLVM auto-vectorization may not be optimal for the shuffle kernel pattern.
 
 ---
-
-## Benchmark
-
-1. Build: `cargo build --release`
-2. Run 1.7B Q1_0 and 1.7B Q2_0 (they have the largest lm_head relative to total model size)
-3. Check the `lm_head_matmul` timing section
-4. Run all 6 models to verify no regression
-
-**Session 8 baselines (50-token, warm):**
-| Model | tok/s | avg_cpu_overhead (µs/tok) |
-|---|---|---|
-| 1.7B Q1_0 | 47.9 | 20,835 |
-| 1.7B Q2_0 | 27.8 | 36,006 |
-| 4B Q1_0 | 21.9 | 45,805 |
-| 4B Q2_0 | 12.8 | 77,919 |
-| 8B Q1_0 | 13.1 | 76,114 |
-| 8B Q2_0 | 7.1 | 140,533 |
 
 ## Key files
-- `crates/hearth-llm/src/pool.rs` — `WorkParams`, `par_dot_rows`, worker loop
-- `crates/hearth-llm/src/model/matmul.rs` — lm_head dispatch in matmul() `GgmlDType::Q1_0_G128` / `GgmlDType::Q1_0` branches
+- `crates/hearth-llm/src/pool.rs` — `WorkParams` now has `tile_size` field; workers tile within chunks
+- `crates/hearth-llm/src/model/matmul.rs` — matmul dispatch (no changes needed for tiling)
+- `crates/hearth-llm/src/model/mod.rs` — forward pass, lm_head timing
+
+## Session 9 baselines (50-token, warm)
+| Model | tok/s | avg_cpu_overhead (µs/tok) |
+|---|---|---|
+| 1.7B Q1_0 | 49.4 | 20,233 |
+| 1.7B Q2_0 | 28.5 | 35,071 |
+| 4B Q1_0 | 23.3 | 42,864 |
+| 4B Q2_0 | 12.9 | 77,367 |
+| 8B Q1_0 | 13.5 | 74,124 |
+| 8B Q2_0 | 7.0 | 142,255 |
