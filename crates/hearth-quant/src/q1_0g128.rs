@@ -348,6 +348,122 @@ unsafe fn dot_q1_0g128_q8_0_ptr_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usiz
     hsum_float_8(acc)
 }
 
+/// Paired-token AVX2 dot: one Q1_0_G128 weight row against two Q8_0 activation
+/// rows at once.
+///
+/// Prefill streams the same weight row once per prompt token, so the per-row work
+/// (`shuffle`/`and`/`cmpeq` sign expansion and the raw bit loads) is recomputed for
+/// every token even though it depends only on the weights. Computing both tokens in
+/// one pass lifts those uops out of the per-token path: ~64 uops per 128 elements
+/// fall to ~52, and the weight bytes move from L2 once instead of twice.
+///
+/// The accumulation order is identical to [`dot_q1_0g128_q8_0_ptr_avx2`], so both
+/// tokens match the single-token kernel bit for bit.
+/// # Safety
+/// w_ptr valid for n/128*18 bytes; a0_ptr and a1_ptr each valid for n/32*34 bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q1_0g128_q8_0x2_ptr_avx2(
+    w_ptr: *const u8,
+    a0_ptr: *const u8,
+    a1_ptr: *const u8,
+    n: usize,
+) -> (f32, f32) {
+    use core::ptr::read_unaligned;
+    let q1_blocks = n / 128;
+
+    let ones_8 = _mm256_set1_epi8(1);
+    let ones_16 = _mm256_set1_epi16(1);
+    let zero = _mm256_setzero_si256();
+    let byte_shuf = _mm256_setr_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
+        3, 3,
+    );
+    let bit_masks: __m256i = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        1, 2, 4, 8, 16, 32, 64, -128,
+    );
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+
+    for b in 0..q1_blocks {
+        let w_off = b * 18;
+        let w_scale: f32 = f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32();
+        let w_bits = w_ptr.add(w_off + 2);
+
+        let qs0 = read_unaligned(w_bits as *const u32);
+        let qs1 = read_unaligned(w_bits.add(4) as *const u32);
+        let qs2 = read_unaligned(w_bits.add(8) as *const u32);
+        let qs3 = read_unaligned(w_bits.add(12) as *const u32);
+
+        let mut acc_block0 = _mm256_setzero_ps();
+        let mut acc_block1 = _mm256_setzero_ps();
+        let qs = [qs0, qs1, qs2, qs3];
+
+        for (sub, &q) in qs.iter().enumerate() {
+            // Weight-only: expanded once, applied to both activations.
+            let sm = _mm256_cmpeq_epi8(
+                _mm256_and_si256(
+                    _mm256_shuffle_epi8(_mm256_set1_epi32(q as i32), byte_shuf),
+                    bit_masks,
+                ),
+                zero,
+            );
+
+            let a_off = (b * 4 + sub) * 34;
+            let a_vals0 = a0_ptr.add(a_off + 2);
+            let a_vals1 = a1_ptr.add(a_off + 2);
+
+            let qy0 = _mm256_loadu_si256(a_vals0 as *const __m256i);
+            let sy0 = _mm256_sub_epi8(_mm256_xor_si256(qy0, sm), sm);
+            let s0 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy0), ones_16);
+
+            let qy1 = _mm256_loadu_si256(a_vals1 as *const __m256i);
+            let sy1 = _mm256_sub_epi8(_mm256_xor_si256(qy1, sm), sm);
+            let s1 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy1), ones_16);
+
+            let a0_scale: f32 =
+                f16::from_le_bytes([*a0_ptr.add(a_off), *a0_ptr.add(a_off + 1)]).to_f32();
+            let a1_scale: f32 =
+                f16::from_le_bytes([*a1_ptr.add(a_off), *a1_ptr.add(a_off + 1)]).to_f32();
+            acc_block0 =
+                _mm256_fmadd_ps(_mm256_set1_ps(a0_scale), _mm256_cvtepi32_ps(s0), acc_block0);
+            acc_block1 =
+                _mm256_fmadd_ps(_mm256_set1_ps(a1_scale), _mm256_cvtepi32_ps(s1), acc_block1);
+        }
+
+        let ws = _mm256_set1_ps(w_scale);
+        acc0 = _mm256_fmadd_ps(ws, acc_block0, acc0);
+        acc1 = _mm256_fmadd_ps(ws, acc_block1, acc1);
+    }
+
+    (hsum_float_8(acc0), hsum_float_8(acc1))
+}
+
+/// Paired-token dot product: one Q1_0_G128 weight row against two Q8_0 activation
+/// rows. Falls back to two single-token dots on CPUs without AVX2.
+/// # Safety
+/// w_ptr valid for n/128*18 bytes; a0_ptr and a1_ptr each valid for n/32*34 bytes.
+/// n must be a multiple of 128.
+pub unsafe fn dot_q1_0g128_q8_0x2_ptr(
+    w_ptr: *const u8,
+    a0_ptr: *const u8,
+    a1_ptr: *const u8,
+    n: usize,
+) -> (f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return dot_q1_0g128_q8_0x2_ptr_avx2(w_ptr, a0_ptr, a1_ptr, n);
+        }
+    }
+    (
+        dot_q1_0g128_q8_0_ptr(w_ptr, a0_ptr, n),
+        dot_q1_0g128_q8_0_ptr(w_ptr, a1_ptr, n),
+    )
+}
+
 /// AVX-512 256-bit VNNI kernel for Q1_0_G128 (128-element blocks).
 /// Uses shuffle's SIMD bit expansion to get sign-corrected activations `sy`,
 /// then replaces maddubs+madd with a single vpdpbusd: dpbusd(1, sy) = Σ sy_i.
@@ -1238,5 +1354,58 @@ mod tests {
             fused,
             reference
         );
+    }
+
+    /// The paired prefill kernel must reproduce the single-token kernel exactly —
+    /// it only shares weight-side work, so any difference means the sharing leaked
+    /// into the per-token math.
+    #[test]
+    fn test_dot_q1_0g128_q8_0x2_matches_single() {
+        for &n in &[128usize, 256, 2048, 6144] {
+            let n_blocks = n / 128;
+            let mut w = vec![0u8; n_blocks * 18];
+            let mut a0 = vec![0u8; n_blocks * 4 * 34];
+            let mut a1 = vec![0u8; n_blocks * 4 * 34];
+
+            for b in 0..n_blocks {
+                let bo = b * 18;
+                let s = f16::from_f32(((b % 7) as f32 + 0.5) * 0.25).to_le_bytes();
+                w[bo] = s[0];
+                w[bo + 1] = s[1];
+                for j in 0..16 {
+                    w[bo + 2 + j] = ((b * 16 + j).wrapping_mul(37) ^ 0xAB) as u8;
+                }
+            }
+            for (act, salt) in [(a0.as_mut_slice(), 53u32), (a1.as_mut_slice(), 97u32)] {
+                for b in 0..n_blocks * 4 {
+                    let bo = b * 34;
+                    let s = f16::from_f32(((b % 5) as f32 + 0.5) * 0.125).to_le_bytes();
+                    act[bo] = s[0];
+                    act[bo + 1] = s[1];
+                    for j in 0..32 {
+                        act[bo + 2 + j] = (b as u32 * salt).wrapping_mul(2654435761) as u8;
+                    }
+                }
+            }
+
+            let (got0, got1) =
+                unsafe { dot_q1_0g128_q8_0x2_ptr(w.as_ptr(), a0.as_ptr(), a1.as_ptr(), n) };
+            let want0 = unsafe { dot_q1_0g128_q8_0_ptr(w.as_ptr(), a0.as_ptr(), n) };
+            let want1 = unsafe { dot_q1_0g128_q8_0_ptr(w.as_ptr(), a1.as_ptr(), n) };
+            assert_eq!(
+                got0.to_bits(),
+                want0.to_bits(),
+                "token0 mismatch at n={}",
+                n
+            );
+            assert_eq!(
+                got1.to_bits(),
+                want1.to_bits(),
+                "token1 mismatch at n={}",
+                n
+            );
+            // Guards against a degenerate all-zero fixture passing trivially.
+            assert!(want0.abs() > 1e-6 && want1.abs() > 1e-6, "n={} fixture", n);
+        }
     }
 }

@@ -13,7 +13,9 @@ hearth-gguf = { workspace = true }
 hearth-llm = { workspace = true }
 hearth-tokenizer = { workspace = true }
 hearth-core = { workspace = true }
+hearth-compute = { workspace = true }
 half = { workspace = true }
 bytemuck = { workspace = true }
 memmap2 = { workspace = true }
 rayon = { workspace = true }
+pollster = "0.4"

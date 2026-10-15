@@ -21,6 +21,36 @@ pub struct ModelConfig {
     pub n_experts_per_tok: u32,
     pub post_norm: bool,
     pub embed_scale: bool,
+    /// True when the GGUF stated attention.head_dim explicitly (vs. derived).
+    /// When set, load() must not re-derive head_dim from tensor shapes —
+    /// architectures like qwen35 (attn_q = query+gate, 2x width) would mis-derive.
+    pub explicit_head_dim: bool,
+    /// Hybrid linear-attention arch guard (gated delta net layers present).
+    pub recurrent_layers: Option<Vec<bool>>,
+    /// Per-model sampling recommendations from `general.sampling.*` metadata.
+    /// When present these are the model author's intended defaults and are
+    /// preferred over Hearth's generic fallbacks.
+    pub sampling_temperature: Option<f32>,
+    pub sampling_top_p: Option<f32>,
+    pub sampling_top_k: Option<u32>,
+    pub sampling_min_p: Option<f32>,
+}
+
+impl ModelConfig {
+    /// Sampling defaults the UI/service should start from when the user has not
+    /// overridden them. Falls back to Hearth's generic values when the GGUF
+    /// carries no `general.sampling.*` metadata.
+    pub fn sampler_defaults(&self) -> hearth_core::SamplerConfig {
+        hearth_core::SamplerConfig {
+            temperature: self.sampling_temperature.unwrap_or(0.7),
+            top_k: self.sampling_top_k.unwrap_or(40) as usize,
+            top_p: self.sampling_top_p.unwrap_or(0.9),
+            repeat_pen: 1.1,
+            min_p: self.sampling_min_p.unwrap_or(0.0),
+            typical_p: 0.0,
+            seed: 0,
+        }
+    }
 }
 
 impl ModelConfig {
@@ -86,10 +116,14 @@ impl ModelConfig {
 
         let n_kv_heads = meta_u32_prefixed("attention.head_count_kv").unwrap_or(n_heads);
 
-        let head_dim = meta_u32_prefixed("attention.head_dim").unwrap_or_else(|| {
+        let head_dim_meta = meta_u32_prefixed("attention.head_dim")
+            .or_else(|| meta_u32_prefixed("attention.key_length"))
+            .or_else(|| meta_u32_prefixed("attention.value_length"));
+        let head_dim = head_dim_meta.unwrap_or_else(|| {
             // Fall back to d_model / n_heads (standard for most Llama models)
             d_model / n_heads
         });
+        let explicit_head_dim = head_dim_meta.is_some();
 
         let d_ffn = meta_u32_prefixed("feed_forward_length").unwrap_or(d_model * 4);
 
@@ -117,8 +151,41 @@ impl ModelConfig {
         let n_experts = meta_u32_prefixed("expert_count").unwrap_or(0);
         let n_experts_per_tok = meta_u32_prefixed("expert_used_count").unwrap_or(0);
 
+        // Model-author sampling recommendations (`general.sampling.*`). These
+        // keys are global, not architecture-prefixed, and every Bonsai GGUF
+        // ships them — ignoring them meant every model ran on Hearth's
+        // hardcoded 0.7/0.9/40 regardless of what it was built for.
+        let sampling_temperature = gguf.meta_f32("general.sampling.temp");
+        let sampling_top_p = gguf.meta_f32("general.sampling.top_p");
+        let sampling_top_k = gguf.meta_u32("general.sampling.top_k");
+        let sampling_min_p = gguf.meta_f32("general.sampling.min_p");
+
         let post_norm = arch == "gemma" || arch == "gemma2";
         let embed_scale = post_norm;
+
+        // Per-layer recurrent (linear attention) flags for hybrid archs.
+        let recurrent_layers = if arch == "qwen35" {
+            // Prefer explicit metadata when present, else full_attention_interval
+            // (recurrent = every layer NOT at a multiple of the interval).
+            if let Some(arr) = gguf.meta_array("qwen35.attention.recurrent_layers") {
+                Some(
+                    arr.iter()
+                        .filter_map(|v| v.as_bool())
+                        .collect::<Vec<bool>>(),
+                )
+            } else {
+                let interval = gguf
+                    .meta_u32(&format!("{}.full_attention_interval", prefixes[0]))
+                    .or_else(|| gguf.meta_u32("qwen35.full_attention_interval"))
+                    .unwrap_or(4) as usize;
+                let n = n_layers as usize;
+                Some((0..n).map(|i| (i + 1) % interval != 0).collect())
+                // Note: for qwen35 the fork marks layer i recurrent when
+                // (i+1) % interval != 0, i.e. layers 0,1,2 recurrent, 3 full.
+            }
+        } else {
+            None
+        };
 
         Ok(ModelConfig {
             arch,
@@ -140,6 +207,12 @@ impl ModelConfig {
             n_experts_per_tok,
             post_norm,
             embed_scale,
+            explicit_head_dim,
+            recurrent_layers,
+            sampling_temperature,
+            sampling_top_p,
+            sampling_top_k,
+            sampling_min_p,
         })
     }
 
@@ -165,7 +238,12 @@ impl ModelConfig {
                 self.n_heads, self.n_kv_heads
             ));
         }
-        if self.head_dim * self.n_heads < self.d_model {
+        // d_model need not divide by n_heads on hybrid archs that emit query+gate
+        // from a single projection (qwen35: 24 heads x 256 dim = 6144 > 5120).
+        if self.explicit_head_dim
+            && self.head_dim * self.n_heads < self.d_model
+            && !matches!(self.arch.as_str(), "qwen35" | "qwen3next" | "qwen35moe")
+        {
             return Err(format!(
                 "Config validation: head_dim ({}) * n_heads ({}) < d_model ({})",
                 self.head_dim, self.n_heads, self.d_model
@@ -215,7 +293,7 @@ fn get_arch_prefixes(arch: &str) -> [&str; 3] {
     match arch {
         "llama" | "mistral" | "mixtral" | "gemma" => ["llama", arch, ""],
         "qwen2" | "qwen2.5" => ["qwen2", arch, ""],
-        "qwen3" | "qwen3moe" | "qwen3next" => ["qwen3", arch, ""],
+        "qwen3" | "qwen3moe" | "qwen3next" | "qwen35" | "qwen35moe" => ["qwen3", arch, ""],
         "phi3" | "phi-3" => ["phi3", arch, ""],
         "starcoder2" => ["starcoder2", arch, ""],
         "gemma2" => ["gemma", arch, ""],

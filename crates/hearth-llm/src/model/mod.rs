@@ -1,6 +1,8 @@
 mod gpu;
+mod kv_budget;
 mod matmul;
 mod moe;
+mod qwen35;
 mod scratch;
 mod tensor;
 
@@ -49,33 +51,64 @@ pub struct LlamaModel {
     gpu_layers: usize,
     scratch: std::sync::Mutex<ForwardScratch>,
     row_buf: std::sync::Mutex<Vec<f32>>,
+    /// Pre-allocated CPU buffer for token embedding lookup in forward_gpu.
+    /// Avoids a per-token Vec allocation on the GPU decode path.
+    hidden_gpu: std::sync::Mutex<Vec<f32>>,
     norm_cache: HashMap<String, Vec<f32>>,
     batch: std::sync::Mutex<BatchScratch>,
     layer_names: Vec<LayerTensorNames>,
     lm_head_name: String,
     pool: ThreadPool,
     rope_cache: ops::RopeCache,
+    /// Hybrid architectures (e.g. qwen35 / Ternary Bonsai 2) own their entire
+    /// forward path; every other field is inert placeholder state.
+    hybrid: Option<qwen35::Qwen35Core>,
+    /// Bytes the f32 KV cache occupies at the allocated context. Allocated at
+    /// load, so this is the model's real RAM cost beyond its weight file — the
+    /// UI shows it so a big-context model can be spotted before chatting.
+    kv_cache_bytes: u64,
 }
 
 impl LlamaModel {
     pub fn load(path: &str, strategy: LoadStrategy) -> Result<Self, String> {
         let gguf = GgufFile::open(path).map_err(|e| format!("GGUF: {}", e))?;
         let mut config = ModelConfig::from_gguf(&gguf)?;
+
+        // Hybrid linear-attention architectures have their own forward path, state
+        // layout and geometry (e.g. d_model not divisible by n_heads); they must
+        // dispatch BEFORE the dense-architecture validation rules.
+        if config.arch == "qwen35" {
+            return qwen35::load(path, strategy);
+        }
         config.validate()?;
 
         let tokenizer = Tokenizer::from_gguf(&gguf).map_err(|e| format!("Tokenizer: {}", e))?;
 
+        // Large tensors borrow the GGUF mmap instead of being copied, so a
+        // multi-GB model loads on a machine with less RAM than the file.
+        // HEARTH_PIN_WEIGHTS overrides that and copies everything into RAM.
+        const COPY_THRESHOLD: usize = 16 * 1024 * 1024;
+        let copy_all = qwen35::pin_weights();
         let mut tensors = HashMap::new();
         for info in &gguf.tensors {
-            let data = gguf.tensor_data(info).to_vec();
-            tensors.insert(
-                info.name.clone(),
-                TensorEntry {
-                    data,
-                    dtype: info.dtype,
-                    shape: info.shape.clone(),
-                },
-            );
+            let byte_len = info.byte_size();
+            let entry = if byte_len > COPY_THRESHOLD && !copy_all {
+                let start = (gguf.data_offset + info.offset) as usize;
+                TensorEntry::mapped(
+                    gguf.mmap_arc(),
+                    start,
+                    byte_len,
+                    info.dtype,
+                    info.shape.clone(),
+                )
+            } else {
+                TensorEntry::owned(
+                    gguf.tensor_data(info).to_vec(),
+                    info.dtype,
+                    info.shape.clone(),
+                )
+            };
+            tensors.insert(info.name.clone(), entry);
         }
 
         let d = config.d_model as usize;
@@ -83,16 +116,41 @@ impl LlamaModel {
         let n_kv_heads = config.n_kv_heads as usize;
         let mut head_dim = config.head_dim as usize;
         let d_ffn = config.d_ffn as usize;
-        let max_seq = config.max_seq_len as usize;
-
-        if let Some(q_entry) = tensors.get("blk.0.attn_q.weight") {
-            let q_rows = q_entry.n_rows();
-            let computed_head_dim = q_rows / n_heads;
-            if computed_head_dim * n_heads == q_rows && computed_head_dim != head_dim {
-                head_dim = computed_head_dim;
+        // Derive head_dim from the Q projection only when the GGUF metadata did
+        // not state it explicitly. Note this would be wrong for qwen35 (attn_q
+        // emits query+gate, 2x width) — but that arch never reaches this code.
+        if !config.explicit_head_dim {
+            if let Some(q_entry) = tensors.get("blk.0.attn_q.weight") {
+                let q_rows = q_entry.n_rows();
+                let computed_head_dim = q_rows / n_heads;
+                if computed_head_dim * n_heads == q_rows && computed_head_dim != head_dim {
+                    head_dim = computed_head_dim;
+                }
             }
         }
         config.head_dim = head_dim as u32;
+
+        // Cap the KV cache context by a byte budget *after* head_dim is settled:
+        // every dense layer keeps K+V, so a model declaring a huge context would
+        // allocate an F32 cache beyond system memory at load. Applied to
+        // config.max_seq_len itself so every consumer (generate_text, warmup,
+        // scratch) sees the capped value.
+        let kv_per_token =
+            kv_budget::kv_bytes_per_token(config.n_layers as usize, n_kv_heads, head_dim);
+        let max_seq = kv_budget::ctx_cap(
+            config.max_seq_len as usize,
+            config.n_layers as usize,
+            n_kv_heads,
+            head_dim,
+            Some(kv_budget::DENSE_CTX_CAP),
+        );
+        config.max_seq_len = max_seq as u32;
+        eprintln!(
+            "[kv] context {} tokens · {} per token · {} KV cache",
+            max_seq,
+            kv_budget::fmt_bytes(kv_per_token),
+            kv_budget::fmt_bytes(max_seq as u64 * kv_per_token)
+        );
 
         let max_row = d.max(d_ffn).max(head_dim);
 
@@ -202,7 +260,7 @@ impl LlamaModel {
                 if is_norm && entry.shape.len() == 1 {
                     let len = entry.shape[0] as usize;
                     let mut buf = vec![0.0f32; len];
-                    if hearth_quant::dequantize(entry.dtype, &entry.data, &mut buf).is_ok() {
+                    if hearth_quant::dequantize(entry.dtype, entry.data(), &mut buf).is_ok() {
                         norm_cache.insert(name.clone(), buf);
                     }
                 }
@@ -215,7 +273,7 @@ impl LlamaModel {
             // With 512MB iGPU and 237MB weights already uploaded, ~200-250MB remain.
             // Cap cache to 512 positions (~115MB total) to leave safety margin.
             let cache_max_seq = max_seq.min(512);
-            let per_layer = (n_kv_heads * cache_max_seq * head_dim) as u64 * 2; // K + V in f32
+            let per_layer = (n_kv_heads * cache_max_seq * head_dim) as u64 * 2 * 4; // K + V in f32 (4 bytes each)
             gpu_inner.kv_cache = (0..config.n_layers)
                 .map(|_| gpu_inner.create_storage_buffer(per_layer, "kv_cache"))
                 .collect();
@@ -288,13 +346,52 @@ impl LlamaModel {
             gpu_layers,
             scratch: std::sync::Mutex::new(scratch),
             row_buf: std::sync::Mutex::new(vec![0.0f32; max_row]),
+            hidden_gpu: std::sync::Mutex::new(vec![0.0f32; d]),
             norm_cache,
             batch: std::sync::Mutex::new(batch),
             layer_names,
             lm_head_name,
             pool,
             rope_cache,
+            hybrid: None,
+            kv_cache_bytes: max_seq as u64 * kv_per_token,
         })
+    }
+
+    /// Bytes of f32 KV cache this model allocated at load.
+    pub fn kv_cache_bytes(&self) -> u64 {
+        self.kv_cache_bytes
+    }
+
+    /// Wrap a hybrid-architecture core (qwen35) in the LlamaModel shell.
+    ///
+    /// The shell always adopts the core's final (capped / corrected) config, so
+    /// the caller's config is not read here.
+    pub(crate) fn from_hybrid(
+        core: qwen35::Qwen35Core,
+        _config: ModelConfig,
+        tokenizer: Tokenizer,
+    ) -> Self {
+        let config = core.config_snapshot();
+        LlamaModel {
+            config,
+            tokenizer: std::sync::Mutex::new(tokenizer),
+            tensors: HashMap::new(),
+            strategy: LoadStrategy::CpuOnly,
+            gpu: None,
+            gpu_layers: 0,
+            scratch: std::sync::Mutex::new(ForwardScratch::placeholder()),
+            row_buf: std::sync::Mutex::new(Vec::new()),
+            hidden_gpu: std::sync::Mutex::new(Vec::new()),
+            norm_cache: HashMap::new(),
+            batch: std::sync::Mutex::new(BatchScratch::placeholder()),
+            layer_names: Vec::new(),
+            lm_head_name: "output.weight".to_string(),
+            pool: ThreadPool::new(1),
+            rope_cache: ops::RopeCache::new(16, 16, 10000.0, None, None, None),
+            kv_cache_bytes: core.kv_cache_bytes(),
+            hybrid: Some(core),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -802,18 +899,26 @@ impl LlamaModel {
             }
             let p = format!("blk.{}", layer);
 
+            // --- ATTENTION NORM ---
+            // Write f32 normed values to residual, then parallel-quantize to Q8 for fast matmul
             let attn_norm = self.get_1d(&format!("{}.attn_norm.weight", p), d)?;
             let aq8_needed = seq_len * (d.div_ceil(32) * 34);
             if bs.batch_q8.len() < aq8_needed {
                 bs.batch_q8.resize(aq8_needed, 0u8);
             }
-            ops::rms_norm_q8_batch(
+            ops::rms_norm_batch(
                 &bs.hidden[..seq_len * d],
                 attn_norm,
                 self.config.rms_norm_eps,
-                &mut bs.batch_q8[..aq8_needed],
+                &mut bs.residual[..seq_len * d],
                 seq_len,
                 d,
+            );
+            self.pool.par_quantize(
+                seq_len,
+                d,
+                bs.residual.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
             );
             self.matmul_batch(
                 &format!("{}.attn_q.weight", p),
@@ -980,22 +1085,29 @@ impl LlamaModel {
                 bs.hidden[i] += bs.q_buf[i];
             }
 
+            // --- FEED-FORWARD NORM ---
             let ffn_norm = self.get_1d(&format!("{}.ffn_norm.weight", p), d)?;
             let fq8_needed = seq_len * (d.div_ceil(32) * 34);
             if bs.batch_q8.len() < fq8_needed {
                 bs.batch_q8.resize(fq8_needed, 0u8);
             }
-            ops::rms_norm_q8_batch(
+            ops::rms_norm_batch(
                 &bs.hidden[..seq_len * d],
                 ffn_norm,
                 self.config.rms_norm_eps,
-                &mut bs.batch_q8[..fq8_needed],
+                &mut bs.residual[..seq_len * d],
                 seq_len,
                 d,
             );
+            self.pool.par_quantize(
+                seq_len,
+                d,
+                bs.residual.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
+            );
             self.matmul_batch(
                 &format!("{}.ffn_gate.weight", p),
-                &bs.hidden[..seq_len * d],
+                &bs.residual[..seq_len * d],
                 &mut bs.gate[..seq_len * ffn_dim],
                 rb,
                 ffn_dim,
@@ -1013,7 +1125,6 @@ impl LlamaModel {
                 seq_len,
                 Some(&bs.batch_q8[..]),
             )?;
-
             let fd_q8_needed = seq_len * (ffn_dim.div_ceil(32) * 34);
             if bs.batch_q8.len() < fd_q8_needed {
                 bs.batch_q8.resize(fd_q8_needed, 0u8);
@@ -1135,18 +1246,25 @@ impl LlamaModel {
         for layer in 0..n_layers {
             let p = format!("blk.{}", layer);
 
+            // --- ATTENTION NORM ---
             let attn_norm = self.get_1d(&format!("{}.attn_norm.weight", p), d)?;
             let eaq8_needed = seq_len * (d.div_ceil(32) * 34);
             if bs.batch_q8.len() < eaq8_needed {
                 bs.batch_q8.resize(eaq8_needed, 0u8);
             }
-            ops::rms_norm_q8_batch(
+            ops::rms_norm_batch(
                 &bs.hidden[..seq_len * d],
                 attn_norm,
                 self.config.rms_norm_eps,
-                &mut bs.batch_q8[..eaq8_needed],
+                &mut bs.residual[..seq_len * d],
                 seq_len,
                 d,
+            );
+            self.pool.par_quantize(
+                seq_len,
+                d,
+                bs.residual.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
             );
             self.matmul_batch(
                 &format!("{}.attn_q.weight", p),
@@ -1308,17 +1426,23 @@ impl LlamaModel {
             if bs.batch_q8.len() < efnq8_needed {
                 bs.batch_q8.resize(efnq8_needed, 0u8);
             }
-            ops::rms_norm_q8_batch(
+            ops::rms_norm_batch(
                 &bs.hidden[..seq_len * d],
                 ffn_norm,
                 self.config.rms_norm_eps,
-                &mut bs.batch_q8[..efnq8_needed],
+                &mut bs.residual[..seq_len * d],
                 seq_len,
                 d,
             );
+            self.pool.par_quantize(
+                seq_len,
+                d,
+                bs.residual.as_ptr() as usize,
+                bs.batch_q8.as_mut_ptr() as usize,
+            );
             self.matmul_batch(
                 &format!("{}.ffn_gate.weight", p),
-                &bs.hidden[..seq_len * d],
+                &bs.residual[..seq_len * d],
                 &mut bs.gate[..seq_len * ffn_dim],
                 &mut rb,
                 ffn_dim,
@@ -1496,6 +1620,10 @@ impl LlamaModel {
         _caches: &mut [KVCache],
         logits: &mut [f32],
         cancel: &AtomicBool,
+        greedy: bool,
+        rb: &mut Vec<f32>,
+        repeat_pen: f32,
+        past_tokens: &[u32],
     ) -> Result<(), String> {
         if cfg!(debug_assertions) {
             eprintln!(
@@ -1519,7 +1647,7 @@ impl LlamaModel {
         let rms_norm_eps = self.config.rms_norm_eps;
         let post_norm = self.config.post_norm;
 
-        let create_buf = |n: usize, label: &str| gpu.create_storage_buffer(n as u64, label);
+        let create_buf = |n: usize, label: &str| gpu.create_storage_buffer((n as u64) * 4, label);
 
         // Token embed -> hidden_buf
         let token_id = token_ids[0] as usize;
@@ -1527,7 +1655,8 @@ impl LlamaModel {
             .tensors
             .get("token_embd.weight")
             .ok_or_else(|| "Missing token_embd.weight".to_string())?;
-        let mut hidden = vec![0.0f32; d];
+        let mut hidden = self.hidden_gpu.lock().unwrap();
+        hidden[..d].fill(0.0f32);
         if token_id < embed_entry.n_rows() {
             hearth_quant::dequantize(
                 embed_entry.dtype,
@@ -1538,7 +1667,7 @@ impl LlamaModel {
         }
         if self.config.embed_scale {
             let scale = (d as f32).sqrt();
-            for h in &mut hidden {
+            for h in hidden.iter_mut() {
                 *h *= scale;
             }
         }
@@ -1581,7 +1710,7 @@ impl LlamaModel {
                     let mscale = 1.0 + 0.1 * factor.ln();
                     (corr_low, corr_high, mscale, n_dims_f)
                 }
-                _ => (0.0, 0.0, 0.0, 0.0), // n_dims=0 signals standard RoPE to shader
+                _ => (0.0, 0.0, 1.0, 0.0), // n_dims=0 signals standard RoPE to shader
             };
         let rope_freq_scale = 1.0 / self.config.rope_scaling_factor.unwrap_or(1.0).max(1.0);
 
@@ -1756,7 +1885,7 @@ impl LlamaModel {
             // KV cache write
             let cache_max_seq = gpu.cache_max_seq as usize;
             let cache_stride = cache_max_seq.min(max_s);
-            let seq_len = pos + 1;
+            let _seq_len = pos + 1;
             let layer_buf = &gpu.kv_cache[layer];
             let per_layer_kv = n_kv_heads * cache_stride * head_dim;
             let v_offset = (per_layer_kv as u64) * 4;
@@ -1780,8 +1909,8 @@ impl LlamaModel {
                     n_heads as u32,
                     n_kv_heads as u32,
                     head_dim as u32,
-                    seq_len as u32,
-                    cache_stride as u32,
+                    1,                   // seq_len_q = 1 for single-token decode
+                    cache_stride as u32, // seq_len_kv = cache stride for head indexing
                     pos as u32,
                 )
                 .ok_or_else(|| format!("flash_attention failed layer {}", layer))?;
@@ -1817,6 +1946,7 @@ impl LlamaModel {
                 // attn_out projection (fused matmul+add avoids intermediate buffer)
                 if !gpu.dequant_matmul_fused_add_inplace(
                     &aw,
+                    &qk(3)?,
                     &attn_out_buf,
                     &hidden_buf,
                     wr(3) as u32,
@@ -1887,6 +2017,7 @@ impl LlamaModel {
                 // FFN down + residual (fused matmul+add avoids intermediate buffer)
                 if !gpu.dequant_matmul_fused_add_inplace(
                     &dw,
+                    &qk(6)?,
                     &ffn_tmp_buf,
                     &hidden_buf,
                     wr(6) as u32,
@@ -1909,8 +2040,7 @@ impl LlamaModel {
             let layer_us = layer_t0.elapsed().as_micros();
             sum_layer_us += layer_us as u64;
         }
-
-        // --- FINAL NORM + LM HEAD (GPU+reads back 151669f32) ---
+        // --- FINAL NORM + LM HEAD ---
         let out_norm_buf = &gpu.norm_buffers["output_norm.weight"];
         gpu.rms_norm(
             &hidden_buf,
@@ -1922,8 +2052,477 @@ impl LlamaModel {
         );
 
         let vocab_size = self.config.vocab_size as usize;
-        // GPU lm_head matmul (full 151669×2048 dispatch) — keeps GPU busy → DVFS boost
-        let w_buf = {
+
+        // Always compute lm_head on CPU: read back hidden state (8KB) after the final norm,
+        // then compute the full 151669×2048 matmul on CPU using parallel Q8_0 dot product.
+        // This eliminates the 196K-workgroup GPU lm_head dispatch and 606KB readback,
+        // saving ~5ms per token. The CPU lm_head takes ~3ms via parallel Q8_0 kernels.
+        gpu.copy_to_readback_staging(&out_norm_tmp, (d as u64) * 4);
+        gpu.end_batch();
+        let hidden = gpu.finish_readback_f32(d);
+
+        // CPU lm_head (forces CPU path by passing layer > gpu_layers)
+        self.matmul(
+            &self.lm_head_name,
+            &hidden,
+            logits,
+            rb,
+            n_layers + 1, // > gpu_layers → CPU path
+            None,         // no pre-quantized activation
+        )?;
+
+        if greedy {
+            // Apply repetition penalty before argmax (matches sampler behavior)
+            if (repeat_pen - 1.0).abs() > 1e-6 {
+                for &tid in past_tokens {
+                    let idx = tid as usize;
+                    if idx < vocab_size {
+                        if logits[idx] > 0.0 {
+                            logits[idx] /= repeat_pen;
+                        } else {
+                            logits[idx] *= repeat_pen;
+                        }
+                    }
+                }
+            }
+
+            // Find argmax from CPU-computed logits and store in logits[0]
+            let argmax = logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as u32)
+                .unwrap_or(0);
+            logits[0] = argmax as f32;
+        }
+        // For non-greedy: logits already contain the full CPU-computed results,
+        // and the caller will apply temperature/sampling via the standard sampler.
+
+        let fwd_total_us = fwd_t0.elapsed().as_micros();
+        eprintln!(
+            "[fwd] total={}us  layers={}us  read={}us",
+            fwd_total_us,
+            sum_layer_us,
+            fwd_total_us - sum_layer_us as u128,
+        );
+        Ok(())
+    }
+
+    /// GPU batch forward pass for prefill (processes seq_len > 1 tokens in one batch).
+    /// Uploads all token embeddings at once, runs all layers with batch operations,
+    /// and reads back logits for the last token only.
+    fn forward_gpu_batch(
+        &self,
+        prompt_ids: &[u32],
+        _caches: &mut [KVCache],
+        logits: &mut [f32],
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        if cfg!(debug_assertions) {
+            eprintln!(
+                "[forward_gpu_batch] GPU batch forward pass seq_len={}",
+                prompt_ids.len()
+            );
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Cancelled".into());
+        }
+        let gpu = self.gpu.as_ref().ok_or("GPU not available")?;
+        let seq_len = prompt_ids.len() as u32;
+        let d = self.config.d_model as u32;
+        let n_heads = self.config.n_heads as u32;
+        let n_kv_heads = self.config.n_kv_heads as u32;
+        let head_dim = self.config.head_dim as u32;
+        let n_layers = self.config.n_layers as u32;
+        let ffn_dim = self.config.d_ffn as u32;
+        let nq = n_heads * head_dim;
+        let nkv = n_kv_heads * head_dim;
+        let rope_dim = self.config.rope_dim as u32;
+        let max_s = self.config.max_seq_len as u32;
+        let rms_norm_eps = self.config.rms_norm_eps;
+        let post_norm = self.config.post_norm;
+
+        let create_buf = |n: u64, label: &str| gpu.create_storage_buffer(n, label);
+
+        // Embed all tokens on CPU, upload as [seq_len × d] f32
+        let needed = (seq_len as usize) * (d as usize);
+        let mut hidden_cpu = self.hidden_gpu.lock().unwrap();
+        if hidden_cpu.len() < needed {
+            hidden_cpu.resize(needed, 0.0f32);
+        }
+        let embed_entry = self
+            .tensors
+            .get("token_embd.weight")
+            .ok_or_else(|| "Missing token_embd.weight".to_string())?;
+        for (s, &tid) in prompt_ids.iter().enumerate() {
+            let token_id = tid as usize;
+            let row = &mut hidden_cpu[s * d as usize..(s + 1) * d as usize];
+            row.fill(0.0f32);
+            if token_id < embed_entry.n_rows() {
+                hearth_quant::dequantize(embed_entry.dtype, embed_entry.row_data(token_id), row)
+                    .map_err(|e| format!("Embed dequant: {}", e))?;
+            }
+            if self.config.embed_scale {
+                let scale = (d as f32).sqrt();
+                for v in row.iter_mut() {
+                    *v *= scale;
+                }
+            }
+        }
+        let hidden_buf = gpu.upload_f32(&hidden_cpu[..needed], "hidden_batch");
+        drop(hidden_cpu);
+
+        let has_qk_norm = self.tensors.contains_key("blk.0.attn_q_norm.weight");
+
+        // Pre-allocate scratch GPU buffers
+        let norm_tmp = create_buf((needed as u64) * 4, "norm_tmp_batch");
+        let ffn_norm_tmp = create_buf((needed as u64) * 4, "ffn_norm_tmp_batch");
+        let q_buf = create_buf((seq_len * nq) as u64 * 4, "q_buf_batch");
+        let k_buf = create_buf((seq_len * nkv) as u64 * 4, "k_buf_batch");
+        let v_buf = create_buf((seq_len * nkv) as u64 * 4, "v_buf_batch");
+        let attn_out_buf = create_buf((seq_len * nq) as u64 * 4, "attn_out_batch");
+        let gate_buf = create_buf((seq_len * ffn_dim) as u64 * 4, "gate_buf_batch");
+        let up_buf = create_buf((seq_len * ffn_dim) as u64 * 4, "up_buf_batch");
+        let ffn_tmp_buf = create_buf((seq_len * ffn_dim) as u64 * 4, "ffn_tmp_batch");
+        let out_norm_tmp = create_buf(d as u64 * 4, "out_norm_tmp");
+
+        // Pre-compute per-layer weight names
+        let wnames: Vec<[String; 7]> = (0..n_layers as usize)
+            .map(|i| {
+                let p = format!("blk.{}", i);
+                [
+                    format!("{}.attn_q.weight", p),
+                    format!("{}.attn_k.weight", p),
+                    format!("{}.attn_v.weight", p),
+                    format!("{}.attn_output.weight", p),
+                    format!("{}.ffn_gate.weight", p),
+                    format!("{}.ffn_up.weight", p),
+                    format!("{}.ffn_down.weight", p),
+                ]
+            })
+            .collect();
+
+        // Pre-resolve norm buffer references
+        let mut anb = Vec::with_capacity(n_layers as usize);
+        let mut fnb = Vec::with_capacity(n_layers as usize);
+        let mut qnb = Vec::with_capacity(n_layers as usize);
+        let mut knb = Vec::with_capacity(n_layers as usize);
+        for i in 0..n_layers as usize {
+            let p = format!("blk.{}", i);
+            anb.push(gpu.norm_buffers[&format!("{}.attn_norm.weight", p)].clone());
+            fnb.push(gpu.norm_buffers[&format!("{}.ffn_norm.weight", p)].clone());
+            qnb.push(if has_qk_norm {
+                gpu.norm_buffers
+                    .get(&format!("{}.attn_q_norm.weight", p))
+                    .cloned()
+            } else {
+                None
+            });
+            knb.push(if has_qk_norm {
+                gpu.norm_buffers
+                    .get(&format!("{}.attn_k_norm.weight", p))
+                    .cloned()
+            } else {
+                None
+            });
+        }
+
+        // Pre-compute RoPE constants (same as forward_gpu)
+        let rope_theta = self.config.rope_theta;
+        let (yarn_corr_low, yarn_corr_high, yarn_mscale, yarn_n_dims) =
+            match self.config.rope_scaling_type.as_deref() {
+                Some("yarn") => {
+                    let factor = self.config.rope_scaling_factor.unwrap_or(1.0);
+                    let orig_ctx = self.config.original_ctx_len.unwrap_or(2048) as f32;
+                    let n_dims_f = head_dim as f32;
+                    let corr_dim = |beta: f32| {
+                        n_dims_f * (orig_ctx / (beta * 2.0 * std::f32::consts::PI)).ln()
+                            / (2.0 * rope_theta.ln())
+                    };
+                    let corr_low = (corr_dim(32.0)).floor().max(0.0);
+                    let corr_high = (corr_dim(1.0)).ceil().min(n_dims_f - 1.0);
+                    let mscale = 1.0 + 0.1 * factor.ln();
+                    (corr_low, corr_high, mscale, n_dims_f)
+                }
+                _ => (0.0, 0.0, 1.0, 0.0),
+            };
+        let rope_freq_scale = 1.0 / self.config.rope_scaling_factor.unwrap_or(1.0).max(1.0);
+        let cache_stride = gpu.cache_max_seq.min(max_s);
+
+        gpu.begin_batch();
+
+        let fwd_t0 = std::time::Instant::now();
+        let mut sum_layer_us: u64 = 0;
+
+        for layer in 0..n_layers as usize {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled".into());
+            }
+            let layer_t0 = std::time::Instant::now();
+
+            // --- ATTENTION RMS NORM (batch) ---
+            gpu.rms_norm_batch(
+                &hidden_buf,
+                &anb[layer],
+                &norm_tmp,
+                seq_len,
+                d,
+                rms_norm_eps,
+                post_norm,
+            );
+
+            // --- BATCH QKV ---
+            {
+                let pool = gpu.pool.lock().unwrap();
+                let qw = pool
+                    .get(&wnames[layer][0])
+                    .cloned()
+                    .ok_or_else(|| format!("Missing {}", &wnames[layer][0]))?;
+                let kw = pool
+                    .get(&wnames[layer][1])
+                    .cloned()
+                    .ok_or_else(|| format!("Missing {}", &wnames[layer][1]))?;
+                let vw = pool
+                    .get(&wnames[layer][2])
+                    .cloned()
+                    .ok_or_else(|| format!("Missing {}", &wnames[layer][2]))?;
+                drop(pool);
+
+                let qk = |i| {
+                    hearth_compute::QuantKind::from_gguf_dtype(
+                        self.tensors[&wnames[layer][i]].dtype,
+                    )
+                    .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][i]))
+                };
+
+                // Fused QKV batch: one dispatch replaces 3 matmuls + 3 copies
+                let qk_q = qk(0)?;
+                if qk_q == hearth_compute::QuantKind::Q1_0G128
+                    && gpu.fused_qkv_batch(
+                        &qw, &kw, &vw, &norm_tmp, &q_buf, &k_buf, &v_buf, nq, nkv, d, seq_len,
+                    )
+                {
+                    // Fused path succeeded — Q, K, V already written to buffers
+                } else {
+                    // Fallback: three separate batch matmuls
+                    let qk_k = qk(1)?;
+                    let qk_v = qk(2)?;
+
+                    let q_out = gpu
+                        .dequant_matmul_batch(&qw, &qk_q, &norm_tmp, nq, d, seq_len)
+                        .ok_or_else(|| format!("Batch Q matmul failed layer {}", layer))?;
+                    gpu.copy_buffer(&q_out, &q_buf);
+
+                    let k_out = gpu
+                        .dequant_matmul_batch(&kw, &qk_k, &norm_tmp, nkv, d, seq_len)
+                        .ok_or_else(|| format!("Batch K matmul failed layer {}", layer))?;
+                    gpu.copy_buffer(&k_out, &k_buf);
+
+                    let v_out = gpu
+                        .dequant_matmul_batch(&vw, &qk_v, &norm_tmp, nkv, d, seq_len)
+                        .ok_or_else(|| format!("Batch V matmul failed layer {}", layer))?;
+                    gpu.copy_buffer(&v_out, &v_buf);
+                }
+            }
+
+            // --- Q/K HEAD NORMS (batch) ---
+            if let Some(ref qnb_ref) = qnb[layer] {
+                gpu.head_rms_norm_batch(
+                    &q_buf,
+                    qnb_ref,
+                    n_heads,
+                    head_dim,
+                    seq_len,
+                    rms_norm_eps,
+                    post_norm,
+                );
+            }
+            if let Some(ref knb_ref) = knb[layer] {
+                gpu.head_rms_norm_batch(
+                    &k_buf,
+                    knb_ref,
+                    n_kv_heads,
+                    head_dim,
+                    seq_len,
+                    rms_norm_eps,
+                    post_norm,
+                );
+            }
+
+            // --- BATCH RoPE on Q and K ---
+            gpu.rope_batch(
+                &q_buf,
+                n_heads,
+                head_dim,
+                rope_dim,
+                seq_len,
+                rope_theta,
+                rope_freq_scale,
+                yarn_corr_low,
+                yarn_corr_high,
+                yarn_mscale,
+                yarn_n_dims,
+            );
+            gpu.rope_batch(
+                &k_buf,
+                n_kv_heads,
+                head_dim,
+                rope_dim,
+                seq_len,
+                rope_theta,
+                rope_freq_scale,
+                yarn_corr_low,
+                yarn_corr_high,
+                yarn_mscale,
+                yarn_n_dims,
+            );
+
+            // --- BATCH KV CACHE WRITE ---
+            let layer_buf = &gpu.kv_cache[layer];
+            gpu.write_cache_kv_batch(
+                &k_buf,
+                &v_buf,
+                layer_buf,
+                seq_len,
+                n_kv_heads,
+                head_dim,
+                cache_stride,
+            );
+
+            // --- FLASH ATTENTION PREFILL (causal) ---
+            let attn_out = gpu
+                .flash_attention_prefill(
+                    &q_buf,
+                    layer_buf,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    seq_len,
+                    cache_stride,
+                )
+                .ok_or_else(|| format!("flash_attention_prefill failed layer {}", layer))?;
+            gpu.copy_buffer(&attn_out, &attn_out_buf);
+
+            // --- OUTPUT PROJECTION + RESIDUAL (batch) ---
+            {
+                let pool = gpu.pool.lock().unwrap();
+                let aw = pool
+                    .get(&wnames[layer][3])
+                    .cloned()
+                    .ok_or_else(|| format!("Missing {}", &wnames[layer][3]))?;
+                let gw = pool
+                    .get(&wnames[layer][4])
+                    .cloned()
+                    .ok_or_else(|| format!("Missing {}", &wnames[layer][4]))?;
+                let uw = pool
+                    .get(&wnames[layer][5])
+                    .cloned()
+                    .ok_or_else(|| format!("Missing {}", &wnames[layer][5]))?;
+                let dw = pool
+                    .get(&wnames[layer][6])
+                    .cloned()
+                    .ok_or_else(|| format!("Missing {}", &wnames[layer][6]))?;
+                drop(pool);
+
+                let qk_a = hearth_compute::QuantKind::from_gguf_dtype(
+                    self.tensors[&wnames[layer][3]].dtype,
+                )
+                .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][3]))?;
+
+                // attn_out projection: batch matmul then add to hidden
+                let a_out = gpu
+                    .dequant_matmul_batch(&aw, &qk_a, &attn_out_buf, d, nq, seq_len)
+                    .ok_or_else(|| format!("Batch attn_out matmul failed layer {}", layer))?;
+                gpu.add_inplace(&hidden_buf, &a_out, seq_len * d);
+
+                // FFN norm (batch)
+                gpu.rms_norm_batch(
+                    &hidden_buf,
+                    &fnb[layer],
+                    &ffn_norm_tmp,
+                    seq_len,
+                    d,
+                    rms_norm_eps,
+                    post_norm,
+                );
+
+                // FFN gate + up (batch fused — one dispatch replaces 2 matmuls + 2 copies)
+                let qk_gu = hearth_compute::QuantKind::from_gguf_dtype(
+                    self.tensors[&wnames[layer][4]].dtype,
+                )
+                .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][4]))?;
+
+                if qk_gu == hearth_compute::QuantKind::Q1_0G128
+                    && gpu.fused_gate_up_batch(
+                        &gw,
+                        &uw,
+                        &ffn_norm_tmp,
+                        &gate_buf,
+                        &up_buf,
+                        ffn_dim,
+                        d,
+                        seq_len,
+                    )
+                {
+                    // Fused path succeeded
+                } else {
+                    // Fallback: two separate batch matmuls
+                    let qk_u = hearth_compute::QuantKind::from_gguf_dtype(
+                        self.tensors[&wnames[layer][5]].dtype,
+                    )
+                    .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][5]))?;
+
+                    let g_out = gpu
+                        .dequant_matmul_batch(&gw, &qk_gu, &ffn_norm_tmp, ffn_dim, d, seq_len)
+                        .ok_or_else(|| format!("Batch gate matmul failed layer {}", layer))?;
+                    gpu.copy_buffer(&g_out, &gate_buf);
+
+                    let u_out = gpu
+                        .dequant_matmul_batch(&uw, &qk_u, &ffn_norm_tmp, ffn_dim, d, seq_len)
+                        .ok_or_else(|| format!("Batch up matmul failed layer {}", layer))?;
+                    gpu.copy_buffer(&u_out, &up_buf);
+                }
+
+                // SiLU(gate) * up (element-wise, more elements = seq_len * ffn_dim)
+                gpu.silu_mul(&gate_buf, &up_buf, &ffn_tmp_buf, seq_len * ffn_dim);
+
+                // FFN down + residual (batch)
+                let qk_d = hearth_compute::QuantKind::from_gguf_dtype(
+                    self.tensors[&wnames[layer][6]].dtype,
+                )
+                .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][6]))?;
+
+                let d_out = gpu
+                    .dequant_matmul_batch(&dw, &qk_d, &ffn_tmp_buf, d, ffn_dim, seq_len)
+                    .ok_or_else(|| format!("Batch down matmul failed layer {}", layer))?;
+                gpu.add_inplace(&hidden_buf, &d_out, seq_len * d);
+            }
+
+            let layer_us = layer_t0.elapsed().as_micros();
+            sum_layer_us += layer_us as u64;
+        }
+
+        // --- OUTPUT NORM + LM HEAD (only for last position in batch) ---
+        // Copy last position's hidden to single-vec buffer for output norm + lm_head
+        let last_pos = seq_len - 1;
+        let hidden_last = gpu.create_storage_buffer(d as u64 * 4, "hidden_last");
+
+        // copy_buffer_range: copy the last row from hidden_buf
+        let last_offset = (last_pos as u64) * (d as u64) * 4;
+        gpu.copy_buffer_range(&hidden_buf, last_offset, &hidden_last, 0, d as u64 * 4);
+
+        let out_norm_buf = &gpu.norm_buffers["output_norm.weight"];
+        gpu.rms_norm(
+            &hidden_last,
+            out_norm_buf,
+            &out_norm_tmp,
+            d,
+            rms_norm_eps,
+            post_norm,
+        );
+
+        let vocab_size = self.config.vocab_size as usize;
+        let lm_head_w = {
             let pool = gpu.pool.lock().unwrap();
             pool.get(&self.lm_head_name)
                 .cloned()
@@ -1931,13 +2530,13 @@ impl LlamaModel {
         };
         let lm_head_buf = gpu
             .dequant_matmul_fused(
-                &w_buf,
+                &lm_head_w,
                 &hearth_compute::QuantKind::from_gguf_dtype(self.tensors[&self.lm_head_name].dtype)
                     .ok_or_else(|| format!("Unsupported dtype for {}", self.lm_head_name))?,
                 &out_norm_tmp,
                 vocab_size as u32,
                 1,
-                d as u32,
+                d,
             )
             .ok_or_else(|| "Failed lm_head matmul".to_string())?;
 
@@ -1948,10 +2547,8 @@ impl LlamaModel {
 
         let fwd_total_us = fwd_t0.elapsed().as_micros();
         eprintln!(
-            "[fwd] total={}us  layers={}us  read={}us",
-            fwd_total_us,
-            sum_layer_us,
-            fwd_total_us - sum_layer_us as u128,
+            "[fwd_batch] seq_len={} total={}us  layers={}us",
+            seq_len, fwd_total_us, sum_layer_us,
         );
         Ok(())
     }
@@ -2011,12 +2608,24 @@ impl LlamaModel {
 
 impl Model for LlamaModel {
     fn run(&self, request: PipelineRequest, cancel: Arc<AtomicBool>, output: Sender<EngineOutput>) {
+        // Hybrid-architecture models fully own their forward path.
+        if let Some(core) = self.hybrid.as_ref() {
+            return core.run(request, cancel, output);
+        }
         let result = match &request {
             PipelineRequest::TextGen {
                 prompt,
                 sampler,
                 max_new_tokens,
-            } => self.generate_text(prompt, sampler, *max_new_tokens, &cancel, &output),
+                max_context_len,
+            } => self.generate_text(
+                prompt,
+                sampler,
+                *max_new_tokens,
+                *max_context_len,
+                &cancel,
+                &output,
+            ),
             _ => {
                 let _ = output.send(EngineOutput::Error(ModelError::RuntimeError(
                     "Unsupported request type for LlamaModel".to_string(),
@@ -2037,6 +2646,10 @@ impl Model for LlamaModel {
         user: &str,
         thinking: bool,
     ) -> String {
+        // Hybrid-architecture models route through their own core.
+        if let Some(core) = self.hybrid.as_ref() {
+            return core.build_chat_prompt(system, history, user, thinking);
+        }
         self.tokenizer
             .lock()
             .unwrap()
@@ -2050,6 +2663,7 @@ impl LlamaModel {
         prompt: &str,
         sampler_config: &SamplerConfig,
         max_new_tokens: usize,
+        max_context_len: Option<usize>,
         cancel: &Arc<AtomicBool>,
         output: &Sender<EngineOutput>,
     ) -> Result<(), String> {
@@ -2064,9 +2678,14 @@ impl LlamaModel {
             self.gpu.as_ref().unwrap().warmup();
         }
 
-        let input_ids = self.tokenizer.lock().unwrap().encode(prompt, false);
+        let mut input_ids = self.tokenizer.lock().unwrap().encode(prompt, false);
         if input_ids.is_empty() {
             return Err("Empty prompt after tokenization".to_string());
+        }
+        if let Some(max_ctx) = max_context_len {
+            if input_ids.len() > max_ctx {
+                input_ids.drain(..input_ids.len() - max_ctx);
+            }
         }
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -2087,6 +2706,7 @@ impl LlamaModel {
         let mut logits = vec![0.0f32; vocab_size];
         let mut sample_buf = vec![0.0f32; vocab_size];
         let mut past_tokens: Vec<u32> = Vec::new();
+        let prompt_tokens = input_ids.len();
         let mut total_tokens = 0;
 
         let n_layers_usize = n_layers;
@@ -2135,7 +2755,17 @@ impl LlamaModel {
             eprintln!("[warmup] CPU clock ramp: {}ms", warmup_us / 1000);
         }
 
-        if input_ids.len() > 1 && !use_gpu {
+        if input_ids.len() > 1 && use_gpu {
+            let t0 = std::time::Instant::now();
+            self.forward_gpu_batch(&input_ids, &mut caches, &mut logits, cancel)?;
+            let us = t0.elapsed().as_micros();
+            eprintln!(
+                "[prefill] GPU batch {} tokens in {}ms ({:.1}ms/tok)",
+                input_ids.len(),
+                us / 1000,
+                us as f64 / input_ids.len() as f64 / 1000.0
+            );
+        } else if input_ids.len() > 1 && !use_gpu {
             let t0 = std::time::Instant::now();
             self.forward_batch(
                 &input_ids,
@@ -2158,7 +2788,17 @@ impl LlamaModel {
                     return Ok(());
                 }
                 if use_gpu {
-                    self.forward_gpu(&[tid], i, &mut caches, &mut logits, cancel)?;
+                    self.forward_gpu(
+                        &[tid],
+                        i,
+                        &mut caches,
+                        &mut logits,
+                        cancel,
+                        sampler_config.temperature == 0.0,
+                        &mut rb,
+                        sampler_config.repeat_pen,
+                        &past_tokens,
+                    )?;
                 } else {
                     self.forward(
                         &[tid],
@@ -2172,17 +2812,27 @@ impl LlamaModel {
                 }
             }
         }
-        total_tokens += input_ids.len();
+        // `total_tokens` counts generated tokens only; the prompt is reported
+        // separately so a 1-token reply from a 30-token prompt is not
+        // misreported as "31 tokens generated".
         past_tokens.push(input_ids[input_ids.len() - 1]);
 
         let mut generated = 0;
         let mut cpu_overhead_us: u128 = 0;
+        let greedy = sampler_config.temperature == 0.0;
         while generated < max_new_tokens {
             if cancel.load(Ordering::Relaxed) {
+                // Emit any multi-byte character still held by the streaming
+                // decoder so a cancelled stream isn't left one byte short.
+                let flush = self.tokenizer.lock().unwrap().flush_stream_decode();
+                if !flush.is_empty() {
+                    let _ = output.send(EngineOutput::TextToken(flush));
+                }
                 let elapsed = start.elapsed().as_millis();
                 let _ = output.send(EngineOutput::Done(RunStats {
                     elapsed_ms: elapsed,
-                    tokens: total_tokens,
+                    tokens: generated,
+                    prompt_tokens,
                     tokens_per_s: 0.0,
                 }));
                 return Ok(());
@@ -2197,9 +2847,14 @@ impl LlamaModel {
             }
 
             let cpu_t0 = std::time::Instant::now();
-            sample_buf.copy_from_slice(&logits);
 
-            let token = hearth_sampler::sample(&mut sample_buf, sampler_config, &past_tokens);
+            let token = if use_gpu && greedy {
+                // GPU-side argmax: forward_gpu stores argmax index in logits[0]
+                logits[0] as u32
+            } else {
+                sample_buf.copy_from_slice(&logits);
+                hearth_sampler::sample(&mut sample_buf, sampler_config, &past_tokens)
+            };
 
             let cpu_sampling_us = cpu_t0.elapsed().as_micros();
 
@@ -2234,7 +2889,17 @@ impl LlamaModel {
             generated += 1;
 
             if use_gpu {
-                self.forward_gpu(&[token], pos, &mut caches, &mut logits, cancel)?;
+                self.forward_gpu(
+                    &[token],
+                    pos,
+                    &mut caches,
+                    &mut logits,
+                    cancel,
+                    sampler_config.temperature == 0.0,
+                    &mut rb,
+                    sampler_config.repeat_pen,
+                    &past_tokens,
+                )?;
             } else {
                 self.forward(
                     &[token],
@@ -2266,12 +2931,567 @@ impl LlamaModel {
             0.0
         };
 
+        // Emit any multi-byte character still held by the streaming decoder
+        // (e.g. the reply's final character was cut mid-sequence).
+        let flush = self.tokenizer.lock().unwrap().flush_stream_decode();
+        if !flush.is_empty() {
+            let _ = output.send(EngineOutput::TextToken(flush));
+        }
+
         let _ = output.send(EngineOutput::Done(RunStats {
             elapsed_ms: elapsed,
             tokens: total_tokens,
+            prompt_tokens,
             tokens_per_s,
         }));
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gpu_decode_with_real_model() {
+        let models_dir = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
+        let model_path = format!(
+            "{}\\AppData\\Roaming\\hearth\\models\\Bonsai-1.7B-Q1_0.gguf",
+            models_dir
+        );
+
+        if !std::path::Path::new(&model_path).exists() {
+            eprintln!("[test] Model not found — skipping");
+            return;
+        }
+
+        eprintln!("[test] Loading model with GpuFull...");
+        let gpu_model = match LlamaModel::load(&model_path, LoadStrategy::GpuFull) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[test] GPU load failed: {} — skipping", e);
+                return;
+            }
+        };
+
+        if gpu_model.gpu.is_none() {
+            eprintln!("[test] GPU not detected — skipping");
+            return;
+        }
+
+        eprintln!("[test] Loading model CPU-only for comparison...");
+        let cpu_model = match LlamaModel::load(&model_path, LoadStrategy::CpuOnly) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[test] CPU load failed: {} — skipping", e);
+                return;
+            }
+        };
+
+        let n_layers = cpu_model.config.n_layers as usize;
+        let vocab_size = cpu_model.config.vocab_size as usize;
+        let n_kv_heads = cpu_model.config.n_kv_heads as usize;
+        let head_dim = cpu_model.config.head_dim as usize;
+        let max_seq = cpu_model.config.max_seq_len as usize;
+        let d = cpu_model.config.d_model as usize;
+
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        // 1) Compare CPU vs GPU token embedding first
+        eprintln!("[test] Checking token embeddings...");
+        let embed_entry = cpu_model.tensors.get("token_embd.weight").unwrap();
+        let mut cpu_embed = vec![0.0f32; d];
+        hearth_quant::dequantize(embed_entry.dtype, embed_entry.row_data(0), &mut cpu_embed)
+            .unwrap();
+
+        // GPU embedding
+        let gpu = gpu_model.gpu.as_ref().unwrap();
+        let embed_gpu_buf = gpu
+            .pool
+            .lock()
+            .unwrap()
+            .get("token_embd.weight")
+            .cloned()
+            .unwrap();
+        drop(gpu);
+        // Don't need to upload - the CPU path dequantizes directly
+
+        // The CPU embedding is the correct reference. For GPU, we can't easily read back
+        // the dequantized value. But the CPU embedding values are what we expect.
+        eprintln!("[test] CPU embed[0..5]: {:?}", &cpu_embed[..5]);
+        let embed_sum_sq: f32 = cpu_embed.iter().map(|x| x * x).sum();
+        eprintln!("[test] CPU embed sum_sq: {:.4}", embed_sum_sq);
+
+        // 2) CPU forward
+        eprintln!("[test] Running CPU forward...");
+        let mut cpu_caches: Vec<crate::kvcache::KVCache> = (0..n_layers)
+            .map(|_| {
+                crate::kvcache::KVCache::new_with_storage(
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    crate::kvcache::KVStorage::F32,
+                )
+            })
+            .collect();
+        let mut logits_cpu = vec![0.0f32; vocab_size];
+        let mut sc = cpu_model.scratch.lock().unwrap();
+        let mut rb = cpu_model.row_buf.lock().unwrap();
+        cpu_model
+            .forward(
+                &[0u32],
+                0,
+                &mut cpu_caches,
+                &mut logits_cpu,
+                &cancel,
+                &mut sc,
+                &mut rb,
+            )
+            .expect("CPU forward failed");
+
+        // 3) GPU forward
+        eprintln!("[test] Running GPU forward...");
+        let mut gpu_caches: Vec<crate::kvcache::KVCache> = (0..n_layers)
+            .map(|_| {
+                crate::kvcache::KVCache::new_with_storage(
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    crate::kvcache::KVStorage::F32,
+                )
+            })
+            .collect();
+        let mut logits_gpu = vec![0.0f32; vocab_size];
+        let mut dummy_rb = Vec::new();
+        let empty_tokens = Vec::new();
+        gpu_model
+            .forward_gpu(
+                &[0u32],
+                0,
+                &mut gpu_caches,
+                &mut logits_gpu,
+                &cancel,
+                false,
+                &mut dummy_rb,
+                1.0,
+                &empty_tokens,
+            )
+            .expect("GPU forward failed");
+
+        // Compare
+        let mut cpu_sorted: Vec<(u32, f32)> = logits_cpu
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i as u32, v))
+            .collect();
+        cpu_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let mut gpu_sorted: Vec<(u32, f32)> = logits_gpu
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i as u32, v))
+            .collect();
+        gpu_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        eprintln!("[test] CPU Top-5: {:?}", &cpu_sorted[..5]);
+        eprintln!("[test] GPU Top-5: {:?}", &gpu_sorted[..5]);
+
+        let dot: f32 = logits_cpu
+            .iter()
+            .zip(logits_gpu.iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        let norm_cpu: f32 = logits_cpu.iter().map(|a| a * a).sum::<f32>().sqrt();
+        let norm_gpu: f32 = logits_gpu.iter().map(|a| a * a).sum::<f32>().sqrt();
+        eprintln!(
+            "[test] Cosine similarity: {:.6}",
+            dot / (norm_cpu * norm_gpu + 1e-10)
+        );
+
+        if cpu_sorted[0].0 == gpu_sorted[0].0 {
+            eprintln!("[test] ✓ Top-1 token matches!");
+        } else {
+            eprintln!(
+                "[test] ✗ Top-1 MISMATCH: CPU={} GPU={}",
+                cpu_sorted[0].0, gpu_sorted[0].0
+            );
+        }
+
+        // 4) Debug: manually run first layer operations on GPU and compare
+        eprintln!("[test] Layer-by-layer debug...");
+        let n_heads = cpu_model.config.n_heads as usize;
+        let ffn_dim = cpu_model.config.d_ffn as usize;
+
+        // Manually run embedding on GPU and read back
+        let mut hidden_cpu_input = vec![0.0f32; d];
+        hearth_quant::dequantize(
+            embed_entry.dtype,
+            embed_entry.row_data(0),
+            &mut hidden_cpu_input,
+        )
+        .unwrap();
+
+        // Upload to GPU
+        let gpu = gpu_model.gpu.as_ref().unwrap();
+        let hidden_buf = gpu.upload_f32(&hidden_cpu_input, "hidden_debug");
+
+        // Run RMS norm on GPU for layer 0
+        let anb = gpu
+            .norm_buffers
+            .get("blk.0.attn_norm.weight")
+            .unwrap()
+            .clone();
+        let norm_tmp = gpu.create_storage_buffer(d as u64 * 4, "norm_tmp_debug");
+        gpu.rms_norm(
+            &hidden_buf,
+            &anb,
+            &norm_tmp,
+            d as u32,
+            cpu_model.config.rms_norm_eps,
+            false,
+        );
+
+        // Read back RMS norm output
+        let norm_out = gpu.readback_f32(&norm_tmp, d);
+
+        // Compute CPU RMS norm for comparison
+        let attn_norm_weight = cpu_model.norm_cache.get("blk.0.attn_norm.weight").unwrap();
+        let mut cpu_norm_out = vec![0.0f32; d];
+        ops::rms_norm(
+            &hidden_cpu_input,
+            attn_norm_weight,
+            cpu_model.config.rms_norm_eps,
+            &mut cpu_norm_out,
+        );
+
+        // Compare RMS norm outputs
+        eprintln!("[test] RMS norm comparison (first 10):");
+        for i in 0..10 {
+            eprintln!(
+                "  [{}] cpu={:.6} gpu={:.6}",
+                i, cpu_norm_out[i], norm_out[i]
+            );
+        }
+        let rms_match = norm_out
+            .iter()
+            .zip(cpu_norm_out.iter())
+            .all(|(a, b)| (a - b).abs() < 0.001);
+        eprintln!("[test] RMS norm match: {}", rms_match);
+
+        // 5) Check QKV matmul on GPU
+        eprintln!("[test] Checking QKV matmul...");
+        let qw = gpu_model.tensors.get("blk.0.attn_q.weight").unwrap();
+        let kw = gpu_model.tensors.get("blk.0.attn_k.weight").unwrap();
+        let vw = gpu_model.tensors.get("blk.0.attn_v.weight").unwrap();
+        let wr_q = qw.n_rows();
+        let wr_k = kw.n_rows();
+        let wr_v = vw.n_rows();
+
+        // GPU QKV
+        gpu.begin_batch();
+        let qk_q = hearth_compute::QuantKind::from_gguf_dtype(qw.dtype).unwrap();
+        let qb = gpu
+            .dequant_matmul_fused(
+                &gpu_model.gpu.as_ref().unwrap().pool.lock().unwrap()["blk.0.attn_q.weight"],
+                &qk_q,
+                &norm_tmp,
+                wr_q as u32,
+                1,
+                d as u32,
+            )
+            .unwrap();
+        let qk_k = hearth_compute::QuantKind::from_gguf_dtype(kw.dtype).unwrap();
+        let kb = gpu
+            .dequant_matmul_fused(
+                &gpu_model.gpu.as_ref().unwrap().pool.lock().unwrap()["blk.0.attn_k.weight"],
+                &qk_k,
+                &norm_tmp,
+                wr_k as u32,
+                1,
+                d as u32,
+            )
+            .unwrap();
+        let qk_v = hearth_compute::QuantKind::from_gguf_dtype(vw.dtype).unwrap();
+        let vb = gpu
+            .dequant_matmul_fused(
+                &gpu_model.gpu.as_ref().unwrap().pool.lock().unwrap()["blk.0.attn_v.weight"],
+                &qk_v,
+                &norm_tmp,
+                wr_v as u32,
+                1,
+                d as u32,
+            )
+            .unwrap();
+        gpu.end_batch();
+
+        let gpu_q = gpu.readback_f32(&qb, wr_q);
+        let gpu_k = gpu.readback_f32(&kb, wr_k);
+        let gpu_v = gpu.readback_f32(&vb, wr_v);
+
+        // CPU QKV
+        let mut cpu_q = vec![0.0f32; wr_q];
+        let mut cpu_k = vec![0.0f32; wr_k];
+        let mut cpu_v = vec![0.0f32; wr_v];
+        {
+            let entry = qw;
+            let n_cols = entry.n_cols();
+            let n_rows = entry.n_rows();
+            for row in 0..n_rows {
+                let w = entry.row_data(row);
+                cpu_q[row] = hearth_quant::dot_q1_0g128_f32(w, &cpu_norm_out, n_cols);
+            }
+        }
+        {
+            let entry = kw;
+            let n_cols = entry.n_cols();
+            let n_rows = entry.n_rows();
+            for row in 0..n_rows {
+                let w = entry.row_data(row);
+                cpu_k[row] = hearth_quant::dot_q1_0g128_f32(w, &cpu_norm_out, n_cols);
+            }
+        }
+        {
+            let entry = vw;
+            let n_cols = entry.n_cols();
+            let n_rows = entry.n_rows();
+            for row in 0..n_rows {
+                let w = entry.row_data(row);
+                cpu_v[row] = hearth_quant::dot_q1_0g128_f32(w, &cpu_norm_out, n_cols);
+            }
+        }
+
+        let q_match = gpu_q
+            .iter()
+            .zip(cpu_q.iter())
+            .all(|(a, b)| (a - b).abs() < 0.1);
+        eprintln!("[test] Q matmul match: {} (wr_q={})", q_match, wr_q);
+        if !q_match {
+            eprintln!(
+                "[test] Q first 10: cpu={:?} gpu={:?}",
+                &cpu_q[..10],
+                &gpu_q[..10]
+            );
+        }
+        let k_match = gpu_k
+            .iter()
+            .zip(cpu_k.iter())
+            .all(|(a, b)| (a - b).abs() < 0.1);
+        eprintln!("[test] K matmul match: {}", k_match);
+        if !k_match {
+            eprintln!(
+                "[test] K first 10: cpu={:?} gpu={:?}",
+                &cpu_k[..10],
+                &gpu_k[..10]
+            );
+        }
+        let v_match = gpu_v
+            .iter()
+            .zip(cpu_v.iter())
+            .all(|(a, b)| (a - b).abs() < 0.1);
+        eprintln!("[test] V matmul match: {}", v_match);
+        if !v_match {
+            eprintln!(
+                "[test] V first 10: cpu={:?} gpu={:?}",
+                &cpu_v[..10],
+                &gpu_v[..10]
+            );
+        }
+
+        // 6) Check head RMS norm + RoPE
+        eprintln!("[test] Checking head_norm + RoPE...");
+        let n_heads = cpu_model.config.n_heads as usize;
+        let n_kv_heads = cpu_model.config.n_kv_heads as usize;
+        let head_dim = cpu_model.config.head_dim as usize;
+        let nq = n_heads * head_dim;
+        let nkv = n_kv_heads * head_dim;
+        let rope_dim = cpu_model.config.rope_dim as usize;
+
+        // Upload Q/K to GPU buffers
+        let gpu_q_buf = gpu.upload_f32(&gpu_q, "q_debug");
+        let gpu_k_buf = gpu.upload_f32(&gpu_k, "k_debug");
+
+        // Apply head RMS norm on GPU
+        let q_norm_w = gpu
+            .norm_buffers
+            .get("blk.0.attn_q_norm.weight")
+            .unwrap()
+            .clone();
+        let k_norm_w = gpu
+            .norm_buffers
+            .get("blk.0.attn_k_norm.weight")
+            .unwrap()
+            .clone();
+        // head_rms_norm works in-place on the buffer
+        gpu.head_rms_norm(
+            &gpu_q_buf,
+            &q_norm_w,
+            n_heads as u32,
+            head_dim as u32,
+            cpu_model.config.rms_norm_eps,
+            false,
+        );
+        gpu.head_rms_norm(
+            &gpu_k_buf,
+            &k_norm_w,
+            n_kv_heads as u32,
+            head_dim as u32,
+            cpu_model.config.rms_norm_eps,
+            false,
+        );
+
+        // Read back
+        let gpu_q_hnorm = gpu.readback_f32(&gpu_q_buf, nq);
+        let gpu_k_hnorm = gpu.readback_f32(&gpu_k_buf, nkv);
+
+        // CPU head RMS norm
+        let q_norm_cpu = cpu_model
+            .norm_cache
+            .get("blk.0.attn_q_norm.weight")
+            .unwrap();
+        let k_norm_cpu = cpu_model
+            .norm_cache
+            .get("blk.0.attn_k_norm.weight")
+            .unwrap();
+        let mut cpu_q_hnorm = cpu_q.clone();
+        let mut cpu_k_hnorm = cpu_k.clone();
+        for h in 0..n_heads {
+            let s = h * head_dim;
+            ops::rms_norm(
+                &cpu_q[s..s + head_dim],
+                q_norm_cpu,
+                cpu_model.config.rms_norm_eps,
+                &mut cpu_q_hnorm[s..s + head_dim],
+            );
+        }
+        for h in 0..n_kv_heads {
+            let s = h * head_dim;
+            ops::rms_norm(
+                &cpu_k[s..s + head_dim],
+                k_norm_cpu,
+                cpu_model.config.rms_norm_eps,
+                &mut cpu_k_hnorm[s..s + head_dim],
+            );
+        }
+
+        let qh_match = gpu_q_hnorm
+            .iter()
+            .zip(cpu_q_hnorm.iter())
+            .all(|(a, b)| (a - b).abs() < 0.01);
+        eprintln!("[test] Q head_norm match: {}", qh_match);
+        if !qh_match {
+            eprintln!(
+                "[test] Q head_norm first 10: cpu={:?} gpu={:?}",
+                &cpu_q_hnorm[..10],
+                &gpu_q_hnorm[..10]
+            );
+        }
+        let kh_match = gpu_k_hnorm
+            .iter()
+            .zip(cpu_k_hnorm.iter())
+            .all(|(a, b)| (a - b).abs() < 0.01);
+        eprintln!("[test] K head_norm match: {}", kh_match);
+        if !kh_match {
+            eprintln!(
+                "[test] K head_norm first 10: cpu={:?} gpu={:?}",
+                &cpu_k_hnorm[..10],
+                &gpu_k_hnorm[..10]
+            );
+        }
+
+        // 7) Check RoPE
+        eprintln!("[test] Checking RoPE...");
+        let rope_theta = cpu_model.config.rope_theta;
+        let rope_freq_scale = 1.0 / cpu_model.config.rope_scaling_factor.unwrap_or(1.0).max(1.0);
+        // We need to re-upload because head_norm modified the buffers in-place
+        let gpu_q_rope = gpu.upload_f32(&gpu_q_hnorm, "q_rope_debug");
+        let gpu_k_rope = gpu.upload_f32(&gpu_k_hnorm, "k_rope_debug");
+        gpu.rope_combined(
+            &gpu_q_rope,
+            n_heads as u32,
+            head_dim as u32,
+            rope_dim as u32,
+            0,
+            rope_theta,
+            rope_freq_scale,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+        );
+        gpu.rope_combined(
+            &gpu_k_rope,
+            n_kv_heads as u32,
+            head_dim as u32,
+            rope_dim as u32,
+            0,
+            rope_theta,
+            rope_freq_scale,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+        );
+        let gpu_q_roped = gpu.readback_f32(&gpu_q_rope, nq);
+        let gpu_k_roped = gpu.readback_f32(&gpu_k_rope, nkv);
+
+        // CPU RoPE
+        let mut cpu_q_roped = cpu_q_hnorm.clone();
+        let mut cpu_k_roped = cpu_k_hnorm.clone();
+        for h in 0..n_heads {
+            let s = h * head_dim;
+            cpu_model
+                .rope_cache
+                .apply(&mut cpu_q_roped[s..s + rope_dim], 0);
+        }
+        for h in 0..n_kv_heads {
+            let s = h * head_dim;
+            cpu_model
+                .rope_cache
+                .apply(&mut cpu_k_roped[s..s + rope_dim], 0);
+        }
+
+        let qr_match = gpu_q_roped
+            .iter()
+            .zip(cpu_q_roped.iter())
+            .all(|(a, b)| (a - b).abs() < 0.01);
+        eprintln!("[test] Q RoPE match: {}", qr_match);
+        if !qr_match {
+            eprintln!(
+                "[test] Q RoPE first 10: cpu={:?} gpu={:?}",
+                &cpu_q_roped[..10],
+                &gpu_q_roped[..10]
+            );
+            // Also check specific head pairs to see if the rotation is correct
+            for h in 0..n_heads.min(2) {
+                let s = h * head_dim;
+                eprintln!(
+                    "[test] Q head {} first 15: cpu={:?} gpu={:?}",
+                    h,
+                    &cpu_q_roped[s..s + 15],
+                    &gpu_q_roped[s..s + 15]
+                );
+            }
+        }
+        let kr_match = gpu_k_roped
+            .iter()
+            .zip(cpu_k_roped.iter())
+            .all(|(a, b)| (a - b).abs() < 0.01);
+        eprintln!("[test] K RoPE match: {}", kr_match);
+        if !kr_match {
+            eprintln!(
+                "[test] K RoPE first 10: cpu={:?} gpu={:?}",
+                &cpu_k_roped[..10],
+                &gpu_k_roped[..10]
+            );
+            for h in 0..n_kv_heads.min(2) {
+                let s = h * head_dim;
+                eprintln!(
+                    "[test] K head {} first 15: cpu={:?} gpu={:?}",
+                    h,
+                    &cpu_k_roped[s..s + 15],
+                    &gpu_k_roped[s..s + 15]
+                );
+            }
+        }
     }
 }

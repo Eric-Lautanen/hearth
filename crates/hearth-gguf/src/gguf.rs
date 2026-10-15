@@ -223,6 +223,12 @@ impl GgufFile {
         &self.mmap[start..end]
     }
 
+    /// Shared handle to the backing mmap, for zero-copy tensor storage that
+    /// outlives a borrow of `self`.
+    pub fn mmap_arc(&self) -> Arc<Mmap> {
+        Arc::clone(&self.mmap)
+    }
+
     pub fn find_tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.iter().find(|t| t.name == name)
     }

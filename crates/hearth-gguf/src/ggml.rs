@@ -42,6 +42,8 @@ pub enum GgmlDType {
     Q1_0,      // 41: PRISM Q1_0 1-bit binary, 128-element blocks, 18 bytes
     Q2_0,      // 42: PRISM Q2_0 2-bit ternary {-1,0,+1}, 128-element blocks, 34 bytes
     Q1_0_G128, // 43: PRISM Q1_0_G128 1-bit binary, 128-element blocks, 18 bytes
+    PQ2_0,     // 142: Prism 2-bit ternary g128, 34-byte blocks, Hadamard-rotated basis
+    PTQ1_0,    // 143: Prism dense-trit ternary g128, 28-byte blocks, Hadamard-rotated basis
 }
 
 impl GgmlDType {
@@ -87,6 +89,8 @@ impl GgmlDType {
             39 | 43 => Self::Q1_0_G128, // 39 = legacy, 43 = PRISM standard
             41 => Self::Q1_0,           // PRISM Q1_0 (1-bit binary)
             42 => Self::Q2_0,           // PRISM Q2_0 (2-bit ternary {-1,0,+1})
+            142 => Self::PQ2_0,         // Prism PQ2_0 (2-bit ternary g128, rotated basis)
+            143 => Self::PTQ1_0,        // Prism PTQ1_0 (dense trits g128, rotated basis)
             _ => return None,
         })
     }
@@ -111,6 +115,8 @@ impl GgmlDType {
             Self::IQ4_NL_4x4 | Self::IQ4_NL_4x8 | Self::IQ4_NL_8x8 => 32,
             Self::Q4_0_4_4 | Self::Q4_0_4_8 | Self::Q4_0_8_8 => 32,
             Self::Q2_0 => 128,
+            Self::PQ2_0 => 128,
+            Self::PTQ1_0 => 128,
             Self::TQ1_0 | Self::TQ2_0 => 32,
             Self::Q1_0 | Self::Q1_0_G128 => 128,
         }
@@ -151,6 +157,8 @@ impl GgmlDType {
             Self::TQ1_0 => 34,
             Self::TQ2_0 => 34,
             Self::Q2_0 => 34,
+            Self::PQ2_0 => 34,
+            Self::PTQ1_0 => 28,
             Self::Q1_0 | Self::Q1_0_G128 => 18,
         }
     }
@@ -202,6 +210,8 @@ impl GgmlDType {
             Self::Q1_0 => "Q1_0",
             Self::Q2_0 => "Q2_0",
             Self::Q1_0_G128 => "Q1_0_G128",
+            Self::PQ2_0 => "PQ2_0",
+            Self::PTQ1_0 => "PTQ1_0",
         }
     }
 

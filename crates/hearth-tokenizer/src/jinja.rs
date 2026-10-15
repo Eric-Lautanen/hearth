@@ -9,7 +9,11 @@ pub struct TemplateContext {
     pub bos_token: String,
     pub eos_token: String,
     pub add_generation_prompt: bool,
+    /// Some templates render extra content (e.g. `<think>` tags) based on this.
     pub thinking: bool,
+    /// Qwen3-style: when false, pre-close the think block so the model starts
+    /// answering directly instead of reasoning inline.
+    pub enable_thinking: bool,
 }
 
 pub fn eval_jinja2(template: &str, ctx: &TemplateContext) -> String {
@@ -141,7 +145,7 @@ fn eval_stmt(
 }
 
 fn eval_for(
-    var: &str,
+    _var: &str,
     iter_expr: &str,
     template: &str,
     after_pos: usize,
@@ -161,90 +165,20 @@ fn eval_for(
         0
     };
 
-    for idx in 0..iter_count {
+    // Render the body once per message through the full evaluator with a
+    // single-message context (`message[...]` reads the last message), so
+    // nested ifs/interpolations inside the loop work instead of leaking as
+    // literal text.
+    for msg in ctx.messages.iter().take(iter_count) {
         let loop_ctx = TemplateContext {
-            messages: ctx.messages.clone(),
+            messages: vec![msg.clone()],
             bos_token: ctx.bos_token.clone(),
             eos_token: ctx.eos_token.clone(),
             add_generation_prompt: ctx.add_generation_prompt,
             thinking: ctx.thinking,
+            enable_thinking: ctx.enable_thinking,
         };
-        let _ = (var, idx);
-        let mut pos = 0;
-        let body_bytes = body.as_bytes();
-        while pos < body_bytes.len() {
-            if pos + 1 < body_bytes.len() && &body_bytes[pos..pos + 2] == b"{{" {
-                if let Some(end) = find_close(&body[pos..], "}}") {
-                    let expr = body[pos + 2..pos + end].trim();
-                    if expr == "message['role']" || expr == "message[\"role\"]" {
-                        out.push_str(&loop_ctx.messages[idx].role);
-                    } else if expr == "message['content']" || expr == "message[\"content\"]" {
-                        out.push_str(&loop_ctx.messages[idx].content);
-                    } else if expr == "bos_token" {
-                        out.push_str(&loop_ctx.bos_token);
-                    } else if expr == "eos_token" {
-                        out.push_str(&loop_ctx.eos_token);
-                    } else if expr == "loop.index" {
-                        out.push_str(&format!("{}", idx + 1));
-                    }
-                    pos += end + 2;
-                    continue;
-                }
-            }
-            if pos + 1 < body_bytes.len() && &body_bytes[pos..pos + 2] == b"{%" {
-                if let Some(end) = find_close(&body[pos..], "%}") {
-                    let stmt = body[pos + 2..pos + end].trim();
-                    if stmt.starts_with("if ") {
-                        let cond = stmt.strip_prefix("if ").unwrap_or("").trim_end_matches(':');
-                        let cond_result = eval_cond(cond, &loop_ctx.messages[idx]);
-                        let if_body_end = find_if_end_simple(body, pos + end + 2);
-                        let if_body = &body[pos + end + 2..if_body_end];
-                        if cond_result {
-                            let mut ip = 0;
-                            let ib = if_body.as_bytes();
-                            while ip < ib.len() {
-                                if ip + 1 < ib.len() && &ib[ip..ip + 2] == b"{{" {
-                                    if let Some(e) = find_close(&if_body[ip..], "}}") {
-                                        let expr = if_body[ip + 2..ip + e].trim();
-                                        if expr == "message['role']" || expr == "message[\"role\"]"
-                                        {
-                                            out.push_str(&loop_ctx.messages[idx].role);
-                                        } else if expr == "message['content']"
-                                            || expr == "message[\"content\"]"
-                                        {
-                                            out.push_str(&loop_ctx.messages[idx].content);
-                                        } else if expr == "bos_token" {
-                                            out.push_str(&loop_ctx.bos_token);
-                                        } else if expr == "eos_token" {
-                                            out.push_str(&loop_ctx.eos_token);
-                                        }
-                                        ip += e + 2;
-                                        continue;
-                                    }
-                                }
-                                out.push(ib[ip] as char);
-                                ip += 1;
-                            }
-                        }
-                        pos = if_body_end;
-                        if pos < body_bytes.len() && body[pos..].starts_with("{% endif %}") {
-                            pos += "{% endif %}".len();
-                        }
-                        continue;
-                    }
-                    pos += end + 2;
-                    continue;
-                }
-            }
-            if pos + 1 < body_bytes.len() && &body_bytes[pos..pos + 2] == b"{#" {
-                if let Some(end) = find_close(&body[pos..], "#}") {
-                    pos += end + 2;
-                    continue;
-                }
-            }
-            out.push(body_bytes[pos] as char);
-            pos += 1;
-        }
+        out.push_str(&eval_jinja2(body, &loop_ctx));
     }
 
     end_pos + "{% endfor %}".len()
@@ -257,32 +191,73 @@ fn eval_if(
     ctx: &TemplateContext,
     out: &mut String,
 ) -> usize {
-    let cond_result = eval_cond_global(cond, ctx);
-
-    let else_pos = template[after_pos..].find("{% else %}");
-    let endif_pos = template[after_pos..].find("{% endif %}");
-
-    let (if_end, body_end) = match (else_pos, endif_pos) {
-        (Some(ep), Some(eip)) if ep < eip => {
-            (after_pos + ep, after_pos + eip + "{% endif %}".len())
-        }
-        (None, Some(eip)) => (after_pos + eip, after_pos + eip + "{% endif %}".len()),
-        _ => return after_pos,
+    // Split the if/elif/else/endif chain honoring nested conditionals, then
+    // render the winning branch through the full evaluator so nested `{{ }}`
+    // and `{% %}` constructs work instead of leaking as literal text.
+    let Some((branches, body_end)) = parse_if_branches(cond, template, after_pos) else {
+        return after_pos;
     };
-
-    if cond_result {
-        let body = &template[after_pos..if_end];
-        out.push_str(body);
-    } else if let Some(ep) = else_pos {
-        if let Some(eip) = endif_pos {
-            if ep < eip {
-                let else_body = &template[after_pos + ep + "{% else %}".len()..after_pos + eip];
-                out.push_str(else_body);
-            }
+    for (branch_cond, range) in &branches {
+        let take = match branch_cond {
+            Some(c) => eval_cond_global(c, ctx),
+            None => true, // {% else %}
+        };
+        if take {
+            out.push_str(&eval_jinja2(&template[range.0..range.1], ctx));
+            break;
         }
     }
-
     body_end
+}
+
+/// One branch of an `{% if %}` chain: its condition (`None` for `{% else %}`)
+/// and the body's byte range in the template.
+type IfBranch = (Option<String>, (usize, usize));
+
+/// Splits an `{% if %}…{% endif %}` chain into branches, tracking nesting so
+/// inner if/endif pairs don't terminate the outer block. Returns one branch
+/// pair per branch plus the position just past the matching `{% endif %}`.
+fn parse_if_branches(
+    first_cond: &str,
+    template: &str,
+    after_pos: usize,
+) -> Option<(Vec<IfBranch>, usize)> {
+    let bytes = template.as_bytes();
+    let mut depth = 1usize;
+    let mut pos = after_pos;
+    let mut branch_start = after_pos;
+    let mut current_cond = Some(first_cond.trim().to_string());
+    let mut branches: Vec<(Option<String>, (usize, usize))> = Vec::new();
+
+    while pos < bytes.len() {
+        if pos + 1 < bytes.len() && &bytes[pos..pos + 2] == b"{%" {
+            if let Some(end) = find_close(&template[pos..], "%}") {
+                let stmt = template[pos + 2..pos + end].trim();
+                if stmt.starts_with("if ") {
+                    depth += 1;
+                } else if stmt == "endif" {
+                    depth -= 1;
+                    if depth == 0 {
+                        branches.push((current_cond.take(), (branch_start, pos)));
+                        return Some((branches, pos + end + 2));
+                    }
+                } else if depth == 1 && stmt == "else" {
+                    branches.push((current_cond.take(), (branch_start, pos)));
+                    current_cond = None;
+                    branch_start = pos + end + 2;
+                } else if depth == 1 && stmt.starts_with("elif ") {
+                    branches.push((current_cond.take(), (branch_start, pos)));
+                    current_cond =
+                        Some(stmt.strip_prefix("elif ").unwrap_or("").trim().to_string());
+                    branch_start = pos + end + 2;
+                }
+                pos += end + 2;
+                continue;
+            }
+        }
+        pos += 1;
+    }
+    None
 }
 
 fn eval_cond(cond: &str, msg: &ChatMessage) -> bool {
@@ -313,8 +288,16 @@ fn eval_cond(cond: &str, msg: &ChatMessage) -> bool {
 
 fn eval_cond_global(cond: &str, ctx: &TemplateContext) -> bool {
     let cond = cond.trim();
+    // Message-relative conditions (used inside `{% for message in messages %}`
+    // loops, where the context holds exactly one message).
+    if cond.contains("message['") || cond.contains("message[\"") {
+        return ctx.messages.last().is_some_and(|msg| eval_cond(cond, msg));
+    }
     if cond == "add_generation_prompt" {
         return ctx.add_generation_prompt;
+    }
+    if cond == "enable_thinking" {
+        return ctx.enable_thinking;
     }
     if cond == "true" {
         return true;
@@ -399,30 +382,6 @@ fn find_end_block(template: &str, start: usize) -> Option<usize> {
     None
 }
 
-fn find_if_end_simple(body: &str, start: usize) -> usize {
-    let mut depth = 1;
-    let mut pos = start;
-    while pos < body.len() {
-        if pos + 1 < body.len() && &body.as_bytes()[pos..pos + 2] == b"{%" {
-            if let Some(end) = find_close(&body[pos..], "%}") {
-                let stmt = body[pos + 2..pos + end].trim();
-                if stmt.starts_with("if ") {
-                    depth += 1;
-                } else if stmt == "endif" {
-                    depth -= 1;
-                    if depth == 0 {
-                        return pos;
-                    }
-                }
-                pos += end + 2;
-                continue;
-            }
-        }
-        pos += 1;
-    }
-    body.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +394,7 @@ mod tests {
             eos_token: "</s>".to_string(),
             add_generation_prompt: true,
             thinking: false,
+            enable_thinking: true,
         };
         let result = eval_jinja2("{{ bos_token }}hello{{ eos_token }}", &ctx);
         assert_eq!(result, "<s>hello</s>");
@@ -457,6 +417,7 @@ mod tests {
             eos_token: "</s>".to_string(),
             add_generation_prompt: true,
             thinking: false,
+            enable_thinking: true,
         };
         let template = "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}";
         let result = eval_jinja2(template, &ctx);
@@ -475,6 +436,7 @@ mod tests {
             eos_token: "".to_string(),
             add_generation_prompt: true,
             thinking: false,
+            enable_thinking: true,
         };
         let template = "{% if add_generation_prompt %}GEN{% endif %}";
         let result = eval_jinja2(template, &ctx);

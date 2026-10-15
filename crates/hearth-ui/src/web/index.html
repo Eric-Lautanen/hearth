@@ -1,0 +1,1322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hearth Chat</title>
+<style>
+  :root {
+    --bg: #0a0d13;
+    --bg2: #0d1118;
+    --panel: #12161f;
+    --panel2: #171c28;
+    --border: #1d2330;
+    --border2: #2a3140;
+    --text: #e8ecf3;
+    --muted: #9aa3b5;
+    --faint: #5f6779;
+    --accent: #ff6a3d;
+    --accent2: #ff3d71;
+    --accent-soft: rgba(255, 106, 61, 0.14);
+    --user-bubble: #1c2433;
+    --ok: #34d399;
+    --err: #f87171;
+    --radius: 14px;
+    --mono: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    margin: 0;
+    background:
+      radial-gradient(1200px 500px at 70% -10%, rgba(255, 106, 61, 0.07), transparent 60%),
+      radial-gradient(900px 400px at 10% 110%, rgba(255, 61, 113, 0.05), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font: 15px/1.55 -apple-system, "Segoe UI", system-ui, Roboto, Helvetica, Arial, sans-serif;
+  }
+  body { display: flex; flex-direction: column; overflow: hidden; }
+
+  /* ---------- Header ---------- */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 20px;
+    background: rgba(13, 17, 24, 0.85);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+    z-index: 10;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: 0.2px;
+    white-space: nowrap;
+  }
+  .brand .flame {
+    width: 30px; height: 30px;
+    display: grid; place-items: center;
+    border-radius: 9px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    box-shadow: 0 2px 14px rgba(255, 106, 61, 0.35);
+    font-size: 16px;
+  }
+  .model-zone {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .select-wrap {
+    position: relative;
+    flex: 0 1 460px;
+    min-width: 180px;
+  }
+  select#modelSelect {
+    width: 100%;
+    appearance: none;
+    -webkit-appearance: none;
+    background: var(--panel2);
+    color: var(--text);
+    border: 1px solid var(--border2);
+    border-radius: 10px;
+    padding: 9px 38px 9px 14px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: border-color .15s, box-shadow .15s;
+    text-overflow: ellipsis;
+  }
+  select#modelSelect:hover:not(:disabled) { border-color: var(--accent); }
+  select#modelSelect:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  select#modelSelect:disabled { opacity: 0.55; cursor: not-allowed; }
+  .select-wrap::after {
+    content: "▾";
+    position: absolute;
+    right: 14px; top: 50%;
+    transform: translateY(-50%);
+    color: var(--muted);
+    pointer-events: none;
+    font-size: 12px;
+  }
+  .icon-btn {
+    background: var(--panel2);
+    border: 1px solid var(--border2);
+    color: var(--muted);
+    width: 36px; height: 36px;
+    border-radius: 10px;
+    cursor: pointer;
+    font-size: 15px;
+    display: grid; place-items: center;
+    transition: color .15s, border-color .15s, transform .1s;
+    flex: 0 0 auto;
+  }
+  .icon-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+  .icon-btn:active:not(:disabled) { transform: scale(0.94); }
+  .icon-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .spin { animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: var(--panel2);
+    border: 1px solid var(--border2);
+    font-size: 12.5px;
+    color: var(--muted);
+    white-space: nowrap;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px rgba(52, 211, 153, 0.7); }
+  .dot.busy { background: var(--accent); box-shadow: 0 0 8px rgba(255, 106, 61, 0.7); animation: pulse 1.2s ease infinite; }
+  .dot.err { background: var(--err); }
+  @keyframes pulse { 50% { opacity: 0.4; } }
+
+  /* ---------- Chat scroll area ---------- */
+  main {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+  }
+  .chat-col {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 28px 20px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .row { display: flex; gap: 12px; align-items: flex-start; }
+  .row.user { flex-direction: row-reverse; }
+  .avatar {
+    width: 34px; height: 34px;
+    border-radius: 10px;
+    display: grid; place-items: center;
+    font-size: 15px;
+    flex: 0 0 auto;
+    margin-top: 2px;
+  }
+  .row.user .avatar { background: #232d40; border: 1px solid #324060; }
+  .row.ai .avatar { background: linear-gradient(135deg, var(--accent), var(--accent2)); box-shadow: 0 2px 10px rgba(255, 106, 61, 0.3); }
+  .bubble {
+    max-width: 76%;
+    padding: 12px 16px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--panel);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    min-width: 0;
+  }
+  .row.user .bubble {
+    background: var(--user-bubble);
+    border-color: #2c3850;
+  }
+  .row.ai .bubble { border-top-left-radius: 4px; }
+  .row.user .bubble { border-top-right-radius: 4px; }
+  .meta {
+    font-size: 11.5px;
+    color: var(--faint);
+    margin-top: 6px;
+    display: flex;
+    gap: 10px;
+  }
+  /* Reasoning drawer: collapsible <think> stream above the answer */
+  .think {
+    border: 1px solid var(--border2);
+    border-left: 3px solid #7c6a3f;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.03);
+    margin-bottom: 10px;
+    overflow: hidden;
+  }
+  .think-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 10px;
+    background: none;
+    border: none;
+    color: #c9a96a;
+    font: 600 12px/1.3 var(--mono);
+    cursor: pointer;
+    text-align: left;
+  }
+  .think-header:hover { background: rgba(255, 255, 255, 0.04); }
+  .think-header .chev {
+    display: inline-block;
+    transition: transform .15s;
+    font-size: 10px;
+    color: var(--faint);
+  }
+  .think.open .think-header .chev { transform: rotate(90deg); }
+  .think-header .think-spin {
+    width: 10px; height: 10px;
+    border: 2px solid #7c6a3f;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+    flex: 0 0 auto;
+  }
+  .think-body {
+    display: none;
+    padding: 2px 12px 10px;
+    color: #b7ac93;
+    font-size: 13px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    max-height: 320px;
+    overflow-y: auto;
+  }
+  .think.open .think-body { display: block; }
+  .cursor {
+    display: inline-block;
+    width: 8px; height: 17px;
+    background: var(--accent);
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    animation: blink 0.9s steps(1) infinite;
+    border-radius: 2px;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* ---------- Welcome hero ---------- */
+  .hero {
+    text-align: center;
+    padding: 9vh 16px 30px;
+    color: var(--muted);
+  }
+  .hero .big {
+    font-size: 34px;
+    font-weight: 800;
+    color: var(--text);
+    letter-spacing: 0.3px;
+    margin-bottom: 6px;
+  }
+  .hero .big .flame-big { color: var(--accent); }
+  .hero .sub { font-size: 15px; }
+  .hero .warn { color: var(--err); margin-top: 14px; font-size: 13.5px; }
+  .hero .dir { font-family: var(--mono); font-size: 12px; color: var(--faint); margin-top: 4px; }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: center;
+    margin-top: 26px;
+  }
+  .chip {
+    border: 1px solid var(--border2);
+    background: var(--panel);
+    color: var(--muted);
+    border-radius: 999px;
+    padding: 8px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .chip:hover { color: var(--text); border-color: var(--accent); background: var(--accent-soft); }
+
+  /* ---------- Composer ---------- */
+  .composer-zone {
+    flex: 0 0 auto;
+    padding: 10px 20px 16px;
+    background: linear-gradient(transparent, var(--bg) 30%);
+  }
+  .composer {
+    max-width: 820px;
+    margin: 0 auto;
+    background: var(--panel2);
+    border: 1px solid var(--border2);
+    border-radius: 18px;
+    padding: 10px 12px;
+    display: flex;
+    align-items: flex-end;
+    gap: 10px;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  textarea#input {
+    flex: 1 1 auto;
+    background: transparent;
+    border: none;
+    resize: none;
+    color: var(--text);
+    font: inherit;
+    outline: none;
+    max-height: 180px;
+    min-height: 24px;
+    padding: 6px 4px;
+  }
+  textarea#input::placeholder { color: var(--faint); }
+  .send-btn {
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    border: none;
+    color: #fff;
+    width: 40px; height: 40px;
+    border-radius: 12px;
+    cursor: pointer;
+    display: grid; place-items: center;
+    flex: 0 0 auto;
+    box-shadow: 0 2px 12px rgba(255, 106, 61, 0.35);
+    transition: filter .15s, transform .1s, opacity .15s;
+  }
+  .send-btn:hover:not(:disabled) { filter: brightness(1.12); }
+  .send-btn:active:not(:disabled) { transform: scale(0.93); }
+  .send-btn:disabled { opacity: 0.35; cursor: not-allowed; box-shadow: none; }
+  .send-btn.stop { background: #3a1d24; box-shadow: none; border: 1px solid #6b2733; }
+  .send-btn.stop .stop-bars { width: 12px; height: 12px; background: var(--err); border-radius: 3px; }
+  .composer-foot {
+    max-width: 820px;
+    margin: 8px auto 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    color: var(--faint);
+    padding: 0 6px;
+  }
+  .foot-left { display: flex; gap: 14px; align-items: center; min-width: 0; }
+  .link-btn {
+    background: none;
+    border: none;
+    color: var(--faint);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 4px 6px;
+    border-radius: 7px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: color .15s, background .15s;
+    white-space: nowrap;
+  }
+  .link-btn:hover:not(:disabled) { color: var(--text); background: var(--panel2); }
+  .link-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .link-btn.danger:hover:not(:disabled) { color: var(--err); }
+
+  /* ---------- Settings drawer ---------- */
+  .drawer {
+    position: fixed;
+    top: 0; right: 0;
+    height: 100%;
+    width: 340px;
+    max-width: 92vw;
+    background: var(--panel);
+    border-left: 1px solid var(--border2);
+    box-shadow: -18px 0 50px rgba(0, 0, 0, 0.5);
+    transform: translateX(105%);
+    transition: transform .25s ease;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+  }
+  .drawer.open { transform: translateX(0); }
+  .drawer-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 18px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 700;
+  }
+  .drawer-body { padding: 8px 18px 20px; overflow-y: auto; }
+  .field { margin: 16px 0; }
+  .field label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+  .field label b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  input[type="range"] {
+    width: 100%;
+    appearance: none;
+    -webkit-appearance: none;
+    height: 5px;
+    border-radius: 3px;
+    background: var(--border2);
+    outline: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    border: 2px solid #fff2;
+  }
+  .check-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 16px 0;
+    font-size: 13.5px;
+    color: var(--muted);
+  }
+  .toggle { position: relative; width: 40px; height: 22px; flex: 0 0 auto; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle .track {
+    position: absolute; inset: 0;
+    background: var(--border2);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  .toggle .track::after {
+    content: "";
+    position: absolute;
+    top: 3px; left: 3px;
+    width: 16px; height: 16px;
+    background: #cbd2e1;
+    border-radius: 50%;
+    transition: transform .15s;
+  }
+  .toggle input:checked + .track { background: var(--accent); }
+  .toggle input:checked + .track::after { transform: translateX(18px); background: #fff; }
+  select.mini, input.mini, textarea.mini {
+    width: 100%;
+    background: var(--panel2);
+    color: var(--text);
+    border: 1px solid var(--border2);
+    border-radius: 9px;
+    padding: 8px 12px;
+    font-size: 13.5px;
+    outline: none;
+  }
+  .reset-row { display: flex; justify-content: flex-end; margin: -6px 0 2px; }
+  .field.hidden { display: none; }
+  .drawer-note { font-size: 12px; color: var(--faint); margin-top: 10px; }
+
+  /* ---------- Toast ---------- */
+  #toast {
+    position: fixed;
+    left: 50%;
+    bottom: 110px;
+    transform: translateX(-50%) translateY(20px);
+    background: #2a1520;
+    color: #ffb4c0;
+    border: 1px solid #6b2733;
+    padding: 10px 18px;
+    border-radius: 12px;
+    font-size: 13.5px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .2s, transform .2s;
+    z-index: 100;
+    max-width: 80vw;
+    text-align: center;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #toast.info { background: var(--panel2); color: var(--text); border-color: var(--border2); }
+
+  ::-webkit-scrollbar { width: 10px; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 5px; border: 2px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background: #3a4356; }
+
+  @media (max-width: 640px) {
+    .status-pill .label { display: none; }
+    .bubble { max-width: 88%; }
+    .hero .big { font-size: 26px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand"><div class="flame">🔥</div><span>Hearth</span></div>
+  <div class="model-zone">
+    <div class="select-wrap">
+      <select id="modelSelect" disabled>
+        <option>Loading models…</option>
+      </select>
+    </div>
+    <button class="icon-btn" id="refreshBtn" title="Refresh model list" disabled>⟳</button>
+    <button class="icon-btn" id="reloadBtn" title="Reload current model" disabled>⟲</button>
+    <button class="icon-btn" id="ejectBtn" title="Unload model" disabled>⏏</button>
+  </div>
+  <div class="status-pill" id="statusPill" title="">
+    <span class="dot" id="statusDot"></span><span class="label" id="statusText">Starting…</span>
+  </div>
+  <button class="icon-btn" id="settingsBtn" title="Settings">⚙</button>
+</header>
+
+<main id="scroller">
+  <div class="chat-col" id="chatCol"></div>
+</main>
+
+<div class="composer-zone">
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="Message Hearth…"></textarea>
+    <button class="send-btn" id="sendBtn" title="Send (Enter)" disabled>
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
+    </button>
+  </div>
+  <div class="composer-foot">
+    <div class="foot-left">
+      <button class="link-btn danger" id="clearBtn" title="Clear messages and model context" disabled>🧹 Clear chat</button>
+    </div>
+    <div id="stats"></div>
+  </div>
+</div>
+
+<!-- Settings drawer -->
+<div class="drawer" id="drawer">
+  <div class="drawer-head">
+    <span>Generation settings</span>
+    <button class="icon-btn" id="closeDrawer" title="Close">✕</button>
+  </div>
+  <div class="drawer-body">
+    <div class="field">
+      <label>System prompt</label>
+      <textarea id="systemPrompt" class="mini" rows="3" style="resize:vertical">You are a helpful assistant.</textarea>
+    </div>
+    <div class="field">
+      <label>Temperature <b id="tempVal">0.70</b></label>
+      <input type="range" id="temp" min="0" max="2" step="0.05" value="0.7">
+    </div>
+    <div class="field">
+      <label>Top-K <b id="topkVal">40</b></label>
+      <input type="range" id="topk" min="1" max="100" step="1" value="40">
+    </div>
+    <div class="field">
+      <label>Top-P <b id="toppVal">0.90</b></label>
+      <input type="range" id="topp" min="0" max="1" step="0.01" value="0.9">
+    </div>
+    <div class="field">
+      <label>Min-P <b id="minpVal">0.00</b></label>
+      <input type="range" id="minp" min="0" max="1" step="0.01" value="0">
+    </div>
+    <div class="field">
+      <label>Typical-P <b id="typpVal">0.00</b></label>
+      <input type="range" id="typp" min="0" max="1" step="0.01" value="0">
+    </div>
+    <div class="field">
+      <label>Repeat penalty <b id="reppenVal">1.10</b></label>
+      <input type="range" id="reppen" min="1" max="2" step="0.01" value="1.1">
+    </div>
+    <div class="field">
+      <label>Seed <b id="seedVal">0 (random)</b></label>
+      <input type="number" id="seed" class="mini" min="0" step="1" value="0">
+    </div>
+    <div class="field">
+      <label>Max reply tokens <b id="maxtokVal">512</b></label>
+      <input type="range" id="maxtok" min="16" max="4096" step="16" value="512">
+    </div>
+    <div class="field">
+      <label>Context window <b id="ctxVal">8192</b></label>
+      <input type="range" id="ctx" min="256" max="32768" step="256" value="8192">
+    </div>
+    <div class="check-row">
+      <span>Show &lt;think&gt; reasoning</span>
+      <label class="toggle"><input type="checkbox" id="showThink"><span class="track"></span></label>
+    </div>
+    <div class="drawer-note" style="margin-top:-8px">
+      When on, the model reasons first and its &lt;think&gt; stream appears in a
+      collapsible panel above the answer. When off, it is asked to answer
+      directly; if a model still reasons, only its answer is shown.
+    </div>
+    <div class="field">
+      <label>Device</label>
+      <select id="device" class="mini">
+        <option value="cpu" selected>CPU only (fastest here)</option>
+        <option value="gpu">GPU — all layers</option>
+        <option value="gpu_split">GPU + CPU split</option>
+        <option value="offload">CPU offload</option>
+      </select>
+    </div>
+    <div class="field hidden" id="gpuLayersField">
+      <label>GPU layers <b id="gpuLayersVal">8</b></label>
+      <input type="range" id="gpuLayers" min="1" max="64" step="1" value="8">
+    </div>
+    <div class="check-row">
+      <span>Pin weights in RAM</span>
+      <label class="toggle"><input type="checkbox" id="pinWeights"><span class="track"></span></label>
+    </div>
+    <div class="reset-row">
+      <button class="link-btn" id="resetDefaults" title="Reload the loaded model's recommended sampling settings">↺ Reset to model defaults</button>
+    </div>
+    <div class="drawer-note" id="modelNote">No model loaded.</div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+const S = {
+  models: [],
+  modelsDir: "",
+  selectedPath: null,
+  loaded: null,          // LoadedModel info object or null
+  loading: false,
+  generating: false,
+  stopping: false,
+  history: [],           // [{role:'user'|'assistant', text, think?, stats?}]
+  streaming: "",         // assistant text currently streaming
+  streamingReason: "",   // reasoning text currently streaming (show_think on)
+  evtSource: null,
+  genStart: 0,
+  genTokens: 0,          // live streamed-fragment count while generating
+  liveTimer: null,
+};
+
+const $ = (id) => document.getElementById(id);
+const scroller = $("scroller"), chatCol = $("chatCol"), input = $("input"),
+      sendBtn = $("sendBtn"), clearBtn = $("clearBtn"), statsEl = $("stats"),
+      modelSelect = $("modelSelect"), refreshBtn = $("refreshBtn"),
+      reloadBtn = $("reloadBtn"),
+      ejectBtn = $("ejectBtn"), statusDot = $("statusDot"),
+      statusText = $("statusText"), statusPill = $("statusPill");
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function esc(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+let toastTimer = null;
+function toast(msg, kind) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "show " + (kind || "info");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ""; }, 3500);
+}
+
+function fmtBytes(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + " GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(0) + " MB";
+  return (n / 1e3).toFixed(0) + " KB";
+}
+
+// Clamp the context slider to the loaded model's real KV-cache limit so the
+// control never promises more than the engine will allocate.
+function syncCtxSlider() {
+  const slider = $("ctx");
+  const cap = S.loaded && S.loaded.max_seq_len > 0
+    ? S.loaded.max_seq_len
+    : 32768;
+  slider.max = String(cap);
+  if (parseInt(slider.value, 10) > cap) {
+    slider.value = String(cap);
+  }
+  $("ctxVal").textContent = slider.value;
+}
+
+function setRangeValue(id, outId, v, fmt) {
+  const el = $(id);
+  if (!el || v === undefined || v === null || Number.isNaN(Number(v))) return;
+  const lo = Number(el.min), hi = Number(el.max);
+  const n = Math.min(hi, Math.max(lo, Number(v)));
+  el.value = String(n);
+  if (outId) $(outId).textContent = fmt ? fmt(n) : String(n);
+}
+
+// Seed every generation control from the loaded model's own recommendations
+// (`general.sampling.*` and `context_length`). Nothing about inference is
+// hardcoded here: switching models re-seeds the panel from that model's GGUF.
+function applyModelDefaults(m) {
+  if (!m) return;
+  const ctx = $("ctx");
+  const cap = m.max_seq_len > 0 ? m.max_seq_len : 8192;
+  ctx.max = String(cap);
+  setRangeValue("ctx", "ctxVal", cap);
+  setRangeValue("temp", "tempVal", m.sampling_temperature, v => v.toFixed(2));
+  setRangeValue("topk", "topkVal", m.sampling_top_k);
+  setRangeValue("topp", "toppVal", m.sampling_top_p, v => v.toFixed(2));
+  setRangeValue("minp", "minpVal", m.sampling_min_p, v => v.toFixed(2));
+  setRangeValue("reppen", "reppenVal", m.sampling_repeat_pen, v => v.toFixed(2));
+  $("seed").value = "0";
+  $("seedVal").textContent = "0 (random)";
+  $("gpuLayers").max = String(Math.max(1, m.n_layers || 64));
+  // The context window is allocated at load as a f32 KV cache, so show what it
+  // costs in RAM: on a memory-tight machine this is the number that decides
+  // whether a big model is chattable at all.
+  const kv = m.kv_bytes ? " · KV cache " + fmtBytes(m.kv_bytes) + " f32" : "";
+  $("modelNote").textContent =
+    m.name + " — " + m.arch + ", " + m.n_layers + " layers, d=" + m.d_model +
+    ", ctx " + m.max_seq_len + ", vocab " + m.vocab_size + " (" + (m.template || "?") + ")" +
+    (m.sampling_from_model ? " · sampling: model defaults" : " · sampling: built-in defaults") + kv;
+}
+
+function fmtBytes(n) {
+  if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(1) + " GiB";
+  return Math.round(n / (1024 * 1024)) + " MiB";
+}
+
+function loadPayload(path) {
+  const device = $("device").value;
+  const body = { path, device };
+  if (device === "gpu_split") body.gpu_layers = parseInt($("gpuLayers").value, 10);
+  if ($("pinWeights").checked) body.pin_weights = true;
+  return body;
+}
+
+function startLiveStats() {
+  stopLiveStats();
+  S.genStart = Date.now();
+  S.genTokens = 0;
+  S.liveTimer = setInterval(() => {
+    if (!S.generating) { stopLiveStats(); return; }
+    const secs = Math.max(0.001, (Date.now() - S.genStart) / 1000);
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    const rate = (S.genTokens / secs).toFixed(1);
+    // A 27B answers at ~1 tok/s, so the budget implies a wait — say it up front
+    // instead of letting the reply look stalled.
+    let eta = "";
+    const budget = parseInt($("maxtok").value, 10);
+    const perSec = S.genTokens / secs;
+    if (budget > S.genTokens && perSec > 0.001) {
+      const left = (budget - S.genTokens) / perSec;
+      if (left >= 60) eta = " · up to " + Math.round(left / 60) + " min for the full budget";
+    }
+    statsEl.textContent = "streaming · " + S.genTokens + " tok · " +
+      m + ":" + String(s).padStart(2, "0") + " · " + rate + " tok/s (live)" + eta;
+  }, 500);
+}
+
+function stopLiveStats() {
+  if (S.liveTimer) { clearInterval(S.liveTimer); S.liveTimer = null; }
+}
+
+function setStatus(text, cls) {
+  statusText.textContent = text;
+  statusDot.className = "dot" + (cls ? " " + cls : "");
+  statusPill.title = text;
+}
+
+function updateButtons() {
+  const hasModel = !!S.loaded;
+  if (S.generating) {
+    sendBtn.disabled = false; // acts as Stop
+  } else {
+    sendBtn.disabled = S.loading || !hasModel || !input.value.trim();
+  }
+  sendBtn.classList.toggle("stop", S.generating);
+  sendBtn.title = S.generating ? "Stop generating" : "Send (Enter)";
+  sendBtn.innerHTML = S.generating
+    ? '<span class="stop-bars"></span>'
+    : '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>';
+  clearBtn.disabled = S.history.length === 0 && !S.streaming && !S.streamingReason;
+  modelSelect.disabled = S.loading || S.generating;
+  refreshBtn.disabled = S.loading || S.generating;
+  reloadBtn.disabled = !hasModel || S.loading || S.generating;
+  ejectBtn.disabled = !hasModel || S.loading || S.generating;
+}
+
+function scrollBottom(force) {
+  const nearBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 140;
+  if (force || nearBottom) scroller.scrollTop = scroller.scrollHeight;
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+function heroEl() {
+  const div = document.createElement("div");
+  div.className = "hero";
+  const noModels = S.models.length === 0;
+  div.innerHTML =
+    '<div class="big"><span class="flame-big">🔥</span> Hearth Chat</div>' +
+    '<div class="sub">' + (noModels
+      ? "Pick a model from the dropdown above to start chatting."
+      : "Pick a model from the dropdown above — it loads automatically.") + '</div>' +
+    (noModels
+      ? '<div class="warn">No .gguf models found' +
+        (S.modelsDir ? ' in <span class="dir">' + esc(S.modelsDir) + '</span>' : "") + '.</div>'
+      : "") +
+    (S.models.length
+      ? '<div class="chips">' + S.models.map(m =>
+          '<button class="chip" data-path="' + esc(m.path) + '">' + esc(prettyName(m.name)) +
+          ' <span style="color:var(--faint)">· ' + fmtBytes(m.size_bytes) + '</span></button>').join("") + '</div>'
+      : "");
+  div.querySelectorAll(".chip").forEach(ch => {
+    ch.addEventListener("click", () => {
+      modelSelect.value = ch.dataset.path;
+      onModelSelected();
+    });
+  });
+  return div;
+}
+
+function prettyName(file) {
+  return file.replace(/\.gguf$/i, "").replace(/[-_]/g, " ");
+}
+
+// Build the collapsible reasoning drawer element for a completed message.
+function thinkDrawer(text, live) {
+  const box = document.createElement("div");
+  box.className = "think";
+  const head = document.createElement("button");
+  head.className = "think-header";
+  const label = live
+    ? 'Thinking <span class="think-spin"></span>'
+    : "Thought for a moment";
+  head.innerHTML =
+    '<span class="chev">\u25B6</span> ' + label +
+    ' <span style="color:var(--faint);font-weight:400">\u00B7 click to ' +
+    (live ? "view" : "expand/collapse") + "</span>";
+  const body = document.createElement("div");
+  body.className = "think-body";
+  body.textContent = text;
+  head.addEventListener("click", () => box.classList.toggle("open"));
+  box.appendChild(head);
+  box.appendChild(body);
+  return box;
+}
+
+function renderChat() {
+  chatCol.innerHTML = "";
+  if (S.history.length === 0 && !S.streaming) {
+    chatCol.appendChild(heroEl());
+    updateButtons();
+    return;
+  }
+  for (const m of S.history) {
+    const row = document.createElement("div");
+    row.className = "row " + (m.role === "user" ? "user" : "ai");
+    const av = document.createElement("div");
+    av.className = "avatar";
+    av.textContent = m.role === "user" ? "🧑" : "🔥";
+    const bub = document.createElement("div");
+    bub.className = "bubble";
+    if (m.role === "assistant" && m.think) {
+      bub.appendChild(thinkDrawer(m.think, false));
+    }
+    const txt = document.createElement("div");
+    txt.textContent = m.text;
+    bub.appendChild(txt);
+    row.appendChild(av); row.appendChild(bub);
+    if (m.role === "assistant" && m.stats) {
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = m.stats;
+      bub.appendChild(meta);
+    }
+    chatCol.appendChild(row);
+  }
+  if ((S.streaming.length > 0 || S.streamingReason.length > 0) ||
+      (S.streaming !== null && S.generating)) {
+    const row = document.createElement("div");
+    row.className = "row ai";
+    const av = document.createElement("div");
+    av.className = "avatar"; av.textContent = "🔥";
+    const bub = document.createElement("div");
+    bub.className = "bubble";
+    if (S.streamingReason.length > 0) {
+      const drawer = thinkDrawer(S.streamingReason, S.generating);
+      if (S.generating && S.streaming.length === 0) {
+        // Auto-open while the model is still reasoning, so the thinking
+        // stream is visible; collapse once the answer starts.
+        drawer.classList.add("open");
+      }
+      bub.appendChild(drawer);
+    }
+    if (S.streaming.length > 0 || S.streamingReason.length === 0) {
+      const txt = document.createElement("div");
+      txt.textContent = S.streaming;
+      bub.appendChild(txt);
+      if (S.generating) {
+        const cur = document.createElement("span");
+        cur.className = "cursor";
+        txt.appendChild(cur);
+      }
+    }
+    row.appendChild(av); row.appendChild(bub);
+    chatCol.appendChild(row);
+  }
+  scrollBottom(false);
+  updateButtons();
+}
+
+// ---------------------------------------------------------------------------
+// Model dropdown + lifecycle
+// ---------------------------------------------------------------------------
+
+async function refreshModels() {
+  try {
+    const r = await fetch("/api/models");
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || "failed");
+    S.models = j.models || [];
+    S.modelsDir = j.dir || "";
+    renderModelOptions();
+    renderChat();
+  } catch (e) {
+    setStatus("Model list failed", "err");
+    toast("Could not list models: " + e.message, "err");
+  }
+}
+
+function renderModelOptions() {
+  modelSelect.innerHTML = "";
+  if (S.models.length === 0) {
+    const o = document.createElement("option");
+    o.textContent = "No models found";
+    o.disabled = true; o.selected = true;
+    modelSelect.appendChild(o);
+    return;
+  }
+  const ph = document.createElement("option");
+  ph.textContent = "Select a model…";
+  ph.disabled = true; ph.value = "";
+  ph.selected = !S.selectedPath;
+  modelSelect.appendChild(ph);
+  for (const m of S.models) {
+    const o = document.createElement("option");
+    o.value = m.path;
+    o.textContent = prettyName(m.name) + "  ·  " + fmtBytes(m.size_bytes);
+    if (m.path === S.selectedPath) o.selected = true;
+    modelSelect.appendChild(o);
+  }
+}
+
+async function onModelSelected() {
+  const path = modelSelect.value;
+  if (!path || path === S.selectedPath && S.loaded) return;
+  S.selectedPath = path;
+  await loadModel(path, /*auto*/ true);
+}
+
+async function loadModel(path, auto) {
+  if (S.generating) { toast("Stop generation before switching models", "err"); return; }
+  S.loading = true;
+  setStatus((auto ? "Auto-loading " : "Loading ") + prettyName(path.split(/[\\/]/).pop() || "") + "…", "busy");
+  refreshBtn.classList.add("spin");
+  updateButtons();
+  renderChat();
+  try {
+    const r = await fetch("/api/load", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(loadPayload(path)),
+    });
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || "load failed");
+    S.loaded = j.model || { name: path, arch: "?" };
+    S.history = [];
+    S.streaming = "";
+    // Re-seed the whole generation panel from this model's own metadata.
+    applyModelDefaults(S.loaded);
+    setStatus(S.loaded.name + " · " + S.loaded.arch, "on");
+    toast("Model loaded: " + S.loaded.name, "info");
+    input.focus();
+  } catch (e) {
+    S.loaded = null;
+    S.selectedPath = null;
+    setStatus("Load failed", "err");
+    toast("Load failed: " + e.message, "err");
+    renderModelOptions();
+  } finally {
+    S.loading = false;
+    refreshBtn.classList.remove("spin");
+    renderChat();
+  }
+}
+
+async function unloadModel() {
+  if (S.generating || S.loading) return;
+  try {
+    const r = await fetch("/api/unload", { method: "POST" });
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || "unload failed");
+    S.loaded = null;
+    setStatus("Model unloaded", "");
+    $("modelNote").textContent = "No model loaded.";
+    toast("Model unloaded", "info");
+    updateButtons();
+  } catch (e) {
+    toast("Unload failed: " + e.message, "err");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chat flow
+// ---------------------------------------------------------------------------
+
+function connectEvents() {
+  if (S.evtSource) S.evtSource.close();
+  const es = new EventSource("/api/events");
+  S.evtSource = es;
+  es.onmessage = (m) => {
+    let ev;
+    try { ev = JSON.parse(m.data); } catch { return; }
+    if (ev.type === "token") {
+      S.genTokens++;
+      S.streaming += ev.text;
+      renderChat();
+    } else if (ev.type === "reason") {
+      S.genTokens++;
+      S.streamingReason += ev.text;
+      renderChat();
+    } else if (ev.type === "done") {
+      finishStream(ev);
+    } else    if (ev.type === "error") {
+      stopLiveStats();
+      S.generating = false;
+      if (S.streaming || S.streamingReason) {
+        S.history.push({
+          role: "assistant",
+          text: (S.streaming || S.streamingReason) + "\n\n[error]",
+          think: S.streaming ? undefined : S.streamingReason,
+        });
+      }
+      S.streaming = "";
+      S.streamingReason = "";
+      setStatus("Error", "err");
+      toast(ev.error || "generation error", "err");
+      renderChat();
+    } else if (ev.type === "service_exited") {
+      S.generating = false;
+      S.loaded = null;
+      setStatus("Service exited", "err");
+      toast(ev.message || "The engine service exited", "err");
+      renderChat();
+    }
+  };
+  es.onerror = () => {
+    // The server closes the stream after each "done"; EventSource will try to
+    // reconnect automatically, which is what we want.
+  };
+}
+
+function finishStream(ev) {
+  if (ev.error) {
+    toast(ev.error, "err");
+  }
+  const secs = (ev.elapsed_ms / 1000).toFixed(1);
+  // `tokens` is what the model generated; the prompt is reported separately, so
+  // an empty reply is never disguised as a long one.
+  const gen = ev.tokens || 0;
+  const prompt = ev.prompt_tokens || 0;
+  const rt = ev.reason_tokens ? " · " + ev.reason_tokens + " think" : "";
+  const stats = gen + " new tok" + (prompt ? " · " + prompt + " prompt" : "") +
+    " · " + secs + " s · " +
+    (ev.tokens_per_s ? ev.tokens_per_s.toFixed(2) : "?") + " tok/s" + rt +
+    (ev.stopped ? " · stopped" : "");
+  const finalText = (ev.text || "").trim();
+  const finalReason = (ev.reason_text || "").trim();
+  // Slow models are the interesting case: name the real cost per prompt token
+  // instead of blaming the reply budget.
+  const perPromptTok = prompt > 0 ? (ev.elapsed_ms / 1000) / prompt : 0;
+  const slowness = perPromptTok >= 0.25
+    ? " This model took " + perPromptTok.toFixed(2) + " s per prompt token here."
+    : "";
+  if (finalText.length > 0 || finalReason.length > 0) {
+    const msg = { role: "assistant", text: finalText, stats };
+    if (finalReason) msg.think = finalReason;
+    S.history.push(msg);
+  } else if (ev.stopped) {
+    S.history.push({
+      role: "assistant",
+      text: "*[Stopped before any text arrived" + (prompt ? " — the " + prompt +
+        "-token prompt had been processing for " + secs + " s" : "") + "." +
+        slowness + " A slow model needs a bigger \"Max reply tokens\" budget and patience.]*",
+      stats,
+    });
+  } else if (gen > 0 && ev.reason_tokens > 0) {
+    // Reasoning arrived but no visible answer did (common when a model's own
+    // template opens <think> regardless of the toggle). Report the count from
+    // the engine rather than guessing from the token total.
+    S.history.push({
+      role: "assistant",
+      text: "*[The model reasoned for " + ev.reason_tokens + " token" +
+        (ev.reason_tokens === 1 ? "" : "s") + " but produced no visible answer." +
+        " Turn on \"Show <think> reasoning\" to read its reasoning, or raise \"Max reply tokens\".]*",
+      stats,
+    });
+  } else if (gen > 0) {
+    // Tokens arrived but none decoded to visible text (control/stop tokens, or
+    // reasoning the template never closed).
+    S.history.push({
+      role: "assistant",
+      text: "*[The model produced " + gen + " token" + (gen === 1 ? "" : "s") +
+        " that decoded to no visible text. Try a different model, or turn on \"Show <think> reasoning\".]*",
+      stats,
+    });
+  } else if (prompt > 0) {
+    // Zero generated tokens: the model stopped on its first step (or the window
+    // was full). Nothing to do with the reply budget.
+    S.history.push({
+      role: "assistant",
+      text: "*[The model stopped immediately without generating a token (" + prompt +
+        "-token prompt, " + secs + " s)." + slowness +
+        " Check the context window is at least the prompt size, or try another model.]*",
+      stats,
+    });
+  } else {
+    S.history.push({ role: "assistant", text: "[no output]", stats });
+  }
+  stopLiveStats();
+  S.streaming = "";
+  S.streamingReason = "";
+  S.generating = false;
+  setStatus(S.loaded ? S.loaded.name + " · " + S.loaded.arch : "Ready", "on");
+  statsEl.textContent = stats;
+  renderChat();
+  input.focus();
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text || S.generating || S.loading || !S.loaded) return;
+  input.value = "";
+  autosize();
+  S.history.push({ role: "user", text });
+  S.streaming = "";
+  S.streamingReason = "";
+  S.generating = true;
+  startLiveStats();
+  setStatus("Generating…", "busy");
+  updateButtons();
+  renderChat();
+
+  // Completed [user, assistant] pairs for the engine's chat template.
+  const pairs = [];
+  for (let i = 0; i < S.history.length - 1; i++) {
+    if (S.history[i].role === "user" && S.history[i + 1].role === "assistant") {
+      pairs.push([S.history[i].text, S.history[i + 1].text]);
+      i++;
+    }
+  }
+
+  const payload = {
+    message: text,
+    system: $("systemPrompt").value,
+    history: pairs,
+    temp: parseFloat($("temp").value),
+    top_k: parseInt($("topk").value, 10),
+    top_p: parseFloat($("topp").value),
+    min_p: parseFloat($("minp").value),
+    typical_p: parseFloat($("typp").value),
+    repeat_pen: parseFloat($("reppen").value),
+    seed: parseInt($("seed").value, 10) || 0,
+    max_tokens: parseInt($("maxtok").value, 10),
+    max_context: parseInt($("ctx").value, 10),
+    show_think: $("showThink").checked,
+    enable_think: $("showThink").checked,
+  };
+
+  try {
+    const r = await fetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || "generate failed");
+    // Tokens arrive over SSE.
+  } catch (e) {
+    S.generating = false;
+    setStatus("Error", "err");
+    toast(e.message, "err");
+    renderChat();
+  }
+}
+
+async function stopGeneration() {
+  if (!S.generating || S.stopping) return;
+  S.stopping = true;
+  setStatus("Stopping…", "busy");
+  try {
+    await fetch("/api/stop", { method: "POST" });
+  } finally {
+    setTimeout(() => { S.stopping = false; }, 400);
+  }
+}
+
+function clearChat() {
+  if (S.generating) { toast("Stop generation first", "err"); return; }
+  stopLiveStats();
+  S.history = [];
+  S.streaming = "";
+  S.streamingReason = "";
+  statsEl.textContent = "";
+  setStatus(S.loaded ? S.loaded.name + " · " + S.loaded.arch : "Model unloaded — select one above", S.loaded ? "on" : "");
+  renderChat();
+  input.focus();
+}
+
+// ---------------------------------------------------------------------------
+// Composer behavior
+// ---------------------------------------------------------------------------
+
+function autosize() {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 180) + "px";
+}
+
+input.addEventListener("input", () => { autosize(); updateButtons(); });
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    if (S.generating) return;
+    sendMessage();
+  }
+});
+sendBtn.addEventListener("click", () => {
+  if (S.generating) stopGeneration();
+  else sendMessage();
+});
+clearBtn.addEventListener("click", clearChat);
+modelSelect.addEventListener("change", onModelSelected);
+refreshBtn.addEventListener("click", refreshModels);
+reloadBtn.addEventListener("click", () => {
+  const path = (S.loaded && S.loaded.path) || S.selectedPath;
+  if (path) loadModel(path, false);
+});
+ejectBtn.addEventListener("click", unloadModel);
+
+// Settings drawer
+const drawer = $("drawer");
+$("settingsBtn").addEventListener("click", () => drawer.classList.toggle("open"));
+$("closeDrawer").addEventListener("click", () => drawer.classList.remove("open"));
+document.addEventListener("click", (e) => {
+  if (drawer.classList.contains("open") &&
+      !drawer.contains(e.target) && e.target !== $("settingsBtn") &&
+      !$("settingsBtn").contains(e.target)) {
+    drawer.classList.remove("open");
+  }
+});
+for (const [sl, out, fmt] of [
+  ["temp", "tempVal", v => parseFloat(v).toFixed(2)],
+  ["topp", "toppVal", v => parseFloat(v).toFixed(2)],
+  ["minp", "minpVal", v => parseFloat(v).toFixed(2)],
+  ["typp", "typpVal", v => parseFloat(v).toFixed(2)],
+  ["reppen", "reppenVal", v => parseFloat(v).toFixed(2)],
+]) {
+  $(sl).addEventListener("input", () => { $(out).textContent = fmt($(sl).value); });
+}
+for (const [sl, out] of [["topk", "topkVal"], ["maxtok", "maxtokVal"], ["ctx", "ctxVal"]]) {
+  $(sl).addEventListener("input", () => { $(out).textContent = $(sl).value; });
+}
+$("seed").addEventListener("input", () => {
+  const v = parseInt($("seed").value, 10);
+  $("seedVal").textContent = (!v ? "0 (random)" : String(v));
+});
+$("gpuLayers").addEventListener("input", () => { $("gpuLayersVal").textContent = $("gpuLayers").value; });
+$("device").addEventListener("change", () => {
+  const split = $("device").value === "gpu_split";
+  $("gpuLayersField").classList.toggle("hidden", !split);
+  if (S.loaded) toast("Device applies when the model is reloaded (⟲)", "info");
+});
+$("pinWeights").addEventListener("change", () => {
+  if (S.loaded) toast("Applies when the model is reloaded (⟲)", "info");
+});
+$("resetDefaults").addEventListener("click", () => {
+  if (!S.loaded) { toast("Load a model first", "err"); return; }
+  applyModelDefaults(S.loaded);
+  toast("Reset to " + S.loaded.name + " defaults", "info");
+});
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+(async function boot() {
+  connectEvents();
+  setStatus("Connecting…", "busy");
+  try {
+    const r = await fetch("/api/status");
+    const j = await r.json();
+    if (j.ok && j.loaded && j.model) {
+      S.loaded = j.model;
+      S.selectedPath = j.model.path;
+      setStatus(j.model.name + " · " + j.model.arch, "on");
+      applyModelDefaults(j.model);
+    } else {
+      setStatus("No model loaded", "");
+    }
+  } catch { setStatus("Service unreachable", "err"); }
+  await refreshModels();
+  syncCtxSlider();
+  renderChat();
+  updateButtons();
+  input.focus();
+})();
+</script>
+</body>
+</html>

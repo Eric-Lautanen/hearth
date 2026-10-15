@@ -1,6 +1,8 @@
 use crate::attention;
 use crate::ops;
-use crate::weights::ModelWeights;
+use crate::weights::{self, ModelWeights};
+use hearth_compute::{GpuBuffer, GpuCompute, QuantKind};
+use std::collections::HashMap;
 
 pub struct FluxConfig {
     pub d_model: usize,         // 3072
@@ -37,11 +39,58 @@ impl Default for FluxConfig {
 pub struct FluxTransformer {
     cfg: FluxConfig,
     pub weights: ModelWeights,
+    gpu: Option<GpuCompute>,
+    /// GPU buffers for Q2_0 weights, uploaded once during construction.
+    gpu_q2_bufs: HashMap<String, GpuBuffer>,
+    /// GPU buffers for BF16 weights converted to f32.
+    gpu_f32_bufs: HashMap<String, GpuBuffer>,
 }
 
 impl FluxTransformer {
     pub fn new(cfg: FluxConfig, weights: ModelWeights) -> Self {
-        FluxTransformer { cfg, weights }
+        let gpu = pollster::block_on(GpuCompute::new());
+        let mut gpu_q2_bufs = HashMap::new();
+        let mut gpu_f32_bufs = HashMap::new();
+
+        if let Some(ref g) = gpu {
+            eprintln!("[hearth-diffusion] GPU available, uploading weights...");
+            // Upload all Q2_0 weights
+            for (name, tensor) in &weights.tensors {
+                match tensor {
+                    crate::weights::StoredTensor::Q2(q2) => {
+                        let buf = g.upload_bytes(&q2.data, &format!("diffusion:{}", name));
+                        gpu_q2_bufs.insert(name.clone(), buf);
+                    }
+                    crate::weights::StoredTensor::Bf16(bf16) => {
+                        // Convert BF16 → f32 on CPU, upload as f32 buffer
+                        let mut f32_data = Vec::with_capacity(bf16.data.len() / 2);
+                        for chunk in bf16.data.chunks_exact(2) {
+                            let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
+                            f32_data.push(f32::from_bits((raw as u32) << 16));
+                        }
+                        let buf = g.upload_f32(&f32_data, &format!("diffusion:{}", name));
+                        gpu_f32_bufs.insert(name.clone(), buf);
+                    }
+                    crate::weights::StoredTensor::F32(f32t) => {
+                        let buf = g.upload_f32(&f32t.data, &format!("diffusion:{}", name));
+                        gpu_f32_bufs.insert(name.clone(), buf);
+                    }
+                }
+            }
+            eprintln!(
+                "[hearth-diffusion] {} Q2_0 + {} f32 weights uploaded",
+                gpu_q2_bufs.len(),
+                gpu_f32_bufs.len()
+            );
+        }
+
+        FluxTransformer {
+            cfg,
+            weights,
+            gpu,
+            gpu_q2_bufs,
+            gpu_f32_bufs,
+        }
     }
 
     /// Full forward pass: latent [seq_img × d_model] + text [seq_txt × joint_dim] + pooled [d_model]
@@ -200,33 +249,67 @@ impl FluxTransformer {
 
         let prefix = format!("transformer_blocks.{}.attn", idx);
 
-        if let Some(w) = self.weights.q2(&format!("{}.to_q", prefix)) {
-            ops::matmul_q2_batched(w, &img_normed, &mut q_img, img_seq);
-            ops::matmul_q2_batched(w, &txt_normed, &mut q_txt, txt_seq);
-        }
-        if let Some(w) = self.weights.q2(&format!("{}.to_k", prefix)) {
-            ops::matmul_q2_batched(w, &img_normed, &mut k_img, img_seq);
-            ops::matmul_q2_batched(w, &txt_normed, &mut k_txt, txt_seq);
-        }
-        if let Some(w) = self.weights.q2(&format!("{}.to_v", prefix)) {
-            ops::matmul_q2_batched(w, &img_normed, &mut v_img, img_seq);
-            ops::matmul_q2_batched(w, &txt_normed, &mut v_txt, txt_seq);
-        }
+        // Q, K, V projections (GPU-accelerated when available)
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_q", prefix),
+            &img_normed,
+            &mut q_img,
+            img_seq,
+        );
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_q", prefix),
+            &txt_normed,
+            &mut q_txt,
+            txt_seq,
+        );
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_k", prefix),
+            &img_normed,
+            &mut k_img,
+            img_seq,
+        );
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_k", prefix),
+            &txt_normed,
+            &mut k_txt,
+            txt_seq,
+        );
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_v", prefix),
+            &img_normed,
+            &mut v_img,
+            img_seq,
+        );
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_v", prefix),
+            &txt_normed,
+            &mut v_txt,
+            txt_seq,
+        );
 
-        // --- Cross-attention Q, K, V ---
+        // --- Cross-attention Q, K, V (GPU-accelerated) ---
         let mut add_q = vec![0.0f32; img_seq * n_qkv];
         let mut add_k = vec![0.0f32; txt_seq * n_qkv];
         let mut add_v = vec![0.0f32; txt_seq * n_qkv];
 
-        if let Some(w) = self.weights.q2(&format!("{}.add_q_proj", prefix)) {
-            ops::matmul_q2_batched(w, &img_normed, &mut add_q, img_seq);
-        }
-        if let Some(w) = self.weights.q2(&format!("{}.add_k_proj", prefix)) {
-            ops::matmul_q2_batched(w, &txt_normed, &mut add_k, txt_seq);
-        }
-        if let Some(w) = self.weights.q2(&format!("{}.add_v_proj", prefix)) {
-            ops::matmul_q2_batched(w, &txt_normed, &mut add_v, txt_seq);
-        }
+        self.matmul_q2_or_fallback(
+            &format!("{}.add_q_proj", prefix),
+            &img_normed,
+            &mut add_q,
+            img_seq,
+        );
+        self.matmul_q2_or_fallback(
+            &format!("{}.add_k_proj", prefix),
+            &txt_normed,
+            &mut add_k,
+            txt_seq,
+        );
+        self.matmul_q2_or_fallback(
+            &format!("{}.add_v_proj", prefix),
+            &txt_normed,
+            &mut add_v,
+            txt_seq,
+        );
 
         // Merge: Q = Q_img + Add_Q, K = cat(K_img, K_txt) + cat(Add_K, Add_K?)
         // Actually in flux: Q = Q_img + Add_Q, K = K_img + Add_K, V = V_img + Add_V
@@ -267,16 +350,21 @@ impl FluxTransformer {
         let mut v_all = v_txt.clone();
         v_all.extend_from_slice(&v_img);
 
-        // Img attention (batched)
-        attention::attention_batched(
-            &q_img_rope,
-            &k_all,
-            &v_all,
-            total_seq,
-            head_dim,
-            n_heads,
-            &mut attn_out_img,
-        );
+        // Img attention (GPU-accelerated when available)
+        match self.gpu_attention(&q_img_rope, &k_all, &v_all, total_seq, head_dim, n_heads) {
+            Ok(gpu_out) => attn_out_img.copy_from_slice(&gpu_out),
+            Err(_) => {
+                attention::attention_batched(
+                    &q_img_rope,
+                    &k_all,
+                    &v_all,
+                    total_seq,
+                    head_dim,
+                    n_heads,
+                    &mut attn_out_img,
+                );
+            }
+        }
 
         // Txt attention (batched, uses txt Q which doesn't have RoPE)
         let mut k_all_txt = k_img_rope.clone();
@@ -284,32 +372,53 @@ impl FluxTransformer {
         let mut v_all_txt = v_img.clone();
         v_all_txt.extend_from_slice(&v_txt);
 
-        attention::attention_batched(
-            &q_txt,
-            &k_all_txt,
-            &v_all_txt,
-            total_seq,
-            head_dim,
-            n_heads,
-            &mut attn_out_txt,
-        );
+        match self.gpu_attention(&q_txt, &k_all_txt, &v_all_txt, total_seq, head_dim, n_heads) {
+            Ok(gpu_out) => attn_out_txt.copy_from_slice(&gpu_out),
+            Err(_) => {
+                attention::attention_batched(
+                    &q_txt,
+                    &k_all_txt,
+                    &v_all_txt,
+                    total_seq,
+                    head_dim,
+                    n_heads,
+                    &mut attn_out_txt,
+                );
+            }
+        }
 
-        // Output projections
+        // Output projections (GPU-accelerated)
         let mut add_out_img = vec![0.0f32; img_seq * d];
         let mut add_out_txt = vec![0.0f32; txt_seq * d];
 
-        if let Some(w) = self.weights.q2(&format!("{}.to_add_out", prefix)) {
-            ops::matmul_q2_batched(w, &attn_out_img, &mut add_out_img, img_seq);
-            ops::matmul_q2_batched(w, &attn_out_txt, &mut add_out_txt, txt_seq);
-        }
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_add_out", prefix),
+            &attn_out_img,
+            &mut add_out_img,
+            img_seq,
+        );
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_add_out", prefix),
+            &attn_out_txt,
+            &mut add_out_txt,
+            txt_seq,
+        );
 
         // Output projections
         let mut out_img = vec![0.0f32; img_seq * d];
         let mut out_txt = vec![0.0f32; txt_seq * d];
-        if let Some(w) = self.weights.q2(&format!("{}.to_out.0", prefix)) {
-            ops::matmul_q2_batched(w, &attn_out_img, &mut out_img, img_seq);
-            ops::matmul_q2_batched(w, &attn_out_txt, &mut out_txt, txt_seq);
-        }
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_out.0", prefix),
+            &attn_out_img,
+            &mut out_img,
+            img_seq,
+        );
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_out.0", prefix),
+            &attn_out_txt,
+            &mut out_txt,
+            txt_seq,
+        );
 
         // Gate + residual
         let mut new_img = img.to_vec();
@@ -337,10 +446,19 @@ impl FluxTransformer {
             }
         }
         let ffn_img_prefix = format!("transformer_blocks.{}.ff", idx);
-        if let Some(w) = self.weights.q2(&format!("{}.linear_in", ffn_img_prefix)) {
-            let ffn_total = w.rows; // 2 * ffn_dim for gate+up
+        let ffn_total = self
+            .weights
+            .q2(&format!("{}.linear_in", ffn_img_prefix))
+            .map(|w| w.rows)
+            .unwrap_or(0);
+        if ffn_total > 0 {
             let mut ffn_hidden = vec![0.0f32; img_seq * ffn_total];
-            ops::matmul_q2_batched(w, &img_ffn_normed, &mut ffn_hidden, img_seq);
+            self.matmul_q2_or_fallback(
+                &format!("{}.linear_in", ffn_img_prefix),
+                &img_ffn_normed,
+                &mut ffn_hidden,
+                img_seq,
+            );
             // Split into gate and up
             let half = ffn_total / 2;
             let mut gate = vec![0.0f32; img_seq * half];
@@ -356,11 +474,14 @@ impl FluxTransformer {
                 gate[i] *= up[i];
             }
             let mut ffn_out = vec![0.0f32; img_seq * d];
-            if let Some(w2) = self.weights.q2(&format!("{}.linear_out", ffn_img_prefix)) {
-                ops::matmul_q2_batched(w2, &gate, &mut ffn_out, img_seq);
-                for i in 0..img_seq * d {
-                    new_img[i] += gate_mlp_img[i % d] * ffn_out[i];
-                }
+            self.matmul_q2_or_fallback(
+                &format!("{}.linear_out", ffn_img_prefix),
+                &gate,
+                &mut ffn_out,
+                img_seq,
+            );
+            for i in 0..img_seq * d {
+                new_img[i] += gate_mlp_img[i % d] * ffn_out[i];
             }
         }
 
@@ -380,11 +501,20 @@ impl FluxTransformer {
             }
         }
         let ffn_txt_prefix = format!("transformer_blocks.{}.ff_context", idx);
-        if let Some(w) = self.weights.q2(&format!("{}.linear_in", ffn_txt_prefix)) {
-            let ffn_total = w.rows;
-            let mut ffn_hidden = vec![0.0f32; txt_seq * ffn_total];
-            ops::matmul_q2_batched(w, &txt_ffn_normed, &mut ffn_hidden, txt_seq);
-            let half = ffn_total / 2;
+        let ffn_txt_total = self
+            .weights
+            .q2(&format!("{}.linear_in", ffn_txt_prefix))
+            .map(|w| w.rows)
+            .unwrap_or(0);
+        if ffn_txt_total > 0 {
+            let mut ffn_hidden = vec![0.0f32; txt_seq * ffn_txt_total];
+            self.matmul_q2_or_fallback(
+                &format!("{}.linear_in", ffn_txt_prefix),
+                &txt_ffn_normed,
+                &mut ffn_hidden,
+                txt_seq,
+            );
+            let half = ffn_txt_total / 2;
             let mut gate = vec![0.0f32; txt_seq * half];
             let mut up = vec![0.0f32; txt_seq * half];
             for s in 0..txt_seq {
@@ -398,11 +528,14 @@ impl FluxTransformer {
                 gate[i] *= up[i];
             }
             let mut ffn_out = vec![0.0f32; txt_seq * d];
-            if let Some(w2) = self.weights.q2(&format!("{}.linear_out", ffn_txt_prefix)) {
-                ops::matmul_q2_batched(w2, &gate, &mut ffn_out, txt_seq);
-                for i in 0..txt_seq * d {
-                    new_txt[i] += gate_mlp_txt[i % d] * ffn_out[i];
-                }
+            self.matmul_q2_or_fallback(
+                &format!("{}.linear_out", ffn_txt_prefix),
+                &gate,
+                &mut ffn_out,
+                txt_seq,
+            );
+            for i in 0..txt_seq * d {
+                new_txt[i] += gate_mlp_txt[i % d] * ffn_out[i];
             }
         }
 
@@ -442,7 +575,7 @@ impl FluxTransformer {
             }
         }
 
-        // Combined QKV + MLP projection
+        // Combined QKV + MLP projection (GPU-accelerated)
         let prefix = format!("single_transformer_blocks.{}.attn", idx);
         let proj_rows = self
             .weights
@@ -450,9 +583,12 @@ impl FluxTransformer {
             .map(|w| w.rows)
             .unwrap_or(0);
         let mut qkv_mlp = vec![0.0f32; seq * proj_rows];
-        if let Some(w) = self.weights.q2(&format!("{}.to_qkv_mlp_proj", prefix)) {
-            ops::matmul_q2_batched(w, &normed, &mut qkv_mlp, seq);
-        }
+        self.matmul_q2_or_fallback(
+            &format!("{}.to_qkv_mlp_proj", prefix),
+            &normed,
+            &mut qkv_mlp,
+            seq,
+        );
 
         let n_qkv = self.cfg.n_heads * self.cfg.head_dim;
         // Split: Q (3072), K (3072), V (3072), gate_mlp (9216), up_mlp (9216) = 27648
@@ -488,17 +624,29 @@ impl FluxTransformer {
             &self.cfg.axes_dims,
         );
 
-        // Attention (batched)
+        // Attention (GPU-accelerated when available)
         let mut attn_out = vec![0.0f32; seq * n_qkv];
-        attention::attention_batched(
+        match self.gpu_attention(
             &q_all,
             &k_all,
             &v_all,
             seq,
             self.cfg.head_dim,
             self.cfg.n_heads,
-            &mut attn_out,
-        );
+        ) {
+            Ok(gpu_out) => attn_out.copy_from_slice(&gpu_out),
+            Err(_) => {
+                attention::attention_batched(
+                    &q_all,
+                    &k_all,
+                    &v_all,
+                    seq,
+                    self.cfg.head_dim,
+                    self.cfg.n_heads,
+                    &mut attn_out,
+                );
+            }
+        }
 
         // MLP: silu(gate_mlp) * up_mlp
         ops::silu(&mut gate_mlp);
@@ -511,9 +659,7 @@ impl FluxTransformer {
         combined.extend_from_slice(&gate_mlp);
 
         let mut proj_out = vec![0.0f32; seq * d];
-        if let Some(w) = self.weights.q2(&format!("{}.to_out", prefix)) {
-            ops::matmul_q2_batched(w, &combined, &mut proj_out, seq);
-        }
+        self.matmul_q2_or_fallback(&format!("{}.to_out", prefix), &combined, &mut proj_out, seq);
 
         // Gate + residual
         let mut new_hidden = hidden.to_vec();
@@ -588,5 +734,66 @@ impl FluxTransformer {
         } else {
             vec![0.0f32; out_dim]
         }
+    }
+
+    /// GPU-accelerated Q2_0 batch matmul: upload input → dispatch → readback output.
+    /// Falls back to CPU matmul_q2_batched if GPU unavailable.
+    fn gpu_matmul_q2(&self, name: &str, input: &[f32], batch: usize) -> Result<Vec<f32>, String> {
+        let gpu = self.gpu.as_ref().ok_or("GPU not available")?;
+        let buf = self
+            .gpu_q2_bufs
+            .get(name)
+            .ok_or_else(|| format!("Q2_0 weight not on GPU: {}", name))?;
+        let q2 = self
+            .weights
+            .q2(name)
+            .ok_or_else(|| format!("Weight not found: {}", name))?;
+        let m = q2.rows as u32;
+        let k = q2.cols as u32;
+        let act_buf = gpu.upload_f32(input, &format!("diff_act:{}", name));
+        let out_buf = gpu
+            .dequant_matmul_batch(buf, &QuantKind::Q2_0, &act_buf, m, k, batch as u32)
+            .ok_or_else(|| format!("GPU matmul failed: {}", name))?;
+        Ok(gpu.readback_f32(&out_buf, (m as usize) * batch))
+    }
+
+    /// Try GPU matmul; on failure, run CPU matmul_q2_batched into the given output slice.
+    fn matmul_q2_or_fallback(&self, name: &str, input: &[f32], out: &mut [f32], batch: usize) {
+        if let Ok(gpu_out) = self.gpu_matmul_q2(name, input, batch) {
+            out.copy_from_slice(&gpu_out);
+        } else if let Some(w) = self.weights.q2(name) {
+            ops::matmul_q2_batched(w, input, out, batch);
+        }
+    }
+
+    /// GPU-accelerated batch attention: upload Q, K, V → dispatch → readback output.
+    /// GPU-accelerated batch attention: upload Q, K, V → dispatch → readback output.
+    /// Falls back to CPU attention_batched if GPU unavailable.
+    fn gpu_attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        head_dim: usize,
+        n_heads: usize,
+    ) -> Result<Vec<f32>, String> {
+        let gpu = self.gpu.as_ref().ok_or("GPU not available")?;
+        let batch = q.len() / (n_heads * head_dim);
+        let q_buf = gpu.upload_f32(q, "diff_attn_q");
+        let k_buf = gpu.upload_f32(k, "diff_attn_k");
+        let v_buf = gpu.upload_f32(v, "diff_attn_v");
+        let out_buf = gpu
+            .flash_attention_bidirectional(
+                &q_buf,
+                &k_buf,
+                &v_buf,
+                n_heads as u32,
+                head_dim as u32,
+                batch as u32,
+                seq_len as u32,
+            )
+            .ok_or("GPU attention failed")?;
+        Ok(gpu.readback_f32(&out_buf, q.len()))
     }
 }

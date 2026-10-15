@@ -1,4 +1,4 @@
-# Hearth Agent Guidelines
+# Hearth Agent Guideline
 
 > **Date**: 2026-05 — my training data snapshot may be stale. Use web search tools (`rust-search_*`) liberally for latest papers, code improvements, quantization formats, and LLM inference optimizations. Don't guess — search.
 
@@ -17,9 +17,9 @@ Running anything in parallel on this 8C/16T CPU causes thermal throttling and SM
 
 **IMPORTANT: Never push code to github.  Only use git for diffs if noticable performance degredation.
 
-**IMPORTANT: ALWAYS update BUG_TRACKER.md and at the end of each session completely rewrite RESUME.MD with things to try during the next session!!!
+**IMPORTANT: ALWAYS update `docs/BUG_TRACKER.md` and at the end of each session completely rewrite `docs/RESUME.md` with things to try during the next session!!!
 
-**File purposes:** `RESUME.md` = detailed implementation instructions for the NEXT session (what to do). `BUG_TRACKER.md` = historical record of what was done (perf table, change log, what didn't work). Keep both concise — token efficiency matters for context limits.
+**File purposes:** `docs/RESUME.md` = detailed implementation instructions for the NEXT session (what to do). `docs/BUG_TRACKER.md` = historical record of what was done (perf table, change log, what didn't work). Keep both concise — token efficiency matters for context limits. Design notes and older session docs live in `docs/`.
 
 **BENCHMARK MANDATE: Always benchmark before-and-after on every session.** Run all 6 models one at a time — NEVER launch multiple benchmarks in the same message. Each model must run alone with no other processes competing for CPU. Compare tok/s to session baseline in BUG_TRACKER.md. If any model degrades, revert the change — do not merge regressions. Benchmark command: `& ".\target\release\hearth-chat-cli.exe" "$model" --temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`
 

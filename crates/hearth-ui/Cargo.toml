@@ -1,0 +1,8 @@
+[package]
+name = "hearth-ui"
+version = "0.2.0"
+edition = "2021"
+description = "Local web chat UI for Hearth — std only, driven through hearth-chat-cli --service"
+
+[dependencies]
+hearth-core = { path = "../hearth-core" }

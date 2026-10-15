@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod error;
+pub mod json;
 pub mod model;
 pub mod output;
 pub mod sampler;

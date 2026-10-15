@@ -9,6 +9,7 @@ members = [
     "crates/hearth-llm",
     "crates/hearth-compute",
     "crates/hearth-diffusion",
+    "crates/hearth-ui",
 ]
 
 [workspace.dependencies]

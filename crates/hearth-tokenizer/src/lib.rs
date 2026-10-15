@@ -29,10 +29,20 @@ pub struct Tokenizer {
     pub template_kind: TemplateKind,
     pub chat_template: Option<String>,
     pub special_tokens: HashMap<String, u32>,
+    /// True when the vocab stores GPT-2 byte-unicode strings (space = "Ġ",
+    /// newline = "Ċ" — Qwen/GPT-2/Llama style). Pre-tokens must be byte-encoded
+    /// before vocab lookup and BPE.
+    pub gpt2_style: bool,
+    /// byte value → GPT-2 byte-unicode char (lazily built from the spec table).
+    gpt2_byte_encoder: HashMap<u8, char>,
     encode_cache: HashMap<u64, CacheItem>,
     decode_cache: HashMap<u64, String>,
     cache_order: VecDeque<u64>,
     cache_capacity: usize,
+    /// Bytes of a multi-byte UTF-8 sequence whose token ended mid-character;
+    /// held here until the rest arrives so per-token streaming decode never
+    /// emits U+FFFD replacement characters.
+    pending_decode: std::cell::RefCell<Vec<u8>>,
 }
 
 impl Tokenizer {
@@ -100,6 +110,13 @@ impl Tokenizer {
             }
         }
 
+        let gpt2_style = token_to_id.contains_key("\u{120}");
+        let gpt2_byte_encoder = if gpt2_style {
+            gpt2_bytes_to_unicode_pairs()
+        } else {
+            HashMap::new()
+        };
+
         Ok(Tokenizer {
             vocab,
             token_to_id,
@@ -111,10 +128,13 @@ impl Tokenizer {
             template_kind,
             chat_template,
             special_tokens,
+            gpt2_style,
+            gpt2_byte_encoder,
             encode_cache: HashMap::new(),
             decode_cache: HashMap::new(),
             cache_order: VecDeque::new(),
             cache_capacity: 256,
+            pending_decode: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -169,9 +189,30 @@ impl Tokenizer {
 
             let end = find_next_special_or_end(remaining, &self.special_tokens);
             let segment = &remaining[..end];
-            let pre_tokens = pre_tokenize(segment);
+            let pre_tokens = if self.gpt2_style {
+                pre_tokenize_qwen(segment)
+            } else {
+                pre_tokenize(segment)
+            };
             for word in &pre_tokens {
-                let word_ids = if word.bytes().all(|b| b.is_ascii())
+                let word_ids = if self.gpt2_style {
+                    // Map raw text bytes into the GPT-2 byte-unicode alphabet
+                    // (space -> "Ġ", newline -> "Ċ", ...) used by the vocab.
+                    let mut s = String::new();
+                    for ch in word.chars() {
+                        let mut buf = [0u8; 4];
+                        for &b in ch.encode_utf8(&mut buf).as_bytes() {
+                            s.push(self.gpt2_byte_encoder.get(&b).copied().unwrap_or(b as char));
+                        }
+                    }
+                    if let Some(&id) = self.token_to_id.get(&s) {
+                        vec![id]
+                    } else {
+                        s.chars()
+                            .filter_map(|c| self.token_to_id.get(&c.to_string()).copied())
+                            .collect()
+                    }
+                } else if word.bytes().all(|b| b.is_ascii())
                     && self.token_to_id.contains_key(word.as_str())
                 {
                     vec![self.token_to_id[word.as_str()]]
@@ -311,16 +352,104 @@ impl Tokenizer {
         out
     }
 
+    /// Decode one token for streaming output. A multi-byte UTF-8 character
+    /// split across two tokens is held until its remaining bytes arrive, so
+    /// no replacement characters (U+FFFD) appear mid-stream.
     pub fn decode_token(&self, id: u32) -> String {
         let raw = self
             .vocab
             .get(id as usize)
             .map(|s| s.as_str())
             .unwrap_or("");
-        gpt2_decode(raw)
+        let bytes = self.token_raw_bytes(raw);
+        self.utf8_stream(bytes)
     }
 
+    /// Drop any held-back partial UTF-8 sequence (call when a generation
+    /// ends so stale bytes never leak into the next stream).
+    pub fn reset_stream_decode(&self) {
+        self.pending_decode.borrow_mut().clear();
+    }
+
+    /// End-of-stream counterpart to [`Self::decode_token`]: emits whatever
+    /// complete text is still buffered, then clears the pending buffer. A
+    /// genuinely incomplete trailing sequence is decoded lossily (it can no
+    /// longer be completed). Call once when a generation finishes.
+    pub fn flush_stream_decode(&self) -> String {
+        let mut pending = self.pending_decode.borrow_mut();
+        let out = String::from_utf8_lossy(&pending).into_owned();
+        pending.clear();
+        out
+    }
+
+    /// Map a vocab string back to raw bytes via the GPT-2 byte-unicode table
+    /// (plain bytes for non-GPT-2 vocabs).
+    fn token_raw_bytes(&self, s: &str) -> Vec<u8> {
+        if !self.gpt2_style {
+            return s.as_bytes().to_vec();
+        }
+        let (char_to_byte, populated) = gpt2_byte_tables();
+        let mut bytes = Vec::with_capacity(s.len());
+        for ch in s.chars() {
+            let cp = ch as u32;
+            if cp < 65536 && populated[cp as usize] {
+                bytes.push(char_to_byte[cp as usize]);
+            } else if cp < 128 {
+                bytes.push(cp as u8);
+            }
+        }
+        bytes
+    }
+
+    /// Append raw bytes to the pending buffer and return the longest
+    /// complete UTF-8 prefix. Incomplete trailing sequences stay buffered.
+    fn utf8_stream(&self, incoming: Vec<u8>) -> String {
+        let mut pending = self.pending_decode.borrow_mut();
+        pending.extend_from_slice(&incoming);
+
+        let mut complete = 0usize;
+        let mut i = 0usize;
+        while i < pending.len() {
+            let b = pending[i];
+            let len = if b < 0x80 {
+                1
+            } else if b & 0xE0 == 0xC0 {
+                2
+            } else if b & 0xF0 == 0xE0 {
+                3
+            } else if b & 0xF8 == 0xF0 {
+                4
+            } else {
+                0 // stray continuation byte: malformed
+            };
+            if len == 0 || i + len > pending.len() {
+                break; // malformed lead or incomplete sequence
+            }
+            if pending[i + 1..i + len].iter().all(|&c| c & 0xC0 == 0x80) {
+                i += len;
+                complete = i;
+            } else {
+                break; // bad continuation byte
+            }
+        }
+
+        // Safety valve: a valid stream never holds more than 3 bytes, so a
+        // large backlog means malformed data — flush it as lossy text.
+        if pending.len() - complete > 64 {
+            complete = pending.len();
+        }
+        let out: Vec<u8> = pending.drain(..complete).collect();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// True for tokens that must terminate generation. Only genuinely
+    /// structural markers qualify: the `<|...|>` family (im_start/im_end/
+    /// endoftext/...) and the classic BOS/EOS/PAD forms. Merely *added*
+    /// tokens like `<think>`/`</think>`/`<tool_call>` are user-defined
+    /// content — models emit them mid-reply, so treating them as stop
+    /// tokens would cut the answer off right after the reasoning block.
     pub fn is_control_token(&self, id: u32) -> bool {
+        const CLASSIC: [&str; 7] = ["<s>", "</s>", "<unk>", "<pad>", "<mask>", "<sep>", "<cls>"];
         let raw = self
             .vocab
             .get(id as usize)
@@ -329,14 +458,7 @@ impl Tokenizer {
         if raw.starts_with("<|") && raw.ends_with("|>") {
             return true;
         }
-        if raw.starts_with("<|im_start|>") || raw.starts_with("<|im_end|>") {
-            return true;
-        }
-        if self.special_tokens.contains_key(raw) {
-            let s = *self.special_tokens.get(raw).unwrap();
-            return s == id;
-        }
-        false
+        CLASSIC.contains(&raw)
     }
 
     /// Generate a synthetic Jinja2 template for a given TemplateKind.
@@ -404,7 +526,9 @@ impl Tokenizer {
                  {{ message['content'] }}<|im_end|>\n\
                  {% endif %}\
                  {% endfor %}\
-                 {% if add_generation_prompt %}<|im_start|>assistant\n<think>\n\n</think>\n\n{% endif %}"
+                 {% if add_generation_prompt %}<|im_start|>assistant\n\
+                 {% if enable_thinking %}<think>\n\n{% else %}<think>\n\n</think>\n\n{% endif %}\
+                 {% endif %}"
             }
             TemplateKind::Phi3 => {
                 "{% for message in messages %}\
@@ -486,6 +610,10 @@ impl Tokenizer {
             eos_token: self.decode_token(self.eos_id),
             add_generation_prompt: true,
             thinking,
+            // `thinking` is the UI's "show reasoning" toggle: when true we let
+            // the model open its own <think> block; when false we pre-close it
+            // so the model skips reasoning and answers directly.
+            enable_thinking: thinking,
         };
         jinja::eval_jinja2(template, &ctx)
     }
@@ -497,9 +625,10 @@ impl Tokenizer {
 /// - Everything else maps to codepoints starting at U+0100 (Ā)
 ///
 /// This function reverses that mapping back to actual UTF-8 text.
-fn gpt2_decode(s: &str) -> String {
-    // Build the reverse map: unicode char → byte value
-    // This matches the table in openai/gpt-2's encoder.py bytes_to_unicode()
+/// The GPT-2 byte-unicode tables from openai/gpt-2's encoder.py:
+/// (`char_to_byte[cp] = raw byte` for mapped codepoints, plus a populated
+/// flag array so zero-valued bytes aren't confused with unmapped entries).
+fn gpt2_byte_tables() -> ([u8; 65536], [bool; 65536]) {
     let mut char_to_byte = [0u8; 65536];
     let mut populated = [false; 65536];
 
@@ -531,12 +660,11 @@ fn gpt2_decode(s: &str) -> String {
             populated[*c as usize] = true;
         }
     }
+    (char_to_byte, populated)
+}
 
-    // Also handle Ġ (U+0120 = 288) → space (0x20) which is the most common case
-    // and Ċ (U+010A = 266) → newline (0x0A)
-    // These are already covered by the loop above, but double-check:
-    // 0x20 (space, 32) is not in printable ASCII range (starts at 33='!'),
-    // so it maps to 256+n for some n. The loop handles this correctly.
+fn gpt2_decode(s: &str) -> String {
+    let (char_to_byte, populated) = gpt2_byte_tables();
 
     let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
     for ch in s.chars() {
@@ -591,8 +719,16 @@ fn detect_template(gguf: &GgufFile) -> (TemplateKind, Option<String>) {
 /// Detect format from the GGUF chat_template string content.
 /// Checks for format-specific markers in the template itself.
 fn detect_format_from_content(template: &str) -> Option<TemplateKind> {
-    // Check for Qwen3-specific patterns (must be before general ChatML check)
-    if template.contains("namespace") && template.contains("reasoning_content") {
+    // Qwen3-family templates (Qwen3, and the Qwen3.5 / Bonsai 2 line) both gate a
+    // `<think>` block on `enable_thinking`. Only the older Qwen3 template mentions
+    // `reasoning_content`, so match the think markers too: a Qwen3.5 template also
+    // uses `namespace` (so it is never "simple enough" either) and would otherwise
+    // be detected as plain ChatML, leaving the model with no think block at all.
+    // Must stay ahead of the generic `<|im_start|>` check.
+    if template.contains("reasoning_content")
+        || template.contains("enable_thinking")
+        || template.contains("<think>")
+    {
         return Some(TemplateKind::Qwen3);
     }
     if template.contains("<|im_start|>") {
@@ -699,6 +835,168 @@ fn find_next_special_or_end(
     earliest
 }
 
+/// GPT-2 `bytes_to_unicode()`: the byte-value → unicode-char table used to
+/// represent arbitrary bytes as printable strings in GPT-2/Qwen vocabs.
+fn gpt2_bytes_to_unicode_pairs() -> HashMap<u8, char> {
+    let mut bs: Vec<u32> = Vec::new();
+    for b in b'!'..=b'~' {
+        bs.push(b as u32);
+    }
+    for b in 0xA1u32..=0xAC {
+        bs.push(b);
+    }
+    for b in 0xAEu32..=0xFF {
+        bs.push(b);
+    }
+    let mut cs = bs.clone();
+    let mut n = 256u32;
+    for b in 0u32..=255 {
+        if !bs.contains(&b) {
+            bs.push(b);
+            cs.push(n);
+            n += 1;
+        }
+    }
+    let mut map = HashMap::with_capacity(256);
+    for (b, c) in bs.iter().zip(cs.iter()) {
+        map.insert(*b as u8, char::from_u32(*c).unwrap_or('?'));
+    }
+    map
+}
+
+/// Qwen2/Qwen3 & GPT-4 style pre-tokenization — a hand-rolled equivalent of
+/// the split regex used by tiktoken for these models:
+///
+/// ```text
+/// (?i:'s|'t|'re|'ve|'m|'ll|'d)
+/// | [^\r\n\p{L}\p{N}]?\p{L}+
+/// | \p{N}{1,3}
+/// |  ?[^\s\p{L}\p{N}]+[\r\n]*
+/// | \s*[\r\n]+
+/// | \s+(?!\S)
+/// | \s+
+/// ```
+///
+/// Returns raw pre-token strings; whitespace attaches to the FOLLOWING word
+/// (" the"), newline runs stay standalone, digits split in groups of ≤3.
+fn pre_tokenize_qwen(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let is_letter = |c: char| c.is_alphabetic();
+    let is_number = |c: char| c.is_numeric();
+    let is_nl = |c: char| c == '\r' || c == '\n';
+    let is_ws = |c: char| c.is_whitespace();
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    'outer: while i < n {
+        let c = chars[i];
+
+        // 1. contractions (case-insensitive): 's 't 're 've 'm 'll 'd
+        if c == '\'' {
+            const CONTRACTIONS: [&str; 7] = ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"];
+            for cand in CONTRACTIONS {
+                let cl: Vec<char> = cand.chars().collect();
+                if i + cl.len() <= n
+                    && (0..cl.len()).all(|k| chars[i + k].to_ascii_lowercase() == cl[k])
+                {
+                    out.push(cand.to_string());
+                    i += cl.len();
+                    continue 'outer;
+                }
+            }
+        }
+
+        // 2. optional single non-newline/letter/number char + letter run
+        //    (covers " the", "!wow", "\tword")
+        {
+            let mut j = i;
+            if !is_letter(c) && !is_number(c) && !is_nl(c) {
+                j += 1;
+            }
+            if j < n && is_letter(chars[j]) {
+                let mut k = j;
+                while k < n && is_letter(chars[k]) {
+                    k += 1;
+                }
+                out.push(chars[i..k].iter().collect());
+                i = k;
+                continue;
+            }
+        }
+
+        // 3. digit groups of up to 3
+        if is_number(c) {
+            let mut k = i;
+            while k < n && is_number(chars[k]) && k - i < 3 {
+                k += 1;
+            }
+            out.push(chars[i..k].iter().collect());
+            i = k;
+            continue;
+        }
+
+        // 4. optional single space + punctuation run + trailing newlines
+        {
+            let mut j = i;
+            if c == ' ' {
+                j += 1;
+            }
+            if j < n && !is_ws(chars[j]) && !is_letter(chars[j]) && !is_number(chars[j]) {
+                let mut k = j;
+                while k < n && !is_ws(chars[k]) && !is_letter(chars[k]) && !is_number(chars[k]) {
+                    k += 1;
+                }
+                while k < n && is_nl(chars[k]) {
+                    k += 1;
+                }
+                out.push(chars[i..k].iter().collect());
+                i = k;
+                continue;
+            }
+        }
+
+        // 5-7. whitespace runs
+        if is_ws(c) {
+            let mut j = i;
+            while j < n && is_ws(chars[j]) {
+                j += 1;
+            }
+            // 5. longest run prefix ending with newline(s): \s*[\r\n]+
+            let mut last_nl = None;
+            for k in (i..j).rev() {
+                if is_nl(chars[k]) {
+                    last_nl = Some(k);
+                    break;
+                }
+            }
+            if let Some(k) = last_nl {
+                out.push(chars[i..=k].iter().collect());
+                i = k + 1;
+                continue;
+            }
+            // 6. \s+(?!\S): whole run at end-of-text, otherwise the run minus
+            //    its last char (leaving that char to join the next word).
+            if j == n || j - i >= 2 {
+                let end = if j == n { j } else { j - 1 };
+                out.push(chars[i..end].iter().collect());
+                i = end;
+                continue;
+            }
+            // 7. \s+: single whitespace char directly before non-space
+            //    (alternatives 2/4 did not absorb it)
+            out.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+
+        // Fallback (unreachable: every char class is handled above).
+        out.push(c.to_string());
+        i += 1;
+    }
+    out
+}
+
 fn pre_tokenize(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
@@ -774,10 +1072,13 @@ mod tests {
             template_kind: TemplateKind::ChatML,
             chat_template: None,
             special_tokens: HashMap::new(),
+            gpt2_style: false,
+            gpt2_byte_encoder: HashMap::new(),
             encode_cache: HashMap::new(),
             decode_cache: HashMap::new(),
             cache_order: VecDeque::new(),
             cache_capacity: 256,
+            pending_decode: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -813,5 +1114,117 @@ mod tests {
         let tok = make_mock_tokenizer();
         assert_eq!(tok.decode_token(0), "<unk>");
         assert_eq!(tok.decode_token(3), "a");
+    }
+
+    #[test]
+    fn test_nested_if_in_template() {
+        // Regression: a nested {% if %} inside {% if add_generation_prompt %}
+        // used to leak its tags literally into the rendered prompt.
+        // The Qwen3 synthetic template nests `{% if enable_thinking %}` inside
+        // `{% if add_generation_prompt %}` - the exact shape that used to leak
+        // tags when the evaluator couldn't handle nested conditionals.
+        let mut tok = make_mock_tokenizer();
+        tok.template_kind = TemplateKind::Qwen3;
+        let with_think = tok.apply_template("sys", &[], "hi", true);
+        let without_think = tok.apply_template("sys", &[], "hi", false);
+        for prompt in [&with_think, &without_think] {
+            assert!(
+                !prompt.contains("{%"),
+                "template tag leaked into prompt: {prompt:?}"
+            );
+            assert!(
+                !prompt.contains("enable_thinking"),
+                "condition text leaked into prompt: {prompt:?}"
+            );
+        }
+        assert!(with_think.ends_with("<think>\n\n"));
+        assert!(without_think.contains("<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn test_qwen35_template_detected_as_qwen3() {
+        // Regression: the Bonsai 2 / Qwen3.5 template (shipped in the small
+        // Ternary-Bonsai-2 GGUFs) mentions `namespace` but *not*
+        // `reasoning_content`, so it used to fall through to plain ChatML.
+        // The ChatML synthetic template has no think block at all, so a model
+        // whose default mode is thinking would never open one.
+        let tmpl = "{%- set ns = namespace(multi_step_tool=true) %}\
+                    {%- if messages[0].role == 'system' %}<|im_start|>system\\n{% endif %}\
+                    {%- if add_generation_prompt %}<|im_start|>assistant\\n\
+                    {%- if enable_thinking is defined and enable_thinking is false %}\
+                    {{- '<think>\\n\\n</think>\\n\\n' }}{%- else %}{{- '<think>\\n' }}{%- endif %}{%- endif %}";
+        assert_eq!(
+            detect_format_from_content(tmpl),
+            Some(TemplateKind::Qwen3),
+            "Qwen3.5/Bonsai 2 template must not be detected as plain ChatML"
+        );
+        // The generic ChatML template must still be ChatML.
+        assert_eq!(
+            detect_format_from_content(
+                "{% for m in messages %}<|im_start|>user\\n{{ m }}{% endfor %}"
+            ),
+            Some(TemplateKind::ChatML)
+        );
+    }
+
+    #[test]
+    fn test_split_utf8_streaming_decode() {
+        // Regression: a multi-byte char split across two tokens used to emit
+        // U+FFFD replacement characters mid-stream.
+        let tok = make_mock_tokenizer();
+        // '你' = U+4F60 = 0xE4 0xBD 0xA0, split 2 bytes then 1.
+        let first = tok.utf8_stream(vec![0xE4, 0xBD]);
+        assert_eq!(first, "", "incomplete sequence must be withheld");
+        let second = tok.utf8_stream(vec![0xA0]);
+        assert_eq!(second, "你");
+        tok.reset_stream_decode();
+        // ASCII passes straight through.
+        assert_eq!(tok.utf8_stream(b"ok".to_vec()), "ok");
+    }
+
+    #[test]
+    fn test_flush_stream_decode() {
+        // Regression: a reply ending mid multi-byte character used to either
+        // lose the character or leak pending bytes into the next stream.
+        let tok = make_mock_tokenizer();
+        // First byte of '你' (0xE4 0xBD 0xA0), then the stream ends.
+        let held = tok.utf8_stream(vec![0xE4]);
+        assert_eq!(held, "", "incomplete sequence must be withheld");
+        // Flush emits the lossy remainder and clears the buffer.
+        let flushed = tok.flush_stream_decode();
+        assert!(!flushed.is_empty(), "flush must emit buffered bytes");
+        // Buffer is clean: the next stream starts from scratch.
+        assert_eq!(tok.flush_stream_decode(), "");
+    }
+
+    #[test]
+    fn test_think_tokens_are_not_control_tokens() {
+        // Regression: user_defined tokens like `</think>` were treated as
+        // stop tokens, so generation aborted right after the reasoning block
+        // and the visible answer never arrived.
+        let tok = make_mock_tokenizer();
+        // Mock vocab: index 1 = "<s>", index 2 = "</s>".
+        assert!(tok.is_control_token(1), "<s> must stop generation");
+        assert!(tok.is_control_token(2), "</s> must stop generation");
+        // Qwen3-style models add these as user_defined tokens at the end of
+        // the vocab; simulate by checking the string-form behavior via a
+        // real-ish id lookup miss and the classic-family rules.
+        let mut tok2 = make_mock_tokenizer();
+        tok2.vocab.push("<think>".to_string());
+        tok2.vocab.push("</think>".to_string());
+        tok2.special_tokens
+            .insert("<think>".to_string(), (tok2.vocab.len() - 2) as u32);
+        tok2.special_tokens
+            .insert("</think>".to_string(), (tok2.vocab.len() - 1) as u32);
+        let think_id = tok2.vocab.len() as u32 - 2;
+        let think_close_id = think_id + 1;
+        assert!(
+            !tok2.is_control_token(think_id),
+            "<think> must stream through, not stop"
+        );
+        assert!(
+            !tok2.is_control_token(think_close_id),
+            "</think> must stream through, not stop"
+        );
     }
 }

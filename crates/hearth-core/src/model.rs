@@ -7,6 +7,7 @@ pub enum PipelineRequest {
         prompt: String,
         sampler: SamplerConfig,
         max_new_tokens: usize,
+        max_context_len: Option<usize>,
     },
     ImageGen {
         prompt: String,

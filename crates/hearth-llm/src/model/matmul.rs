@@ -5,18 +5,6 @@ use rayon::prelude::*;
 
 use super::LlamaModel;
 
-/// Select the fastest Q1_0 dot kernel for the current build configuration.
-/// MSVC-compiled scalar kernel (SSE2 auto-vectorized) beats LLVM AVX2 by ~1.3-1.5×.
-#[cfg(feature = "msvc-kernel")]
-unsafe fn dot_q1_0g128_fast(w: *const u8, a: *const u8, n: usize) -> f32 {
-    hearth_quant::dot_q1_0g128_q8_0_ptr_msvc(w, a, n)
-}
-
-#[cfg(not(feature = "msvc-kernel"))]
-unsafe fn dot_q1_0g128_fast(w: *const u8, a: *const u8, n: usize) -> f32 {
-    hearth_quant::dot_q1_0g128_q8_0_ptr(w, a, n)
-}
-
 impl LlamaModel {
     pub(crate) fn matmul(
         &self,
@@ -121,7 +109,7 @@ impl LlamaModel {
         }
 
         match entry.dtype {
-            GgmlDType::Q2_0 => {
+            GgmlDType::Q2_0 | GgmlDType::PQ2_0 => {
                 let x_q8_data;
                 let q8 = match x_q8 {
                     Some(d) => d,
@@ -130,7 +118,7 @@ impl LlamaModel {
                         &x_q8_data[..]
                     }
                 };
-                let w_base = entry.data.as_ptr() as usize;
+                let w_base = entry.data().as_ptr() as usize;
                 let row_bytes = entry.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let out_ptr = out.as_mut_ptr() as usize;
@@ -144,7 +132,8 @@ impl LlamaModel {
                     hearth_quant::dot_q2_0_q8_0_ptr,
                 );
             }
-            GgmlDType::Q1_0_G128 => {
+            GgmlDType::PTQ1_0 => {
+                // Prism PTQ1_0 (type 143): dense-trit ternary, 128-el blocks, 28 bytes.
                 let x_q8_data;
                 let q8 = match x_q8 {
                     Some(d) => d,
@@ -153,7 +142,7 @@ impl LlamaModel {
                         &x_q8_data[..]
                     }
                 };
-                let w_base = entry.data.as_ptr() as usize;
+                let w_base = entry.data().as_ptr() as usize;
                 let row_bytes = entry.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let out_ptr = out.as_mut_ptr() as usize;
@@ -164,7 +153,30 @@ impl LlamaModel {
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    dot_q1_0g128_fast,
+                    hearth_quant::dot_ptq1_0_q8_0_ptr,
+                );
+            }
+            GgmlDType::Q1_0_G128 => {
+                let x_q8_data;
+                let q8 = match x_q8 {
+                    Some(d) => d,
+                    None => {
+                        x_q8_data = self.quantize_act(x);
+                        &x_q8_data[..]
+                    }
+                };
+                let w_base = entry.data().as_ptr() as usize;
+                let row_bytes = entry.dtype.byte_size(n_cols);
+                let a_ptr = q8.as_ptr() as usize;
+                let out_ptr = out.as_mut_ptr() as usize;
+                self.pool.par_dot_rows(
+                    n_rows,
+                    w_base,
+                    a_ptr,
+                    out_ptr,
+                    row_bytes,
+                    n_cols,
+                    hearth_quant::dot_q1_0g128_q8_0_ptr,
                 );
             }
             GgmlDType::Q1_0 => {
@@ -177,7 +189,7 @@ impl LlamaModel {
                         &x_q8_data[..]
                     }
                 };
-                let w_base = entry.data.as_ptr() as usize;
+                let w_base = entry.data().as_ptr() as usize;
                 let row_bytes = entry.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let out_ptr = out.as_mut_ptr() as usize;
@@ -188,7 +200,7 @@ impl LlamaModel {
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    dot_q1_0g128_fast,
+                    hearth_quant::dot_q1_0g128_q8_0_ptr,
                 );
             }
             GgmlDType::Q8_0 => {
@@ -200,7 +212,7 @@ impl LlamaModel {
                         &x_q8_data[..]
                     }
                 };
-                let w_base = entry.data.as_ptr() as usize;
+                let w_base = entry.data().as_ptr() as usize;
                 let row_bytes = entry.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let out_ptr = out.as_mut_ptr() as usize;
@@ -293,8 +305,12 @@ impl LlamaModel {
                     row_buf.resize(n_cols * n_rows, 0.0f32);
                 }
 
-                hearth_quant::dequantize(entry.dtype, &entry.data, &mut row_buf[..n_cols * n_rows])
-                    .map_err(|e| format!("Dequant {}: {}", weight_name, e))?;
+                hearth_quant::dequantize(
+                    entry.dtype,
+                    entry.data(),
+                    &mut row_buf[..n_cols * n_rows],
+                )
+                .map_err(|e| format!("Dequant {}: {}", weight_name, e))?;
 
                 unsafe {
                     matrixmultiply::sgemm(
@@ -373,8 +389,8 @@ impl LlamaModel {
                         &x_q8_data[..]
                     }
                 };
-                let w_base_a = entry_a.data.as_ptr() as usize;
-                let w_base_b = entry_b.data.as_ptr() as usize;
+                let w_base_a = entry_a.data().as_ptr() as usize;
+                let w_base_b = entry_b.data().as_ptr() as usize;
                 let row_bytes = entry_a.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let out_a_ptr = out_a.as_mut_ptr() as usize;
@@ -386,7 +402,7 @@ impl LlamaModel {
                     out_a_ptr,
                     row_bytes,
                     n_cols,
-                    dot_q1_0g128_fast,
+                    hearth_quant::dot_q1_0g128_q8_0_ptr,
                 );
                 self.pool.par_dot_rows(
                     n_rows_b,
@@ -395,7 +411,7 @@ impl LlamaModel {
                     out_b_ptr,
                     row_bytes,
                     n_cols,
-                    dot_q1_0g128_fast,
+                    hearth_quant::dot_q1_0g128_q8_0_ptr,
                 );
             }
             _ => {
@@ -464,20 +480,41 @@ impl LlamaModel {
                         &x_q8_data[..]
                     }
                 };
-                let wq = eq.data.as_ptr() as usize;
-                let wk = ek.data.as_ptr() as usize;
-                let wv = ev.data.as_ptr() as usize;
+                let wq = eq.data().as_ptr() as usize;
+                let wk = ek.data().as_ptr() as usize;
+                let wv = ev.data().as_ptr() as usize;
                 let row_bytes = eq.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let oq = out_q.as_mut_ptr() as usize;
                 let ok = out_k.as_mut_ptr() as usize;
                 let ov = out_v.as_mut_ptr() as usize;
-                self.pool
-                    .par_dot_rows(nr_q, wq, a_ptr, oq, row_bytes, n_cols, dot_q1_0g128_fast);
-                self.pool
-                    .par_dot_rows(nr_k, wk, a_ptr, ok, row_bytes, n_cols, dot_q1_0g128_fast);
-                self.pool
-                    .par_dot_rows(nr_v, wv, a_ptr, ov, row_bytes, n_cols, dot_q1_0g128_fast);
+                self.pool.par_dot_rows(
+                    nr_q,
+                    wq,
+                    a_ptr,
+                    oq,
+                    row_bytes,
+                    n_cols,
+                    hearth_quant::dot_q1_0g128_q8_0_ptr,
+                );
+                self.pool.par_dot_rows(
+                    nr_k,
+                    wk,
+                    a_ptr,
+                    ok,
+                    row_bytes,
+                    n_cols,
+                    hearth_quant::dot_q1_0g128_q8_0_ptr,
+                );
+                self.pool.par_dot_rows(
+                    nr_v,
+                    wv,
+                    a_ptr,
+                    ov,
+                    row_bytes,
+                    n_cols,
+                    hearth_quant::dot_q1_0g128_q8_0_ptr,
+                );
             }
             _ => {
                 self.matmul(w_q, x, out_q, row_buf, layer, x_q8)?;
@@ -524,12 +561,26 @@ impl LlamaModel {
 
         if matches!(
             entry.dtype,
-            GgmlDType::Q2_0 | GgmlDType::Q1_0 | GgmlDType::Q1_0_G128
+            GgmlDType::Q2_0
+                | GgmlDType::PQ2_0
+                | GgmlDType::PTQ1_0
+                | GgmlDType::Q1_0
+                | GgmlDType::Q1_0_G128
         ) {
             let q8_size = k.div_ceil(32) * 34;
             let dot_fn = match entry.dtype {
-                GgmlDType::Q2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
-                _ => dot_q1_0g128_fast,
+                GgmlDType::Q2_0 | GgmlDType::PQ2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
+                GgmlDType::PTQ1_0 => hearth_quant::dot_ptq1_0_q8_0_ptr,
+                _ => hearth_quant::dot_q1_0g128_q8_0_ptr,
+            };
+            // Paired kernel: expands each weight row once for two prompt tokens.
+            // Bit-identical to two `dot_fn` calls, so only prefill is affected.
+            let dot_fn2: Option<crate::pool::DotFn2> = match entry.dtype {
+                GgmlDType::Q2_0 | GgmlDType::PQ2_0 => Some(hearth_quant::dot_q2_0_q8_0x2_ptr),
+                GgmlDType::Q1_0 | GgmlDType::Q1_0_G128 => {
+                    Some(hearth_quant::dot_q1_0g128_q8_0x2_ptr)
+                }
+                _ => None,
             };
             let _q8_hold;
             let q8_buf: &[u8] = if let Some(data) = x_q8 {
@@ -549,12 +600,13 @@ impl LlamaModel {
                 m,
                 seq_len,
                 q8_size,
-                entry.data.as_ptr() as usize,
+                entry.data().as_ptr() as usize,
                 q8_buf.as_ptr() as usize,
                 out.as_mut_ptr() as usize,
                 entry.dtype.byte_size(k),
                 k,
                 dot_fn,
+                dot_fn2,
             );
         } else {
             for s in 0..seq_len {

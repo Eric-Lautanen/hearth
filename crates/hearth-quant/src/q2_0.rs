@@ -351,6 +351,100 @@ unsafe fn dot_q2_0_q8_0_lut_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -
     hsum_float_8(acc_global)
 }
 
+/// Paired-token AVX2 LUT kernel: one Q2_0 weight row against two Q8_0 activation
+/// rows at once.
+///
+/// Prefill re-runs the Q2V_I16 gather (8 table entries, 16 elements each) for every
+/// prompt token, though it depends only on the weights. Expanding it once and
+/// applying it to both activations removes that work from the per-token path and
+/// halves the weight bytes pulled per token.
+///
+/// Accumulation order matches [`dot_q2_0_q8_0_lut_avx2`], so each token is bit
+/// identical to the single-token kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q2_0_q8_0x2_lut_avx2(
+    w_ptr: *const u8,
+    a0_ptr: *const u8,
+    a1_ptr: *const u8,
+    n: usize,
+) -> (f32, f32) {
+    let blocks = n / BLOCK_SIZE;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    for b in 0..blocks {
+        let w_off = b * BLOCK_BYTES;
+        let w_scale =
+            _mm256_set1_ps(f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32());
+        let qs = w_ptr.add(w_off + 2);
+
+        let mut acc_block0 = _mm256_setzero_ps();
+        let mut acc_block1 = _mm256_setzero_ps();
+        for sub in 0..4 {
+            let a_off = (b * 4 + sub) * 34;
+            let a0_scale = _mm256_set1_ps(
+                f16::from_le_bytes([*a0_ptr.add(a_off), *a0_ptr.add(a_off + 1)]).to_f32(),
+            );
+            let a1_scale = _mm256_set1_ps(
+                f16::from_le_bytes([*a1_ptr.add(a_off), *a1_ptr.add(a_off + 1)]).to_f32(),
+            );
+            let a0_vals = a0_ptr.add(a_off + 2);
+            let a1_vals = a1_ptr.add(a_off + 2);
+            let qs_sub = qs.add(sub * 8);
+
+            let mut w_buf: [i16; 32] = [0i16; 32];
+            for g in 0..8 {
+                let idx = *qs_sub.add(g) as usize;
+                core::ptr::copy_nonoverlapping(
+                    Q2V_I16[idx].as_ptr(),
+                    w_buf.as_mut_ptr().add(g * 4),
+                    4,
+                );
+            }
+            let s0 = _mm256_loadu_si256(w_buf.as_ptr() as *const __m256i);
+            let s1 = _mm256_loadu_si256(w_buf.as_ptr().add(16) as *const __m256i);
+
+            let x0_lo = _mm256_cvtepi8_epi16(_mm_loadu_si128(a0_vals as *const __m128i));
+            let x0_hi = _mm256_cvtepi8_epi16(_mm_loadu_si128(a0_vals.add(16) as *const __m128i));
+            let x1_lo = _mm256_cvtepi8_epi16(_mm_loadu_si128(a1_vals as *const __m128i));
+            let x1_hi = _mm256_cvtepi8_epi16(_mm_loadu_si128(a1_vals.add(16) as *const __m128i));
+
+            let mut acc =
+                _mm256_add_epi32(_mm256_madd_epi16(x0_lo, s0), _mm256_madd_epi16(x0_hi, s1));
+            acc_block0 = _mm256_fmadd_ps(a0_scale, _mm256_cvtepi32_ps(acc), acc_block0);
+
+            acc = _mm256_add_epi32(_mm256_madd_epi16(x1_lo, s0), _mm256_madd_epi16(x1_hi, s1));
+            acc_block1 = _mm256_fmadd_ps(a1_scale, _mm256_cvtepi32_ps(acc), acc_block1);
+        }
+        acc0 = _mm256_fmadd_ps(w_scale, acc_block0, acc0);
+        acc1 = _mm256_fmadd_ps(w_scale, acc_block1, acc1);
+    }
+    (hsum_float_8(acc0), hsum_float_8(acc1))
+}
+
+/// Paired-token dot product: one Q2_0 weight row against two Q8_0 activation rows.
+/// Falls back to two single-token dots on CPUs without AVX2.
+/// # Safety
+/// w_ptr valid for n/128*34 bytes; a0_ptr and a1_ptr each valid for n/32*34 bytes.
+/// n must be a multiple of 128.
+pub unsafe fn dot_q2_0_q8_0x2_ptr(
+    w_ptr: *const u8,
+    a0_ptr: *const u8,
+    a1_ptr: *const u8,
+    n: usize,
+) -> (f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return dot_q2_0_q8_0x2_lut_avx2(w_ptr, a0_ptr, a1_ptr, n);
+        }
+    }
+    (
+        dot_q2_0_q8_0_ptr(w_ptr, a0_ptr, n),
+        dot_q2_0_q8_0_ptr(w_ptr, a1_ptr, n),
+    )
+}
+
 /// SSE4.1 LUT kernel: 8 elements per batch, 4 batches per sub-block.
 #[cfg(target_arch = "x86_64")]
 unsafe fn dot_q2_0_q8_0_ptr_sse41(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
@@ -440,11 +534,13 @@ pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
     #[cfg(target_arch = "x86_64")]
     {
         // AVX-512 512-bit VNNI: processes 2 sub-blocks (64 elements) per iteration
-        // Requires avx512dq for vextracti64x4 in addition to avx512f+avx512vnni
+        // Requires avx512dq for vextracti64x4 in addition to avx512f+avx512vnni.
+        // Skipped on Zen 4 (see crate::avx512_full_width): half-width datapath.
         #[cfg(target_feature = "avx512f")]
         #[cfg(target_feature = "avx512vnni")]
         #[cfg(target_feature = "avx512dq")]
-        if std::arch::is_x86_feature_detected!("avx512f")
+        if crate::avx512_full_width()
+            && std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512vnni")
             && std::arch::is_x86_feature_detected!("avx512dq")
         {
@@ -453,10 +549,12 @@ pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // AVX-512 256-bit VNNI fallback: vpdpbusd replaces cvtepi8+madd pair
+        // AVX-512 256-bit VNNI fallback: vpdpbusd replaces cvtepi8+madd pair.
+        // Also gated on a full-width datapath (see crate::avx512_full_width).
         #[cfg(target_feature = "avx512f")]
         #[cfg(target_feature = "avx512vnni")]
-        if std::arch::is_x86_feature_detected!("avx512f")
+        if crate::avx512_full_width()
+            && std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512vnni")
         {
             return dot_q2_0_q8_0_vnni_avx512(w_ptr, a_ptr, n);
@@ -678,5 +776,57 @@ mod tests {
             expected,
             err
         );
+    }
+
+    /// The paired prefill kernel must reproduce the single-token kernel exactly —
+    /// it only shares weight-side work, so any difference means the sharing leaked
+    /// into the per-token math.
+    #[test]
+    fn test_dot_q2_0_q8_0x2_matches_single() {
+        for &n in &[128usize, 256, 2048, 6144] {
+            let n_blocks = n / BLOCK_SIZE;
+            let mut w = vec![0u8; n_blocks * BLOCK_BYTES];
+            let mut a0 = vec![0u8; n_blocks * 4 * 34];
+            let mut a1 = vec![0u8; n_blocks * 4 * 34];
+
+            for b in 0..n_blocks {
+                let bo = b * BLOCK_BYTES;
+                let s = f16::from_f32(((b % 7) as f32 + 0.5) * 0.25).to_le_bytes();
+                w[bo] = s[0];
+                w[bo + 1] = s[1];
+                for j in 0..32 {
+                    w[bo + 2 + j] = ((b * 32 + j).wrapping_mul(37) ^ 0xAB) as u8;
+                }
+            }
+            for (act, salt) in [(a0.as_mut_slice(), 53u32), (a1.as_mut_slice(), 97u32)] {
+                for b in 0..n_blocks * 4 {
+                    let bo = b * 34;
+                    let s = f16::from_f32(((b % 5) as f32 + 0.5) * 0.125).to_le_bytes();
+                    act[bo] = s[0];
+                    act[bo + 1] = s[1];
+                    for j in 0..32 {
+                        act[bo + 2 + j] = (b as u32 * salt).wrapping_mul(2654435761) as u8;
+                    }
+                }
+            }
+
+            let (got0, got1) =
+                unsafe { dot_q2_0_q8_0x2_ptr(w.as_ptr(), a0.as_ptr(), a1.as_ptr(), n) };
+            let want0 = unsafe { dot_q2_0_q8_0_ptr(w.as_ptr(), a0.as_ptr(), n) };
+            let want1 = unsafe { dot_q2_0_q8_0_ptr(w.as_ptr(), a1.as_ptr(), n) };
+            assert_eq!(
+                got0.to_bits(),
+                want0.to_bits(),
+                "token0 mismatch at n={}",
+                n
+            );
+            assert_eq!(
+                got1.to_bits(),
+                want1.to_bits(),
+                "token1 mismatch at n={}",
+                n
+            );
+            assert!(want0.abs() > 1e-6 && want1.abs() > 1e-6, "n={} fixture", n);
+        }
     }
 }
