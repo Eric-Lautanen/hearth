@@ -184,7 +184,7 @@ want to change** — the rest keep the model's values. Run `hearth-chat-cli --he
 | `--prompt-raw`             | —                        | Send prompt as-is without wrapping it in a chat template       |
 | `--show-think`             | off                      | Print `<think>` reasoning instead of hiding it                 |
 | `--gpu` / `--gpu-layers N` | cpu                      | Load all layers on GPU, or the first N layers                  |
-| `--pin-weights`            | off                      | Read weights into RAM at load instead of mmap                  |
+| `--pin-weights`            | off                      | Read weights into RAM at load instead of mmap. Caution: on a 16 GB box pinning a 27B (5.9 GB + 1.25 GiB KV) died silently — leave off for large models |
 | `--service`                | —                        | Run as the line-JSON stdio service that `hearth-ui` drives     |
 | `--dump-info`              | —                        | Print the GGUF metadata and layer-0 tensor dtypes, then exit   |
 | `--kv-f32`                 | —                        | Accepted for compatibility; F32 is the only KV backend today   |
