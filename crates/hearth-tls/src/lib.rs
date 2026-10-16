@@ -85,23 +85,36 @@
 //! - [`ecdsa`] — `ecdsa_secp256r1_sha256`, over [`der`] for the signature's
 //!   encoding and [`p256`] for the equation. Like the RSA module it is a
 //!   primitive that nothing calls yet.
+//! - [`chain`] — path building: framing, the structural rules, `pathLenConstraint`,
+//!   `keyCertSign`, key identifiers, both names compared as DER, every link's
+//!   signature, and the anchor. Its last input is [`Revocation`], which is `Unchecked`
+//!   or the CRLs to check the whole path against — never a default.
+//! - [`leaf`] — the leaf's own two checks: that it names the server being connected to
+//!   (`subjectAltName`, one wildcard label at most) and that it is allowed to be a server
+//!   certificate at all (`extKeyUsage`/`keyUsage`).
+//! - [`crl`] — reading `CertificateList`s (RFC 5280 §5): the issuer name, the update
+//!   window, the revoked serial numbers, and the bytes a signature covers. Critical
+//!   extensions it does not understand are refusals, which is what refuses a delta CRL
+//!   standing in for a complete one.
+//! - [`verifier`] — the certificate *decision*, as one named type:
+//!   [`PinnedVerifier`] runs the whole path, then the leaf's name and purpose, then the
+//!   `CertificateVerify` signature with the leaf's own key, in that order and with a
+//!   typed failure per stage. It borrows the anchors and the CRLs the caller supplies and
+//!   reads no clock of its own, so the decision is a function of the handshake's bytes and
+//!   the caller's two inputs — which is what makes it the first verifier here that can
+//!   accept anything, and [`RejectAll`] the one a caller who has decided nothing gets.
 //!
 //! Still to come:
-//! 1. **The certificate *decision*.** Both halves of signature verification now
-//!    exist — RSA-PSS and ECDSA, each pinned to vectors from an independent
-//!    implementation — and a certificate parses, so every ingredient is present.
-//!    What does not exist is the code that *decides*: chain building to a pinned
-//!    root, name matching, the validity window check against [`UnixTime`], a
-//!    minimum key size, and the key-to-scheme matching that stops a P-256 key
-//!    being verified with an RSA scheme. Its inputs are settled: the chain, the
-//!    signature and the signed data come from the handshake
-//!    ([`CertificateVerifyInput`]), the name from our own ClientHello, the instant
-//!    from [`ClientConfig`], and the fields from [`x509`]. Until that exists the
-//!    only verifier here is [`RejectAll`], which can only refuse, so no `https://`
-//!    path may be enabled on this crate's account.
+//! 1. **The root store, where it belongs.** [`PinnedVerifier`] takes its anchors as an
+//!    argument on purpose: a pinned set with fingerprints, or a per-platform OS trust
+//!    reader, is the *downloader's* decision and has to be reviewable in one screen. This
+//!    crate has no root store and no business having one — what it has now is everything
+//!    needed to check against one a caller brings.
 //! 2. **The transport** — sockets, and the read/write loop that drives it. That
 //!    belongs in the downloader rather than here, where it would drag I/O into
-//!    code that is provable in isolation.
+//!    code that is provable in isolation. Nothing in this crate has ever opened a
+//!    socket, and the `https://` path stays closed until the downloader's own wiring
+//!    is written on top of this.
 
 /// True if `HEARTH_TLS_NO_HW` is set, which forces every primitive onto its
 /// software path.
@@ -119,6 +132,7 @@ pub(crate) fn hardware_disabled() -> bool {
 pub mod aes;
 pub mod chain;
 pub mod client;
+pub mod crl;
 pub mod der;
 pub mod ecdsa;
 pub mod gcm;
@@ -130,6 +144,7 @@ pub mod p256;
 pub mod record;
 pub mod rsa;
 pub mod sha256;
+pub mod verifier;
 pub mod verify;
 pub mod x25519;
 pub mod x509;
@@ -142,11 +157,15 @@ pub(crate) mod aesni;
 pub(crate) mod ghash_x86;
 
 pub use aes::Aes128;
-pub use chain::{verify_certificate_list, verify_chain, ChainError, Policy, Position};
+pub use chain::{
+    parse_certificate_list, verify_certificate_list, verify_chain, ChainError, Policy, Position,
+    Revocation,
+};
 pub use client::{
     CertificateVerifier, CertificateVerifyInput, ClientConfig, ClientError, ClientHandshake, Out,
     RejectAll, UnixTime,
 };
+pub use crl::{CertificateRevocationList, CrlError, RevokedCertificate};
 pub use der::{oid_from_dotted, Class, Der, DerError, Element, Oid, Tag};
 pub use gcm::{Aes128Gcm, GcmError, NONCE_LEN, TAG_LEN};
 pub use handshake::{
@@ -159,7 +178,11 @@ pub use leaf::{dns_name_matches, verify_leaf, verify_server_auth, verify_server_
 pub use record::{Record, RecordError, RecordLayer, TrafficKeys};
 pub use rsa::{RsaError, RsaPublicKey};
 pub use sha256::{hmac_sha256, hmac_sha256_parts, Sha256};
-pub use verify::{verify_certificate_signature, verify_handshake_signature, Suite, VerifyError};
+pub use verifier::{PinnedVerifier, VerifyFailure};
+pub use verify::{
+    verify_certificate_signature, verify_handshake_signature, verify_tbs_signature, Suite,
+    VerifyError,
+};
 pub use x25519::{diffie_hellman, public_key, x25519, SharedSecretError, BASEPOINT};
 pub use x509::{
     Certificate, GeneralName, KeyUsage, Name, PublicKey, SignatureAlgorithm, X509Error,

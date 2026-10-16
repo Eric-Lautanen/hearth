@@ -180,6 +180,16 @@ pub struct Name<'a> {
 }
 
 impl<'a> Name<'a> {
+    /// A name around DER that is already the `RDNSequence`'s own encoding.
+    ///
+    /// `pub(crate)` and not public: the only caller is [`crate::crl`], which reads the
+    /// same `Name` shape out of a `TBSCertList` and must compare it with a
+    /// certificate's issuer the same way — as bytes, without a re-encoding step that
+    /// could differ.
+    pub(crate) fn from_der(der: &'a [u8]) -> Self {
+        Self { der }
+    }
+
     /// The name's own DER, without the enclosing structure. Two certificates are
     /// linked when the issuer of one is this and the subject of the other is byte
     /// for byte the same.
@@ -235,6 +245,8 @@ pub struct Certificate<'a> {
     key_usage: Option<KeyUsage>,
     extended_key_usage: Vec<Oid<'a>>,
     subject_alt_names: Vec<GeneralName<'a>>,
+    subject_key_id: Option<&'a [u8]>,
+    authority_key_id: Option<&'a [u8]>,
     signature_algorithm: SignatureAlgorithm<'a>,
     signature: &'a [u8],
 }
@@ -358,6 +370,8 @@ impl<'a> Certificate<'a> {
             key_usage: extensions.key_usage,
             extended_key_usage: extensions.extended_key_usage,
             subject_alt_names: extensions.subject_alt_names,
+            subject_key_id: extensions.subject_key_id,
+            authority_key_id: extensions.authority_key_id,
             signature_algorithm,
             signature,
         })
@@ -436,6 +450,25 @@ impl<'a> Certificate<'a> {
         self.key_usage
     }
 
+    /// This certificate's own key identity, from `subjectKeyIdentifier`.
+    ///
+    /// `None` when the extension is absent, which is legal — RFC 5280 §4.2.1.2 makes
+    /// it required of CA certificates but not of end entities.
+    pub fn subject_key_id(&self) -> Option<&'a [u8]> {
+        self.subject_key_id
+    }
+
+    /// The identity of the key that signed this certificate, from
+    /// `authorityKeyIdentifier`.
+    ///
+    /// `None` when the extension is absent, and also when it names the key by issuer
+    /// and serial number rather than by key identifier — the two forms identify the same
+    /// key differently, and only the key identifier form can be compared with a
+    /// `subjectKeyIdentifier`.
+    pub fn authority_key_id(&self) -> Option<&'a [u8]> {
+        self.authority_key_id
+    }
+
     /// Every `extKeyUsage` purpose.
     pub fn extended_key_usage(&self) -> &[Oid<'a>] {
         &self.extended_key_usage
@@ -468,6 +501,8 @@ struct Extensions<'a> {
     key_usage: Option<KeyUsage>,
     extended_key_usage: Vec<Oid<'a>>,
     subject_alt_names: Vec<GeneralName<'a>>,
+    subject_key_id: Option<&'a [u8]>,
+    authority_key_id: Option<&'a [u8]>,
 }
 
 impl<'a> Extensions<'a> {
@@ -501,6 +536,15 @@ impl<'a> Extensions<'a> {
                 oids::KEY_USAGE => result.key_usage = Some(key_usage(value)?),
                 oids::EXT_KEY_USAGE => result.extended_key_usage = extended_key_usage(value)?,
                 oids::SUBJECT_ALT_NAME => result.subject_alt_names = subject_alt_names(value)?,
+                oids::SUBJECT_KEY_IDENTIFIER => {
+                    result.subject_key_id = Some(subject_key_id(value)?)
+                }
+                oids::AUTHORITY_KEY_IDENTIFIER => {
+                    // `None` when the identifier names the key by issuer and serial
+                    // instead, or names nothing at all: absent is not an error, because
+                    // the extension is optional and the other form is legal.
+                    result.authority_key_id = authority_key_id(value)?;
+                }
                 _ => {
                     // RFC 5280 §4.2: "A certificate-using system MUST reject the
                     // certificate if it encounters a critical extension it does
@@ -544,6 +588,48 @@ fn basic_constraints(value: &[u8]) -> Result<(bool, Option<u32>), X509Error> {
     };
     fields.expect_end()?;
     Ok((is_ca, path_len))
+}
+
+/// `SubjectKeyIdentifier ::= KeyIdentifier`, and `KeyIdentifier ::= OCTET STRING`.
+///
+/// The extension's value is the DER of that type, so what arrives is one `OCTET
+/// STRING` around the identifier itself.
+fn subject_key_id(value: &[u8]) -> Result<&[u8], X509Error> {
+    let mut reader = Der::new(value);
+    let identifier = reader.take(Tag::OCTET_STRING)?;
+    reader.expect_end()?;
+    if identifier.contents().is_empty() {
+        return Err(X509Error::Invalid("subjectKeyIdentifier is empty"));
+    }
+    Ok(identifier.contents())
+}
+
+/// `AuthorityKeyIdentifier ::= SEQUENCE { keyIdentifier [0] IMPLICIT KeyIdentifier
+/// OPTIONAL, authorityCertIssuer [1] IMPLICIT GeneralNames OPTIONAL,
+/// authorityCertSerialNumber [2] IMPLICIT CertificateSerialNumber OPTIONAL }`.
+///
+/// Only the key identifier is kept. It is `[0]` **implicit** over an `OCTET STRING`, so
+/// its contents are the identifier bytes directly rather than a nested `OCTET STRING`.
+/// The issuer-and-serial form is read past rather than read: it names the same key, and a
+/// caller comparing identifiers has nothing to compare it with.
+fn authority_key_id(value: &[u8]) -> Result<Option<&[u8]>, X509Error> {
+    let mut reader = Der::new(value);
+    let sequence = reader.take(Tag::SEQUENCE)?;
+    reader.expect_end()?;
+    let mut fields = sequence.reader()?;
+    // In order, because that is what a `SEQUENCE` is: a field that arrives out of order
+    // leaves the reader with something it did not expect, which `expect_end` refuses.
+    let identifier = fields.take_if(Tag::context_primitive(0))?;
+    fields.take_if(Tag::context(1))?;
+    fields.take_if(Tag::context_primitive(2))?;
+    fields.expect_end()?;
+    match identifier {
+        Some(element) if element.contents().is_empty() => {
+            Err(X509Error::Invalid("authorityKeyIdentifier is empty"))
+        }
+        Some(element) => Ok(Some(element.contents())),
+        None => Ok(None),
+    }
 }
 
 /// `KeyUsage ::= BIT STRING`, at most nine bits.
@@ -646,7 +732,10 @@ fn parse_validity(validity: &Element<'_>) -> Result<(UnixTime, UnixTime), X509Er
 /// no fractional seconds, no omitted seconds — a time that could be read two ways
 /// is a time two implementations can disagree about, which is how a certificate
 /// that has expired for one verifier is valid for another.
-fn parse_time(element: &Element<'_>) -> Result<UnixTime, X509Error> {
+///
+/// `pub(crate)`: a CRL's `thisUpdate` and `nextUpdate` are the same two `Time` forms,
+/// and two readers of one time format are two places to disagree about it.
+pub(crate) fn parse_time(element: &Element<'_>) -> Result<UnixTime, X509Error> {
     let text = element.as_primitive()?;
     let (year, rest) = match element.tag() {
         Tag::UTC_TIME => {
@@ -746,7 +835,11 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 }
 
 /// `AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY OPTIONAL }`.
-fn parse_signature_algorithm<'a>(
+///
+/// `pub(crate)` because [`crate::crl`] reads the same structure out of a CRL: a
+/// revocation list is signed with the same `AlgorithmIdentifier` a certificate is,
+/// and one reader of it is one place for the rules to live.
+pub(crate) fn parse_signature_algorithm<'a>(
     element: &Element<'a>,
 ) -> Result<SignatureAlgorithm<'a>, X509Error> {
     let mut fields = element.reader()?;

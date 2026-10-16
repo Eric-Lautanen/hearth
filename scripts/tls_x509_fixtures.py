@@ -8,11 +8,12 @@ them is a differential test against a real implementation rather than a snapshot
 of our own output.
 
 The keys are derived from a fixed seed with `sympy` primes, so the *keys* are the
-same on every run and four of the six fixtures regenerate byte for byte (their RSA
-signatures are deterministic). Two do not: `SELF_SIGNED_PSS` is RSA-PSS, whose salt
-is random, and `SELF_SIGNED_EC` is ECDSA, whose nonce is random — so their signature
-bytes differ on every run, and the ECDSA signature's *length* can differ too, which
-moves that certificate's whole DER length.
+same on every run and every fixture regenerates byte for byte except two:
+`SELF_SIGNED_PSS` is RSA-PSS, whose salt is random, and `SELF_SIGNED_EC` is ECDSA,
+whose nonce is random — so their signature bytes differ on every run, and the ECDSA
+signature's *length* can differ too, which moves that certificate's whole DER
+length. The `CV_*` signature vectors below are RSA-PSS and ECDSA for the same
+reason, and are verified by the OpenSSL CLI before being written down.
 
 **Every fixture has its own key, and that is load-bearing.** Two certificates that
 share a key cannot tell a verifier from a key lookup: the PSS fixture once reused
@@ -42,6 +43,7 @@ Requires `pip install cryptography sympy`. Run from the repository root:
     python scripts/tls_x509_fixtures.py
 """
 import datetime
+import hashlib
 import os
 import random
 import re
@@ -192,6 +194,245 @@ def write_pem(by_label, path, labels):
             handle.write(by_label[label].public_bytes(serialization.Encoding.PEM))
 
 
+def der_tlv(tag, body):
+    """One DER element, with a minimal length."""
+    if len(body) < 0x80:
+        return bytes([tag, len(body)]) + body
+    encoded = len(body).to_bytes((len(body).bit_length() + 7) // 8, "big")
+    return bytes([tag, 0x80 | len(encoded)]) + encoded + body
+
+
+def der_sequence(*parts):
+    return der_tlv(0x30, b"".join(parts))
+
+
+def der_integer(value):
+    raw = value.to_bytes((value.bit_length() + 7) // 8 or 1, "big")
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return der_tlv(0x02, raw)
+
+
+def der_utc_time(moment):
+    return der_tlv(0x17, moment.strftime("%y%m%d%H%M%SZ").encode())
+
+
+def build_crl(issuer_der, signing_key, serials, *, last, next_, version=2, extensions=()):
+    """A CRL written out by hand.
+
+    The library cannot produce the shapes that matter here — v1 (no version field and no
+    extensions), a CRL with no `nextUpdate`, and one carrying an extension of our own
+    choosing — so the bytes are built directly. `issuer_der` is the issuer's own `Name`
+    encoding as `Name.public_bytes()` gives it, which is the same encoding a certificate
+    carries, and `extensions` are `(oid, value, critical)` triples.
+
+    Everything written down here is checked afterwards by [`crl_facts_from_openssl`]: a
+    hand-built structure whose two readers disagree is a fixture bug, and it raises
+    rather than being pinned.
+    """
+    algorithm = der_sequence(
+        der_tlv(0x06, bytes([0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B])),
+        der_tlv(0x05, b""),
+    )
+    fields = []
+    if version == 2:
+        # A plain INTEGER, not the `[0] EXPLICIT` a *certificate* wraps its version in.
+        # The tagged form is unreadable to OpenSSL and is the shape this generator first
+        # wrote, which is how the same mistake survived in the Rust parser: two readings
+        # of the format that agreed with each other and with nothing else.
+        fields.append(der_integer(1))
+    fields.append(algorithm)
+    fields.append(issuer_der)
+    fields.append(der_utc_time(last))
+    if next_ is not None:
+        fields.append(der_utc_time(next_))
+    if serials:
+        entries = b"".join(
+            der_sequence(der_integer(serial), der_utc_time(last)) for serial in serials
+        )
+        fields.append(der_sequence(entries))
+    if extensions:
+        listed = b"".join(
+            der_sequence(
+                der_tlv(0x06, oid)
+                + (b"\x01\x01\xff" if critical else b"")
+                + der_tlv(0x04, value)
+            )
+            for oid, value, critical in extensions
+        )
+        fields.append(der_tlv(0xA0, der_sequence(listed)))
+    tbs = der_sequence(*fields)
+    signature = signing_key.sign(tbs, padding.PKCS1v15(), hashes.SHA256())
+    return der_sequence(tbs, algorithm, der_tlv(0x03, b"\x00" + signature))
+
+
+def crl_facts_from_openssl(der):
+    """What the OpenSSL CLI reads out of a CRL, or a refusal.
+
+    A CRL the tool cannot *load* is not a CRL the tool refuses, and the difference has
+    already cost this project one wrong conclusion, so an unreadable CRL raises here
+    instead of producing a verdict.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "one.der")
+        with open(path, "wb") as handle:
+            handle.write(der)
+        result = subprocess.run(
+            ["openssl", "crl", "-in", path, "-inform", "DER", "-noout", "-text"],
+            capture_output=True,
+            text=True,
+        )
+        text = result.stdout + result.stderr
+        if result.returncode != 0:
+            raise RuntimeError("openssl cannot read this CRL: %s" % text.strip()[:200])
+    # The CLI prints the serial number's DER contents, so a serial that needed a leading
+    # zero octet to stay positive arrives with it. The Rust side reads magnitudes, so what
+    # is recorded is the magnitude: colons out, lower case, leading zeros off.
+    # `strip` first: a revoked entry's serial is printed indented, and a `startswith` on
+    # the raw line silently reads *no* serials out of every CRL with entries in it —
+    # which is exactly what the first version of this did, on a list that does have one.
+    serials = [
+        line.split(":", 1)[1].strip().replace(":", "").lower().lstrip("0").rjust(2, "0")
+        for line in text.splitlines()
+        if line.strip().startswith("Serial Number:")
+    ]
+    return {
+        "version": 2 if "Version 2" in text else 1,
+        "serials": serials,
+        "this_update": _openssl_moment(text, "Last Update:"),
+        "next_update": _openssl_moment(text, "Next Update:"),
+    }
+
+
+def _openssl_moment(text, prefix):
+    for line in text.splitlines():
+        if line.strip().startswith(prefix):
+            value = line.split(":", 1)[1].strip()
+            if value == "NONE":
+                return None
+            parsed = datetime.datetime.strptime(value, "%b %d %H:%M:%S %Y GMT")
+            return int(parsed.replace(tzinfo=UTC).timestamp())
+    raise RuntimeError("no %s line in the CRL text" % prefix)
+
+
+def openssl_crl_verdict(by_label, crl_ders, chain, anchors, attime, crl_check_all):
+    """`(ok, error, depth)` from the OpenSSL CLI for one path, checked with CRLs.
+
+    The same three flags as [`openssl_verdict`] and one more decision: `-crl_check_all`
+    asks about every certificate in the path, which is what this crate's `Revocation::
+    Required` means, while `-crl_check` asks about the leaf alone. Both are used, because
+    the gap between them is one of the recorded divergences.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ca = os.path.join(tmp, "ca.pem")
+        leaf = os.path.join(tmp, "leaf.pem")
+        untrusted = os.path.join(tmp, "chain.pem")
+        crl_file = os.path.join(tmp, "crls.pem")
+        write_pem(by_label, ca, anchors)
+        write_pem(by_label, leaf, [chain[0]])
+        with open(crl_file, "wb") as handle:
+            handle.write(b"".join(crl_ders))
+        command = [
+            "openssl", "verify",
+            "-CAfile", ca,
+            "-CRLfile", crl_file,
+            "-crl_check_all" if crl_check_all else "-crl_check",
+            "-partial_chain",
+            "-attime", str(attime),
+            "-auth_level", "0",
+        ]
+        if chain[1:]:
+            write_pem(by_label, untrusted, chain[1:])
+            command += ["-untrusted", untrusted]
+        result = subprocess.run(command + [leaf], capture_output=True, text=True)
+
+    found = re.search(r"error (\d+) at (\d+) depth lookup", result.stdout + result.stderr)
+    return (
+        result.returncode == 0,
+        int(found.group(1)) if found else None,
+        int(found.group(2)) if found else None,
+    )
+
+
+def crl_cases():
+    """The paths both implementations are asked about, with revocation turned on.
+
+    `(name, chain, anchors, crls, instant-from, crl_check_all, diverges)`, where `crls`
+    names fixtures from [`crl_fixtures`]. `diverges` is set only where a disagreement is
+    expected, and the test enforces the direction: OpenSSL may accept while this crate
+    refuses, never the reverse.
+    """
+    return [
+        ("crl-clean-path", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_CLEAN", "CRL_BY_ROOT"], "LEAF_RSA", True, None),
+        ("crl-leaf-revoked", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_REVOKES_LEAF", "CRL_BY_ROOT"], "LEAF_RSA", True, None),
+        ("crl-intermediate-revoked", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_CLEAN", "CRL_BY_ROOT_REVOKES_INTERMEDIATE"], "LEAF_RSA", True, None),
+        ("crl-anchor-revoked-by-its-own-list", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_CLEAN", "CRL_BY_ROOT", "CRL_BY_ROOT_REVOKES_ROOT"], "LEAF_RSA", True, None),
+        ("crl-missing-for-the-leaf", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_BY_ROOT"], "LEAF_RSA", True, None),
+        ("crl-missing-for-the-intermediate", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_CLEAN"], "LEAF_RSA", True, None),
+        (
+            "crl-missing-for-the-intermediate-leaf-only-check",
+            ["LEAF_RSA", "INTERMEDIATE"],
+            ["ROOT"],
+            ["CRL_CLEAN"],
+            "LEAF_RSA",
+            False,
+            "OpenSSL's `-crl_check` asks only about the leaf, so a revoked intermediate "
+            "goes unnoticed there; this crate checks every certificate in the path, so a "
+            "CRL for the intermediate is required rather than optional",
+        ),
+        ("crl-expired", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_EXPIRED", "CRL_BY_ROOT"], "LEAF_RSA", True, None),
+        ("crl-not-yet-valid", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_NOT_YET_VALID", "CRL_BY_ROOT"], "LEAF_RSA", True, None),
+        ("crl-without-next-update", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_NO_NEXT_UPDATE", "CRL_BY_ROOT"], "LEAF_RSA", True, None),
+        ("crl-v1", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_V1", "CRL_BY_ROOT"], "LEAF_RSA", True, None),
+        ("crl-v1-revokes-the-leaf", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_V1_REVOKES_LEAF", "CRL_BY_ROOT"], "LEAF_RSA", True, None),
+        (
+            "crl-unknown-critical-extension",
+            ["LEAF_RSA", "INTERMEDIATE"],
+            ["ROOT"],
+            ["CRL_UNKNOWN_CRITICAL", "CRL_BY_ROOT"],
+            "LEAF_RSA",
+            True,
+            "both refuse, at different layers: OpenSSL loads the CRL and returns error 36, "
+            "while this crate refuses to read it at all (RFC 5280 §5.2 makes an unknown "
+            "critical extension fatal)",
+        ),
+        (
+            "crl-delta-indicator",
+            ["LEAF_RSA", "INTERMEDIATE"],
+            ["ROOT"],
+            ["CRL_DELTA", "CRL_BY_ROOT"],
+            "LEAF_RSA",
+            True,
+            "a delta CRL lists only what changed since a base CRL, so using it as a complete "
+            "one reports as unrevoked what the base revokes; OpenSSL 3.5.5 accepts it in this "
+            "position and this crate refuses to read it",
+        ),
+        ("crl-signed-by-the-wrong-key", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_WRONG_KEY", "CRL_BY_ROOT"], "LEAF_RSA", True, None),
+        ("crl-stale-revoking-beside-fresh-clean", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], ["CRL_REVOKES_LEAF_STALE", "CRL_CLEAN", "CRL_BY_ROOT"], "LEAF_RSA", True, None),
+        ("crl-issuer-without-crl-sign", ["LEAF_OF_NO_CRL_SIGN_CA", "CA_NO_CRL_SIGN"], ["ROOT"], ["CRL_BY_NO_CRL_SIGN", "CRL_BY_ROOT"], "LEAF_OF_NO_CRL_SIGN_CA", True, None),
+    ]
+
+
+def check_crl_facts(label, der, expected=None):
+    """The OpenSSL CLI's reading of a CRL, checked against what was written down.
+
+    Two readers of the same bytes: the CLI, which is independent, and — for the
+    hand-built CRLs alone — the facts their own construction claims. A disagreement is a
+    fixture bug and raises here rather than being pinned into the table.
+    """
+    try:
+        facts = crl_facts_from_openssl(der)
+    except RuntimeError as error:
+        raise RuntimeError("%s: %s" % (label, error))
+    for key, wanted in (expected or {}).items():
+        if facts[key] != wanted:
+            raise RuntimeError(
+                "%s: openssl reads %s=%s, but the fixture claims %s"
+                % (label, key, facts[key], wanted)
+            )
+    return facts
+
+
 def verify_cases():
     """The paths both implementations are asked about.
 
@@ -205,6 +446,7 @@ def verify_cases():
     """
     return [
         ("leaf-and-intermediate-to-root", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], "LEAF_RSA", None),
+        ("ec-leaf-and-intermediate-to-root", ["LEAF_EC_VALID", "INTERMEDIATE"], ["ROOT"], "LEAF_EC_VALID", None),
         ("intermediate-pinned-as-the-anchor", ["LEAF_SUB", "SUB_CA"], ["TOP_CA"], "LEAF_SUB", None),
         ("path-deeper-than-the-root-allows", ["LEAF_SUB", "SUB_CA", "TOP_CA"], ["ROOT"], "LEAF_SUB", None),
         ("issuer-without-keyCertSign", ["LEAF_OF_NO_SIGN_CA", "CA_NO_KEY_CERT_SIGN"], ["ROOT"], "LEAF_OF_NO_SIGN_CA", None),
@@ -223,6 +465,20 @@ def verify_cases():
             ["LEAF_OF_ROLLOVER_CA_B", "ROLLOVER_CA_B", "ROLLOVER_CA_A"],
             ["ROOT"],
             "LEAF_OF_ROLLOVER_CA_B",
+            None,
+        ),
+        (
+            "leaf-whose-key-identifier-matches",
+            ["LEAF_WITH_MATCHING_AKI", "AKI_CA"],
+            ["ROOT"],
+            "LEAF_WITH_MATCHING_AKI",
+            None,
+        ),
+        (
+            "leaf-whose-key-identifier-points-nowhere",
+            ["LEAF_WITH_MISMATCHED_AKI", "AKI_CA"],
+            ["ROOT"],
+            "LEAF_WITH_MISMATCHED_AKI",
             None,
         ),
         (
@@ -340,6 +596,17 @@ def expectations(cert):
             path_len = extension.value.path_length
             has_basic_constraints = True
 
+    # The key identifiers, read out of OpenSSL's own parser: the two extensions the
+    # chain builder compares, and the only ones whose fields are context-tagged.
+    subject_key_id = None
+    authority_key_id = None
+    for extension in cert.extensions:
+        if isinstance(extension.value, x509.SubjectKeyIdentifier):
+            subject_key_id = extension.value.digest.hex()
+        elif isinstance(extension.value, x509.AuthorityKeyIdentifier):
+            identifier = extension.value.key_identifier
+            authority_key_id = identifier.hex() if identifier else None
+
     cn = [a.value for a in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)]
     issuer_cn = [a.value for a in cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)]
     return {
@@ -353,6 +620,8 @@ def expectations(cert):
         "path_len": path_len,
         "key_usage": key_usage_mask(usage) if usage else None,
         "san_dns": names,
+        "subject_key_id": subject_key_id,
+        "authority_key_id": authority_key_id,
         "signature_algorithm": cert.signature_algorithm_oid.dotted_string,
         "key": key,
     }
@@ -387,6 +656,17 @@ def main():
     leaf_of_weak_key = rsa_key(20261104)
     non_ca_signer_key = rsa_key(20261201)
     leaf_of_non_ca_key = rsa_key(20261202)
+    # Two more identities for the revocation slice: a CA that may issue certificates but
+    # may not publish revocation lists, and a leaf it signed.
+    no_crl_sign_ca_key = rsa_key(20261501)
+    leaf_of_no_crl_sign_key = rsa_key(20261502)
+    # An EC leaf that is *actually usable*: its window sits inside its issuer's, unlike
+    # `LEAF_EC`, whose window starts after its issuer's has closed. The whole verifier needs
+    # one chain per signature suite, or a verifier that only ever worked for RSA would pass.
+    leaf_ec_valid_key = ec_key(20261601)
+    aki_ca_key = rsa_key(20261401)
+    leaf_with_matching_aki_key = rsa_key(20261402)
+    leaf_with_mismatched_aki_key = rsa_key(20261403)
     rollover_ca_a_key = rsa_key(20261301)
     rollover_ca_b_key = rsa_key(20261302)
     leaf_of_rollover_key = rsa_key(20261303)
@@ -978,6 +1258,94 @@ def main():
         rollover_ca_b_key,
     ).sign(rollover_ca_b_key, hashes.SHA256())
 
+    # Whether a child's `authorityKeyIdentifier` has to agree with its issuer's
+    # `subjectKeyIdentifier`. `AKI_CA` names its own key; one leaf points at it, the other
+    # points at twenty bytes nothing owns. The second is the shape a rollover makes
+    # dangerous: two certificates with one distinguished name, and the key identifier as the
+    # only thing that says which one signed you.
+    aki_ca = (
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test AKI CA"))
+        .issuer_name(root.subject)
+        .public_key(aki_ca_key.public_key())
+        .serial_number(0x50)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(key_cert_sign=True, crl_sign=True), critical=True)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(aki_ca_key.public_key()), critical=False
+        )
+        .sign(root_key, hashes.SHA256())
+    )
+
+    def aki_leaf(cn, key, serial, identifier):
+        return (
+            x509.CertificateBuilder()
+            .subject_name(name(cn))
+            .issuer_name(aki_ca.subject)
+            .public_key(key.public_key())
+            .serial_number(serial)
+            .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+            .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(usage(digital_signature=True), critical=True)
+            .add_extension(
+                x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+            )
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(cn)]), critical=False)
+            .add_extension(
+                x509.AuthorityKeyIdentifier(
+                    key_identifier=identifier, authority_cert_issuer=None, authority_cert_serial_number=None
+                ),
+                critical=False,
+            )
+            .sign(aki_ca_key, hashes.SHA256())
+        )
+
+    # The identifier the CA actually has, and twenty bytes of nothing.
+    aki_of_aki_ca = x509.SubjectKeyIdentifier.from_public_key(aki_ca_key.public_key()).digest
+    nobody_key_id = bytes.fromhex("deadbeef" * 5)
+    leaf_with_matching_aki = aki_leaf("aki-match.example", leaf_with_matching_aki_key, 0x51, aki_of_aki_ca)
+    leaf_with_mismatched_aki = aki_leaf(
+        "aki-mismatch.example", leaf_with_mismatched_aki_key, 0x52, nobody_key_id
+    )
+
+    # A CA that may sign certificates but may **not** sign revocation lists: the
+    # `keyUsage` bit that matters for a CRL is `cRLSign`, and this is the fixture that
+    # makes it a rule rather than a comment. It is an ordinary CA in every other way, and
+    # its leaf really is signed by it.
+    no_crl_sign_ca = (
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test No-CRL-Sign CA"))
+        .issuer_name(root.subject)
+        .public_key(no_crl_sign_ca_key.public_key())
+        .serial_number(0x53)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(key_cert_sign=True), critical=True)
+        .sign(root_key, hashes.SHA256())
+    )
+    leaf_of_no_crl_sign_ca = (
+        x509.CertificateBuilder()
+        .subject_name(name("no-crl-sign.example"))
+        .issuer_name(no_crl_sign_ca.subject)
+        .public_key(leaf_of_no_crl_sign_key.public_key())
+        .serial_number(0x54)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("no-crl-sign.example")]), critical=False
+        )
+        .sign(no_crl_sign_ca_key, hashes.SHA256())
+    )
+
     # A leaf whose unknown extension is marked **critical**. RFC 5280 requires a
     # reader that does not understand a critical extension to reject the
     # certificate, so this one must not parse.
@@ -996,6 +1364,112 @@ def main():
         )
         .add_extension(
             x509.SubjectAlternativeName([x509.DNSName("critical.example")]), critical=False
+        )
+        .sign(intermediate_key, hashes.SHA256())
+    )
+
+    # ---- the revocation lists --------------------------------------------------
+    #
+    # Built last because they are about the certificates above. The windows are chosen
+    # around the instant the CRL cases use (LEAF_RSA's `notBefore`, 2026-01-01Z): a
+    # "current" list covers it, an expired one closed before it, and a future one opens
+    # after it.
+    window_start = datetime.datetime(2025, 1, 1, tzinfo=UTC)
+    window_end = datetime.datetime(2027, 1, 1, tzinfo=UTC)
+    stale_start = datetime.datetime(2019, 1, 1, tzinfo=UTC)
+    stale_end = datetime.datetime(2021, 1, 1, tzinfo=UTC)
+    later_start = datetime.datetime(2025, 6, 1, tzinfo=UTC)
+    future_start = datetime.datetime(2030, 1, 1, tzinfo=UTC)
+    leaf_serial = 0xFF
+    intermediate_serial = 0x02
+    root_serial = 0x01
+
+    def signed_crl(issuer_cert, signing_key, serials, *, last, next_, number):
+        builder = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(issuer_cert.subject)
+            .last_update(last)
+            .next_update(next_)
+            .add_extension(x509.CRLNumber(number), critical=False)
+        )
+        for serial in serials:
+            builder = builder.add_revoked_certificate(
+                x509.RevokedCertificateBuilder()
+                .serial_number(serial)
+                .revocation_date(last)
+                .build()
+            )
+        return builder.sign(signing_key, hashes.SHA256())
+
+    # The two the hierarchy's own CAs publish, and the four shapes of "which instant is
+    # this list about": current, superseded, expired, and not yet in force.
+    crl_clean = signed_crl(intermediate, intermediate_key, [], last=window_start, next_=window_end, number=1)
+    crl_by_root = signed_crl(root, root_key, [], last=window_start, next_=window_end, number=1)
+    crl_revokes_leaf = signed_crl(intermediate, intermediate_key, [leaf_serial], last=later_start, next_=window_end, number=2)
+    crl_revokes_leaf_stale = signed_crl(intermediate, intermediate_key, [leaf_serial], last=stale_start, next_=stale_end, number=1)
+    crl_expired = signed_crl(intermediate, intermediate_key, [], last=stale_start, next_=stale_end, number=3)
+    crl_not_yet_valid = signed_crl(intermediate, intermediate_key, [], last=future_start, next_=datetime.datetime(2031, 1, 1, tzinfo=UTC), number=4)
+    crl_by_root_revokes_intermediate = signed_crl(root, root_key, [intermediate_serial], last=later_start, next_=window_end, number=2)
+    crl_by_root_revokes_root = signed_crl(root, root_key, [root_serial], last=later_start, next_=window_end, number=3)
+    crl_by_no_crl_sign = signed_crl(no_crl_sign_ca, no_crl_sign_ca_key, [], last=window_start, next_=window_end, number=1)
+    # The right issuer name signed by the wrong key: a same-name impostor's list.
+    crl_wrong_key = signed_crl(intermediate, root_key, [], last=window_start, next_=window_end, number=5)
+    # Two lists published at the *same* instant, with the same CRL number, that disagree
+    # about the same certificate: nothing in either says which is the later one, so there is
+    # no honest way to pick between them. This pair exists for the rule that refuses instead
+    # of guessing. OpenSSL is not asked about it — either answer it gave would be a choice,
+    # not a rule.
+    crl_conflict_clean = signed_crl(intermediate, intermediate_key, [], last=window_start, next_=window_end, number=2)
+    crl_conflict_revokes_leaf = signed_crl(intermediate, intermediate_key, [leaf_serial], last=window_start, next_=window_end, number=2)
+
+    # Hand-built, because the library cannot produce a v1 CRL, a CRL with no
+    # `nextUpdate`, or one carrying an extension of our choosing. Their facts are given
+    # below and checked against the OpenSSL CLI's reading of the same bytes, so a
+    # hand-built structure whose two readers disagree stops the generator.
+    intermediate_name = intermediate.subject.public_bytes()
+    unknown_oid = bytes([0x2A, 0x03, 0x04])
+    delta_oid = bytes([0x55, 0x1D, 0x1B])
+    crl_no_next_update = build_crl(
+        intermediate_name, intermediate_key, [], last=window_start, next_=None
+    )
+    crl_v1 = build_crl(intermediate_name, intermediate_key, [], last=window_start, next_=window_end, version=1)
+    crl_v1_revokes_leaf = build_crl(
+        intermediate_name, intermediate_key, [leaf_serial], last=window_start, next_=window_end, version=1
+    )
+    crl_unknown_critical = build_crl(
+        intermediate_name,
+        intermediate_key,
+        [],
+        last=window_start,
+        next_=window_end,
+        extensions=[(unknown_oid, b"\x05\x00", True)],
+    )
+    crl_delta = build_crl(
+        intermediate_name,
+        intermediate_key,
+        [],
+        last=window_start,
+        next_=window_end,
+        extensions=[(delta_oid, b"\x02\x01\x07", True)],
+    )
+
+    # P-256, a window inside the intermediate's, and a name of its own: the chain an
+    # end-to-end verification of an `ecdsa_secp256r1_sha256` CertificateVerify needs.
+    leaf_ec_valid = (
+        x509.CertificateBuilder()
+        .subject_name(name("ec-signer.example"))
+        .issuer_name(intermediate.subject)
+        .public_key(leaf_ec_valid_key.public_key())
+        .serial_number(0x55)
+        .not_valid_before(datetime.datetime(2030, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2035, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("ec-signer.example")]), critical=False
         )
         .sign(intermediate_key, hashes.SHA256())
     )
@@ -1028,6 +1502,125 @@ def main():
         ("ROLLOVER_CA_A", rollover_ca_a),
         ("ROLLOVER_CA_B", rollover_ca_b),
         ("LEAF_OF_ROLLOVER_CA_B", leaf_of_rollover_ca_b),
+        ("AKI_CA", aki_ca),
+        ("LEAF_WITH_MATCHING_AKI", leaf_with_matching_aki),
+        ("LEAF_WITH_MISMATCHED_AKI", leaf_with_mismatched_aki),
+        ("CA_NO_CRL_SIGN", no_crl_sign_ca),
+        ("LEAF_OF_NO_CRL_SIGN_CA", leaf_of_no_crl_sign_ca),
+        ("LEAF_EC_VALID", leaf_ec_valid),
+    ]
+
+    # ---- the CertificateVerify vectors -----------------------------------------
+    #
+    # RFC 8446 §4.4.3's construction — 64 spaces, the context string, a zero byte, then the
+    # transcript hash through `Certificate` — signed with the fixture leaves' own keys, so a
+    # whole `CertificateVerifier` can be driven from a test. The hash is a fixed 32 bytes and
+    # not a transcript of anything: what these pin is the *arithmetic and the dispatch*, and
+    # the real transcript is already pinned by RFC 8448's own recorded flight. Each signature
+    # is verified by the OpenSSL CLI before it is written down here, so a vector this crate
+    # accepts is one a second implementation also accepts.
+    transcript_hash = hashlib.sha256(b"hearth fixture transcript hash").digest()
+    signed_data = b"\x20" * 64 + b"TLS 1.3, server CertificateVerify" + b"\x00" + transcript_hash
+    cv_rsa_signature = leaf_key.sign(
+        signed_data,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32),
+        hashes.SHA256(),
+    )
+    cv_ecdsa_signature = leaf_ec_valid_key.sign(signed_data, ec.ECDSA(hashes.SHA256()))
+    cv_rsa_forged = bytearray(cv_rsa_signature)
+    cv_rsa_forged[-1] ^= 0x01
+
+    def check_signature_with_openssl(public_key, signature, *, pss):
+        """Whether the OpenSSL CLI verifies this signature over `signed_data`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            key_path = os.path.join(tmp, "leaf.pem")
+            data_path = os.path.join(tmp, "data.bin")
+            sig_path = os.path.join(tmp, "sig.bin")
+            with open(key_path, "wb") as handle:
+                handle.write(
+                    public_key.public_bytes(
+                        serialization.Encoding.PEM,
+                        serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                )
+            with open(data_path, "wb") as handle:
+                handle.write(signed_data)
+            with open(sig_path, "wb") as handle:
+                handle.write(bytes(signature))
+            command = ["openssl", "dgst", "-sha256", "-verify", key_path]
+            if pss:
+                command += [
+                    "-sigopt", "rsa_padding_mode:pss",
+                    "-sigopt", "rsa_pss_saltlen:32",
+                    "-sigopt", "rsa_mgf1_md:sha256",
+                ]
+            command += ["-signature", sig_path, data_path]
+            result = subprocess.run(command, capture_output=True, text=True)
+            return result.returncode == 0 and "Verified OK" in result.stdout
+
+    if not check_signature_with_openssl(leaf_key.public_key(), cv_rsa_signature, pss=True):
+        raise RuntimeError("the RSA CertificateVerify vector does not verify under OpenSSL")
+    if not check_signature_with_openssl(
+        leaf_ec_valid_key.public_key(), cv_ecdsa_signature, pss=False
+    ):
+        raise RuntimeError("the ECDSA CertificateVerify vector does not verify under OpenSSL")
+    if check_signature_with_openssl(leaf_key.public_key(), cv_rsa_forged, pss=True):
+        raise RuntimeError("the forged CertificateVerify vector verifies under OpenSSL")
+
+    # The vectors the Rust tests consume: a name, the fixture whose private key signed (so
+    # the test looks the public key up instead of restating it), the scheme code as RFC 8446
+    # spells it (0x0804 rsa_pss_rsae_sha256, 0x0403 ecdsa_secp256r1_sha256), the constant
+    # holding the signature, and whether a verifier must accept it. The PSS salt is 32
+    # bytes because RFC 8446 §4.2.3 requires the salt to be as long as the hash.
+    cv_vectors = [
+        ("rsa-pss-leaf-signed", "LEAF_RSA", 0x0804, "CV_RSA_SIGNATURE", True),
+        ("rsa-pss-leaf-forged", "LEAF_RSA", 0x0804, "CV_RSA_SIGNATURE_FORGED", False),
+        ("ecdsa-leaf-signed", "LEAF_EC_VALID", 0x0403, "CV_ECDSA_SIGNATURE", True),
+    ]
+
+    # The CRLs, with the facts the OpenSSL CLI reads out of them. The hand-built ones
+    # carry an expected reading, by construction, and it is checked rather than assumed.
+    crl_fixtures = [
+        ("CRL_CLEAN", crl_clean.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_BY_ROOT", crl_by_root.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_REVOKES_LEAF", crl_revokes_leaf.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_REVOKES_LEAF_STALE", crl_revokes_leaf_stale.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_EXPIRED", crl_expired.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_NOT_YET_VALID", crl_not_yet_valid.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_BY_ROOT_REVOKES_INTERMEDIATE", crl_by_root_revokes_intermediate.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_BY_ROOT_REVOKES_ROOT", crl_by_root_revokes_root.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_BY_NO_CRL_SIGN", crl_by_no_crl_sign.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_WRONG_KEY", crl_wrong_key.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_CONFLICT_CLEAN", crl_conflict_clean.public_bytes(serialization.Encoding.DER), None),
+        ("CRL_CONFLICT_REVOKES_LEAF", crl_conflict_revokes_leaf.public_bytes(serialization.Encoding.DER), None),
+        (
+            "CRL_NO_NEXT_UPDATE",
+            crl_no_next_update,
+            {"version": 2, "serials": [], "this_update": int(window_start.timestamp()), "next_update": None},
+        ),
+        (
+            "CRL_V1",
+            crl_v1,
+            {"version": 1, "serials": [], "this_update": int(window_start.timestamp()), "next_update": int(window_end.timestamp())},
+        ),
+        (
+            "CRL_V1_REVOKES_LEAF",
+            crl_v1_revokes_leaf,
+            {"version": 1, "serials": ["ff"], "this_update": int(window_start.timestamp()), "next_update": int(window_end.timestamp())},
+        ),
+        (
+            "CRL_UNKNOWN_CRITICAL",
+            crl_unknown_critical,
+            {"version": 2, "serials": [], "this_update": int(window_start.timestamp()), "next_update": int(window_end.timestamp())},
+        ),
+        (
+            "CRL_DELTA",
+            crl_delta,
+            {"version": 2, "serials": [], "this_update": int(window_start.timestamp()), "next_update": int(window_end.timestamp())},
+        ),
+    ]
+    crls_checked = [
+        (label, der, check_crl_facts(label, der, expected)) for label, der, expected in crl_fixtures
     ]
 
     # `//` rather than `//!`: this file is pulled in with `include!`, so an inner
@@ -1037,16 +1630,26 @@ def main():
     out.append("//")
     out.append("// Generated by scripts/tls_x509_fixtures.py — do not edit by hand.")
     out.append("//")
-    out.append("// The keys come from a fixed seed, so four of these fixtures regenerate byte for")
-    out.append("// byte. Two do not: the RSA-PSS one (random salt) and the ECDSA one (random")
-    out.append("// nonce) carry a fresh signature on every run, which can also move the ECDSA")
-    out.append("// certificate's total length. Every field asserted below is read out of the")
-    out.append("// certificate, so a regenerated file passes the same tests — but this file is")
-    out.append("// the reviewed pin, so regenerate only deliberately.")
+    out.append("// The keys come from a fixed seed, so every fixture here regenerates byte for byte")
+    out.append("// except two: the RSA-PSS one (random salt) and the ECDSA one (random nonce),")
+    out.append("// whose signatures — and, for ECDSA, DER length — change on every run. The")
+    out.append("// CertificateVerify signature vectors are the same kind of thing. Every field")
+    out.append("// asserted below is read out of the certificate, so a regenerated file passes the")
+    out.append("// same tests — but this file is the reviewed pin, so regenerate only deliberately.")
     out.append("")
     for label, cert in fixtures:
         der = cert.public_bytes(serialization.Encoding.DER)
         out.append('const %s_DER_HEX: &str = "%s";\n' % (label, der_hex(der)))
+    out.append("/// The DER of every certificate above, by name.")
+    out.append("///")
+    out.append("/// A table rather than a `match` in the test: a hand-written lookup is one more")
+    out.append("/// place a new fixture can be left out of, and the failure it produces (\"no fixture")
+    out.append("/// named X\") is a test author's problem rather than a fact about the certificate.")
+    out.append("const DER_HEX: &[(&str, &str)] = &[")
+    for label, _ in fixtures:
+        out.append('    ("%s", %s_DER_HEX),' % (label, label))
+    out.append("];")
+    out.append("")
     out.append("/// What OpenSSL's parser says about each fixture above.")
     out.append("const EXPECTATIONS: &[(&str, Expectation)] = &[")
     for label, cert in fixtures:
@@ -1078,10 +1681,96 @@ def main():
             % ("None" if want["key_usage"] is None else "Some(0x%03x)" % want["key_usage"])
         )
         out.append("            san_dns: &[%s]," % names)
+        out.append(
+            "            subject_key_id: %s,"
+            % (
+                "None"
+                if want["subject_key_id"] is None
+                else 'Some("%s")' % want["subject_key_id"]
+            )
+        )
+        out.append(
+            "            authority_key_id: %s,"
+            % (
+                "None"
+                if want["authority_key_id"] is None
+                else 'Some("%s")' % want["authority_key_id"]
+            )
+        )
         out.append('            signature_algorithm: "%s",' % want["signature_algorithm"])
         out.append("            key: %s," % want["key"])
         out.append("        },")
         out.append("    ),")
+    out.append("];")
+    out.append("")
+
+    out.append("/// Every revocation list, and what the OpenSSL CLI reads out of it.")
+    out.append("///")
+    out.append("/// Two of these carry extensions this crate refuses (an unknown critical one and a")
+    out.append("/// deltaCRLIndicator), so their rows are the fields OpenSSL reports rather than a")
+    out.append("/// parse this crate should reach. `CRL_NO_NEXT_UPDATE`, `CRL_V1`,")
+    out.append("/// `CRL_V1_REVOKES_LEAF`, `CRL_UNKNOWN_CRITICAL` and `CRL_DELTA` are written out by")
+    out.append("/// hand in the generator, because the library cannot build those shapes; the facts")
+    out.append("/// written beside them are the ones they were built with, and the generator checks")
+    out.append("/// them against the CLI's reading rather than trusting them.")
+    out.append("const CRL_EXPECTATIONS: &[(&str, CrlExpectation)] = &[")
+    for label, der, facts in crls_checked:
+        serials = ", ".join('"%s"' % serial for serial in facts["serials"])
+        out.append("    (")
+        out.append('        "%s",' % label)
+        out.append("        CrlExpectation {")
+        out.append("            der_len: %d," % len(der))
+        out.append("            version: %d," % facts["version"])
+        out.append("            this_update: %d," % facts["this_update"])
+        out.append(
+            "            next_update: %s,"
+            % ("None" if facts["next_update"] is None else "Some(%d)" % facts["next_update"])
+        )
+        out.append("            revoked_serials: &[%s]," % serials)
+        out.append("        },")
+        out.append("    ),")
+    out.append("];")
+    out.append("")
+    out.append("/// The CRLs themselves, by fixture name.")
+    out.append("const CRL_DER_HEX: &[(&str, &str)] = &[")
+    for label, der, _ in crls_checked:
+        out.append('    ("%s", "%s"),' % (label, der_hex(der)))
+    out.append("];")
+    out.append("")
+
+    out.append("/// The bytes an RFC 8446 §4.4.3 `CertificateVerify` signature covers.")
+    out.append("///")
+    out.append("/// 64 spaces, the context string, a zero byte, then a 32-byte hash. The hash is a")
+    out.append("/// fixed value rather than a transcript of anything: what the vectors below pin is")
+    out.append("/// the verification arithmetic and the dispatch to the right key type, and a real")
+    out.append("/// transcript is already pinned by the RFC 8448 flight. The *shape* is what a test")
+    out.append("/// asserts here, so a generator change that dropped the context string is visible.")
+    out.append('const CV_SIGNED_DATA_HEX: &str = "%s";' % signed_data.hex())
+    out.append("")
+    out.append("/// A `CertificateVerify` signature, verified by the OpenSSL CLI before it was")
+    out.append("/// written down here. RSA-PSS and ECDSA both draw fresh randomness, so these bytes")
+    out.append("/// differ on every regeneration — the tests assert that they verify, not that they")
+    out.append("/// match anything.")
+    out.append('const CV_RSA_SIGNATURE_HEX: &str = "%s";' % cv_rsa_signature.hex())
+    out.append('const CV_ECDSA_SIGNATURE_HEX: &str = "%s";' % cv_ecdsa_signature.hex())
+    out.append("")
+    out.append("/// The same PSS signature with its last byte flipped: the bytes are a valid")
+    out.append("/// length and the scheme is one we offered, so only the arithmetic can refuse it.")
+    out.append('const CV_RSA_SIGNATURE_FORGED_HEX: &str = "%s";' % bytes(cv_rsa_forged).hex())
+    out.append("")
+    out.append("/// Signatures over [`CV_SIGNED_DATA_HEX`], and which of them must verify.")
+    out.append("///")
+    out.append("/// `leaf` names the fixture whose private key made the signature, so the test")
+    out.append("/// looks up the public key it has to be checked against rather than restating it.")
+    out.append("const CV_VECTORS: &[CvVector] = &[")
+    for name, label, scheme, signature, okay in cv_vectors:
+        out.append("    CvVector {")
+        out.append('        name: "%s",' % name)
+        out.append('        leaf: "%s",' % label)
+        out.append("        scheme: 0x%04x," % scheme)
+        out.append("        signature_hex: %s_HEX," % signature)
+        out.append("        okay: %s," % ("true" if okay else "false"))
+        out.append("    },")
     out.append("];")
     out.append("")
 
@@ -1102,6 +1791,46 @@ def main():
         out.append("        chain: &[%s]," % ", ".join('"%s"' % label for label in chain))
         out.append("        anchors: &[%s]," % ", ".join('"%s"' % label for label in anchors))
         out.append("        attime: %d," % attime)
+        out.append("        openssl_ok: %s," % ("true" if ok else "false"))
+        out.append(
+            "        openssl_error: %s," % ("None" if code is None else "Some(%d)" % code)
+        )
+        out.append(
+            "        openssl_depth: %s," % ("None" if depth is None else "Some(%d)" % depth)
+        )
+        out.append(
+            "        divergence: %s,"
+            % ("None" if note is None else 'Some("%s")' % note.replace('"', '\\"'))
+        )
+        out.append("    },")
+    out.append("];")
+    out.append("")
+
+    out.append("/// The same paths, asked of the OpenSSL CLI with revocation checking turned on.")
+    out.append("///")
+    out.append("// `openssl verify -crl_check_all -CRLfile <crls> -partial_chain -auth_level 0`")
+    out.append("///")
+    out.append("/// `crl_check_all` is false for the one case asked with `-crl_check` instead, which")
+    out.append("/// is the flag that leaves every issuer in the path unchecked.")
+    out.append("const CRL_CASES: &[CrlCase] = &[")
+    by_crl_label = {label: der for label, der, _ in crls_checked}
+    for name, chain, anchors, crls, instant_from, crl_check_all, note in crl_cases():
+        attime = int(by_label[instant_from].not_valid_before_utc.timestamp())
+        ok, code, depth = openssl_crl_verdict(
+            by_label,
+            [by_crl_label[label] for label in crls],
+            chain,
+            anchors,
+            attime,
+            crl_check_all,
+        )
+        out.append("    CrlCase {")
+        out.append('        name: "%s",' % name)
+        out.append("        chain: &[%s]," % ", ".join('"%s"' % label for label in chain))
+        out.append("        anchors: &[%s]," % ", ".join('"%s"' % label for label in anchors))
+        out.append("        crls: &[%s]," % ", ".join('"%s"' % label for label in crls))
+        out.append("        attime: %d," % attime)
+        out.append("        crl_check_all: %s," % ("true" if crl_check_all else "false"))
         out.append("        openssl_ok: %s," % ("true" if ok else "false"))
         out.append(
             "        openssl_error: %s," % ("None" if code is None else "Some(%d)" % code)

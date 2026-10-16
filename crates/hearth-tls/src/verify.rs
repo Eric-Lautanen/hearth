@@ -40,12 +40,22 @@
 //! enumerated anywhere — there is no memorized registry value here to get wrong,
 //! and a scheme is never accepted by falling through to a default.
 //!
-//! # What is not here yet
+//! # What is here now, and what is not
 //!
-//! Chain *building* (deciding which certificate issued which, from the names), the
-//! pinned root store, host name matching, and the validity window. Each is in
-//! `docs/RESUME.md` in the order it can be proven, with its negative test, and
-//! none of them may be reachable from a URL before the others exist.
+//! Everything this module was waiting for exists elsewhere in the crate: chain building
+//! with the structural rules, the validity window and revocation are in [`crate::chain`]
+//! (over [`crate::crl`]), host name matching and the leaf's purpose are in
+//! [`crate::leaf`], both call this module for the arithmetic, and
+//! [`crate::verifier::PinnedVerifier`] is the type that calls all of them in the order a
+//! handshake needs — so the whole certificate decision is reachable, with
+//! [`crate::RejectAll`] still there as the verifier a caller who has decided nothing gets.
+//!
+//! What is *not* here is still the trust decision's *inputs*: which anchors a caller trusts
+//! and where they come from is the caller's own decision, and there is no root store in this
+//! crate to inherit by accident. There is no OCSP, no stapling, and nothing that fetches a CRL
+//! — a list is bytes the caller supplies, and keeping one fresh is a job for something that
+//! talks to the network. Each open item is in `docs/RESUME.md` in the order it can be proven,
+//! and none of it may be reachable from a URL before it exists.
 
 use crate::ecdsa::{verify_ecdsa_secp256r1_sha256, EcdsaError};
 use crate::handshake::{SIG_ECDSA_SECP256R1_SHA256, SIG_RSA_PSS_RSAE_SHA256};
@@ -223,9 +233,33 @@ pub fn verify_certificate_signature(
     certificate: &Certificate<'_>,
     issuer_key: &PublicKey<'_>,
 ) -> Result<(), VerifyError> {
-    let suite = Suite::from_certificate_algorithm(certificate.signature_algorithm())?;
-    let message = certificate.tbs();
-    let signature = certificate.signature();
+    verify_tbs_signature(
+        certificate.signature_algorithm(),
+        certificate.tbs(),
+        certificate.signature(),
+        issuer_key,
+    )
+}
+
+/// Verifies a signature over the `tbs` bytes of an X.509 structure.
+///
+/// This is the shared half of every certificate-shaped signature check: a CRL is
+/// signed exactly the way a certificate is — the same `AlgorithmIdentifier`, the same
+/// `tbs`-covers-everything-but-the-signature rule, the same three suites — so both
+/// callers go through here rather than each picking a suite for itself. Two copies of
+/// "which scheme may verify which key" is two chances for one of them to be the
+/// lenient one.
+///
+/// `tbs` must be the original bytes of the structure, never a re-encoding: the whole
+/// point of the check is that the signature covers the fields that were *read*.
+pub fn verify_tbs_signature(
+    algorithm: &SignatureAlgorithm<'_>,
+    tbs: &[u8],
+    signature: &[u8],
+    issuer_key: &PublicKey<'_>,
+) -> Result<(), VerifyError> {
+    let suite = Suite::from_certificate_algorithm(algorithm)?;
+    let message = tbs;
     match suite {
         Suite::RsaPkcs1Sha256 => rsa_key(issuer_key, suite)?
             .verify_pkcs1v15_sha256(message, signature)

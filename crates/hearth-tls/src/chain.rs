@@ -17,9 +17,13 @@
 //!    this crate can verify with and at least the policy's minimum size, and every
 //!    validity window contains the instant.
 //! 3. **Links.** For each certificate in the presented chain, its issuer is the
-//!    **subject of the next one, compared as the DER of the names**, and its
+//!    **subject of the next one, compared as the DER of the names**, its
 //!    signature verifies with that certificate's public key under the scheme its
-//!    own `signatureAlgorithm` names.
+//!    own `signatureAlgorithm` names, and — when both certificates carry the key
+//!    identifiers — the child's `authorityKeyIdentifier` names the issuer's
+//!    `subjectKeyIdentifier`. That last one is what tells two certificates with the
+//!    same distinguished name apart, so it is checked before the arithmetic rather
+//!    than instead of it.
 //! 4. **The anchor.** The last certificate's issuer name must be the subject name
 //!    of one of the caller's anchors, **and** its signature must verify with that
 //!    anchor's key. The anchor is then held to the rules below itself — the CA
@@ -38,11 +42,57 @@
 //! whose top certificate was signed by some other key with the same name is
 //! refused, and that is the case a name-only match would have accepted.
 //!
+//! # Revocation, and the one question no certificate can answer
+//!
+//! Whether a certificate was revoked is information that is **not in the path**. It
+//! has to come from the caller, as a [`Revocation`]: either `Unchecked`, which says in
+//! so many words that nothing is checked, or `Required` with the CRLs to check
+//! against. There is no default, no boolean and no environment variable: a caller
+//! that does not check revocation has to write the word.
+//!
+//! In `Required` mode a CRL **is** for a certificate when the CRL's issuer name is
+//! that certificate's issuer name, byte for byte — the same DER comparison the links
+//! use. Then:
+//!
+//! - every certificate in the presented path must have at least one such CRL. A
+//!   certificate with none is [`ChainError::NoCrlFor`]: its status is *unknown*, and
+//!   unknown is refused rather than accepted. (OpenSSL's `-crl_check_all` answers the
+//!   same way, with error 3.)
+//! - the certificate that issued the CRL must claim `keyUsage.cRLSign` when it states
+//!   a `keyUsage` at all, on the same argument `keyCertSign` is required on: a
+//!   certificate that says it may not sign revocation lists may not have one trusted.
+//! - every CRL for that certificate must verify its signature with the issuing
+//!   certificate's key — so a CRL that is unusable is named rather than ignored, and a
+//!   caller cannot pad the set with a same-name impostor's list.
+//! - **the freshest CRL speaks**: the one with the latest `thisUpdate` decides where
+//!   the certificate stands, which is what makes a superseded CRL harmless rather than
+//!   fatal, and is what OpenSSL does too (measured: a fresh *good* CRL beside a stale
+//!   one that lists the certificate is accepted, and only a stale CRL at all is error
+//!   12). The decisive CRL's window must contain the instant, unless it has no
+//!   `nextUpdate` at all — that means "no stated expiry", not "expired".
+//! - two equally fresh CRLs that disagree about the certificate is
+//!   [`ChainError::AmbiguousRevocation`]: this crate's own rule, refusing rather than
+//!   guessing which of two contradictory answers is real.
+//! - a revoked serial is [`ChainError::Revoked`].
+//!
+//! The **anchor is not covered by any of this**, with one exception: an anchor that is
+//! self-issued and for which the caller supplied a CRL issued by that same anchor is
+//! checked on the same rules. OpenSSL's `-crl_check_all` catches a revoked anchor the
+//! same way (error 23 at the anchor's depth), and the exception is what keeps this crate
+//! from being the *more permissive* side there. An anchor that is not self-issued has an
+//! issuer this crate has no certificate for, so a CRL for it could not be verified with
+//! any key in hand and is simply not about this path.
+//!
+//! **What is still absent: OCSP, and stapling, and fetching.** A CRL is bytes the caller
+//! brings. Keeping one fresh — fetching it, re-fetching it before `nextUpdate`, and
+//! deciding what to do when the refresh fails — is I/O, and I/O is not this crate's job;
+//! that is the downloader's, and the failure mode it must not have is the one where the
+//! refresh fails quietly and the stale list keeps answering.
+//!
 //! # What this does not do, stated plainly
 //!
-//! - **No revocation checking of any kind.** No CRL, no OCSP, no stapling. A
-//!   revoked certificate verifies here. This is the largest gap in what a success
-//!   from this module means, and it is not fixable from `std` alone.
+//! - **No OCSP and no stapling**, so a certificate whose revocation is published only
+//!   in an OCSP responder is `NoCrlFor` here, and one revoked only by OCSP verifies.
 //! - **No path *selection*.** The presented list must be the path, in order: the leaf
 //!   first, then each certificate that certifies the one before it. A list that is out
 //!   of order, repeats a certificate, or carries one that is not part of the path is
@@ -85,8 +135,9 @@
 use std::fmt;
 
 use crate::client::UnixTime;
+use crate::crl::CertificateRevocationList;
 use crate::rsa::{RsaError, RsaPublicKey};
-use crate::verify::{verify_certificate_signature, VerifyError};
+use crate::verify::{verify_certificate_signature, verify_tbs_signature, VerifyError};
 use crate::x509::{Certificate, KeyUsage, PublicKey, X509Error};
 
 /// The knobs a caller sets. Everything else is fixed by the certificates.
@@ -116,6 +167,32 @@ impl Default for Policy {
             min_rsa_bits: 2048,
         }
     }
+}
+
+/// What the caller knows about revocation.
+///
+/// The one input a chain cannot derive from the certificates, and therefore the one
+/// input a caller has to be explicit about. There is no default and no boolean flag:
+/// `Unchecked` is a sentence, not an omission, and the revocation checks live in the
+/// same function as the rest of path validation rather than in something a caller can
+/// forget to call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revocation<'crl> {
+    /// Nothing is checked, because nothing was supplied.
+    ///
+    /// **A revoked certificate verifies in this mode.** Every mainstream HTTPS stack
+    /// defaults here — OpenSSL without `-crl_check` does exactly this, measured against
+    /// these fixtures — and it is the reason revocation checking in practice is
+    /// described as failing open. This variant exists so that the choice appears at the
+    /// call site in words, rather than being inherited from a default nobody read.
+    Unchecked,
+    /// These CRLs are the caller's revocation information, and every certificate in the
+    /// path must be covered by one.
+    ///
+    /// Parsed rather than raw DER, like a trust anchor: a caller that caches its CRLs
+    /// for the length of a session should not have to parse them per handshake, and a
+    /// CRL that does not parse is refused where it is read rather than here.
+    Required(&'crl [CertificateRevocationList<'crl>]),
 }
 
 /// Where a certificate sits in the path, so an error can name it.
@@ -189,8 +266,12 @@ pub enum ChainError {
     ///
     /// For a chain link, `cA` must be asserted, so an absent `basicConstraints` is this
     /// error too; for an anchor, only a stated `cA: FALSE` is, because a pin may carry no
-    /// extension at all (see [`check_anchor_is_ca`]).
+    /// extension at all (see the module documentation's three CA rules).
     NotACa(Position),
+    /// A certificate names a key identifier that is not its issuer's, so the
+    /// certificate in front of it is not the one it was signed by — whatever the two
+    /// names say.
+    AuthorityKeyMismatch(Position),
     /// A certificate has a `keyUsage` extension without `keyCertSign`, so it does
     /// not assert the right to sign certificates.
     MissingKeyCertSign {
@@ -259,6 +340,50 @@ pub enum ChainError {
         /// The issuer name that could not be resolved, as the DER of the `Name`.
         issuer: Vec<u8>,
     },
+    /// No supplied CRL is issued by the certificate's issuer, so whether this
+    /// certificate was revoked cannot be answered. Unknown is refused, not accepted:
+    /// a caller that asked for revocation checking and supplied a CRL bundle with a
+    /// hole in it has a broken bundle, not a clean certificate.
+    NoCrlFor(Position),
+    /// The certificate that issued a CRL states a `keyUsage` without `cRLSign`, so it
+    /// does not claim the right to publish a revocation list for these certificates.
+    CrlIssuerWithoutCrlSign {
+        /// Where that certificate is.
+        at: Position,
+        /// Its `keyUsage` bits, so the diagnostic says what it does name.
+        key_usage: u16,
+    },
+    /// A CRL's signature does not verify with the key of the certificate that issued
+    /// it, so it is not a statement by that issuer at all.
+    CrlSignature {
+        /// The CRL's index among the caller's, so a bundle with one bad entry in it
+        /// says which entry that is.
+        crl: usize,
+        /// Why the check failed.
+        error: VerifyError,
+    },
+    /// The freshest CRL for a certificate has not taken effect at the instant being
+    /// checked, so it says nothing about now.
+    CrlNotYetValid {
+        /// The CRL's index among the caller's.
+        crl: usize,
+    },
+    /// The freshest CRL for a certificate is stale: its `nextUpdate` has passed.
+    CrlExpired {
+        /// The CRL's index among the caller's.
+        crl: usize,
+    },
+    /// Two equally fresh CRLs for one certificate contradict each other about it, so
+    /// there is no honest answer: one of them is stale in a way its `thisUpdate` does
+    /// not say, or the caller has two different CAs' lists under one name.
+    AmbiguousRevocation(Position),
+    /// The certificate's serial number is listed as revoked.
+    Revoked {
+        /// Where the certificate is.
+        at: Position,
+        /// Its serial number, as the magnitude bytes it is compared by.
+        serial: Vec<u8>,
+    },
 }
 
 /// Renders a name's DER for a diagnostic: hex, truncated, never as text.
@@ -315,6 +440,9 @@ impl fmt::Display for ChainError {
                 f,
                 "{at} is in the chain as an issuer but is not a CA (basicConstraints)"
             ),
+            Self::AuthorityKeyMismatch(at) => {
+                write!(f, "{at} names a key identifier that is not the issuer's")
+            }
             Self::MissingKeyCertSign { at, key_usage } => write!(
                 f,
                 "{at} is in the chain as an issuer but its keyUsage ({key_usage:#05x}) does not \
@@ -360,6 +488,34 @@ impl fmt::Display for ChainError {
                  reaches nothing trusted",
                 name_hex(issuer)
             ),
+            Self::NoCrlFor(at) => write!(
+                f,
+                "no CRL issued by the issuer of {at} was supplied, so its revocation status is \
+                 unknown"
+            ),
+            Self::CrlIssuerWithoutCrlSign { at, key_usage } => write!(
+                f,
+                "{at} issued a CRL but its keyUsage ({key_usage:#05x}) does not include cRLSign"
+            ),
+            Self::CrlSignature { crl, error } => write!(
+                f,
+                "the signature on CRL {crl} does not verify with its issuer's key: {error}"
+            ),
+            Self::CrlNotYetValid { crl } => write!(
+                f,
+                "CRL {crl} is the freshest one for its issuer and is not valid yet at the \
+                 instant being checked"
+            ),
+            Self::CrlExpired { crl } => write!(
+                f,
+                "CRL {crl} is the freshest one for its issuer and has expired"
+            ),
+            Self::AmbiguousRevocation(at) => {
+                write!(f, "two equally fresh CRLs contradict each other about {at}")
+            }
+            Self::Revoked { at, serial } => {
+                write!(f, "{at} is revoked (serial {serial:02x?})")
+            }
         }
     }
 }
@@ -469,6 +625,35 @@ fn intermediates_below(chain: &[Certificate<'_>], index: usize) -> usize {
         .count()
 }
 
+/// A certificate's `authorityKeyIdentifier`, when both it and its issuer's
+/// `subjectKeyIdentifier` are present, must name that identifier.
+///
+/// RFC 5280 §4.2.1.1: the `keyIdentifier` field of an `authorityKeyIdentifier` is the
+/// `subjectKeyIdentifier` of the certificate that signed this one. A mismatch is a
+/// certificate naming a key that is not the one in front of it, which is exactly the
+/// contradiction a chain builder must not paper over — and it is not caught by the
+/// signature, because a certificate whose identifier points somewhere else has still been
+/// signed by whoever signed it.
+///
+/// Two absences are not refusals, for the same reason: a certificate may carry no
+/// `authorityKeyIdentifier` at all, and an issuer may carry no `subjectKeyIdentifier`
+/// (required of CAs by §4.2.1.2, but the extension is optional in the format) — with
+/// nothing to compare there is no contradiction to refuse. The `authorityKeyIdentifier`
+/// form that names the issuer by name and serial is also `None` here, and so is not
+/// compared: it identifies the same key a different way.
+fn check_key_identifier(
+    certificate: &Certificate<'_>,
+    issuer: &Certificate<'_>,
+    at: Position,
+) -> Result<(), ChainError> {
+    if let (Some(named), Some(actual)) = (certificate.authority_key_id(), issuer.subject_key_id()) {
+        if named != actual {
+            return Err(ChainError::AuthorityKeyMismatch(at));
+        }
+    }
+    Ok(())
+}
+
 /// An anchor that *states* it is not a CA may not verify a signature on **another**
 /// certificate.
 ///
@@ -515,6 +700,154 @@ fn check_key_cert_sign(certificate: &Certificate<'_>, at: Position) -> Result<()
         }),
         _ => Ok(()),
     }
+}
+
+/// A CA whose `keyUsage` extension is present must claim `cRLSign` before a CRL it
+/// signed is trusted.
+///
+/// The same argument as [`check_key_cert_sign`], one bit over: RFC 5280 §4.2.1.9 says a
+/// key without the bit "MUST NOT be used to verify signatures on ... certificate
+/// revocation lists", and a certificate that states it may not publish revocation
+/// information should not have its revocation information believed. The absence of
+/// `keyUsage` is not a refusal, exactly as it is not for `keyCertSign`.
+fn check_crl_sign(certificate: &Certificate<'_>, at: Position) -> Result<(), ChainError> {
+    match certificate.key_usage() {
+        Some(usage) if !usage.has(KeyUsage::CRL_SIGN) => Err(ChainError::CrlIssuerWithoutCrlSign {
+            at,
+            key_usage: usage.0,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The indexes, in the caller's list, of the CRLs that are about a certificate issued
+/// by `issuer_name`.
+///
+/// The link is the name and nothing else, compared as the DER of the two `Name` values
+/// the way a chain link is: a CRL applies to a certificate when the CRL's issuer is that
+/// certificate's issuer. A CRL for an issuer that is nowhere in this path is not about
+/// this path and is never considered — which is what OpenSSL does too (measured: a
+/// root's CRL supplied for a leaf issued by an intermediate does not stand in for the
+/// leaf's CRL, error 3).
+fn crl_candidates(crls: &[CertificateRevocationList<'_>], issuer_name: &[u8]) -> Vec<usize> {
+    crls.iter()
+        .enumerate()
+        .filter(|(_, crl)| crl.issuer().as_der() == issuer_name)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Decides one certificate's revocation status from the CRLs that are about it.
+///
+/// `issuer` is the certificate whose key signed both this certificate and any CRL about
+/// it; `at` is where the certificate sits, and `issuer_at` where its issuer does.
+///
+/// `required` is what the absence of any CRL for this certificate means: `true` for every
+/// certificate in the path, where unknown status is a refusal, and `false` for the anchor,
+/// which is trusted by the caller's own decision and is only *contradicted* by a list it
+/// published about itself.
+fn check_revocation(
+    crls: &[CertificateRevocationList<'_>],
+    certificate: &Certificate<'_>,
+    at: Position,
+    issuer: &Certificate<'_>,
+    issuer_at: Position,
+    time: UnixTime,
+    required: bool,
+) -> Result<(), ChainError> {
+    let candidates = crl_candidates(crls, certificate.issuer().as_der());
+    if candidates.is_empty() {
+        if !required {
+            return Ok(());
+        }
+        // Unknown status is refused, not accepted: a caller that asked for revocation
+        // checking and handed over a bundle with a hole in it has a broken bundle.
+        return Err(ChainError::NoCrlFor(at));
+    }
+    // Every CRL the caller supplied for this issuer has to be a statement by that issuer,
+    // *including* the ones a fresher list supersedes: an unusable CRL in the set is named
+    // rather than quietly outvoted, because "the freshest one was fine" is not a reason to
+    // trust a list you cannot verify.
+    check_crl_sign(issuer, issuer_at)?;
+    for &index in &candidates {
+        verify_tbs_signature(
+            crls[index].signature_algorithm(),
+            crls[index].tbs(),
+            crls[index].signature(),
+            issuer.public_key(),
+        )
+        .map_err(|error| ChainError::CrlSignature { crl: index, error })?;
+    }
+
+    // The freshest list speaks: `thisUpdate` is the only ordering a CRL states about
+    // itself, and a list that was replaced has no opinion any more.
+    let newest = candidates
+        .iter()
+        .copied()
+        .max_by_key(|&index| crls[index].this_update())
+        .expect("candidates are not empty");
+    let revoked = crls[newest].is_revoked(certificate.serial());
+    // Two equally fresh lists that contradict each other are a caller error rather than a
+    // race for one of them to win: there is no honest way to pick, so the path is refused.
+    for &index in candidates
+        .iter()
+        .filter(|&&index| crls[index].this_update() == crls[newest].this_update())
+    {
+        if crls[index].is_revoked(certificate.serial()) != revoked {
+            return Err(ChainError::AmbiguousRevocation(at));
+        }
+    }
+
+    // The window before the verdict: a list that is not current is not speaking about
+    // now, whatever it says. An absent `nextUpdate` is not an expired one — see
+    // [`crate::crl`] — so only a stated bound can be crossed.
+    if time < crls[newest].this_update() {
+        return Err(ChainError::CrlNotYetValid { crl: newest });
+    }
+    if let Some(next) = crls[newest].next_update() {
+        if time > next {
+            return Err(ChainError::CrlExpired { crl: newest });
+        }
+    }
+    if revoked {
+        return Err(ChainError::Revoked {
+            at,
+            serial: certificate.serial().to_vec(),
+        });
+    }
+    Ok(())
+}
+
+/// The whole path's revocation, once the path itself is settled.
+///
+/// Run after the anchor is known, because the last certificate's issuer *is* the anchor
+/// and its CRL can only be verified with the anchor's key.
+fn check_path_revocation(
+    chain: &[Certificate<'_>],
+    anchor: &Certificate<'_>,
+    anchor_at: Position,
+    crls: &[CertificateRevocationList<'_>],
+    time: UnixTime,
+) -> Result<(), ChainError> {
+    for (index, certificate) in chain.iter().enumerate() {
+        let at = Position::Chain(index);
+        let (issuer, issuer_at) = match chain.get(index + 1) {
+            Some(next) => (next, Position::Chain(index + 1)),
+            None => (anchor, anchor_at),
+        };
+        check_revocation(crls, certificate, at, issuer, issuer_at, time, true)?;
+    }
+    // The anchor is checked only against a revocation list it published about itself,
+    // which can only exist while it is self-issued — and is then verifiable with its own
+    // key. An anchor that is not self-issued has an issuer this crate holds no
+    // certificate for, so any list about it could not be verified with any key in hand.
+    // OpenSSL's `-crl_check_all` catches a revoked self-issued anchor the same way
+    // (error 23 at the anchor's depth), which is why this exception exists at all: without
+    // it, this crate would be the *more permissive* side of that comparison.
+    if anchor.issuer().as_der() == anchor.subject().as_der() {
+        check_revocation(crls, anchor, anchor_at, anchor, anchor_at, time, false)?;
+    }
+    Ok(())
 }
 
 /// Checks one certificate's validity window against `time`.
@@ -573,11 +906,18 @@ fn check_key(key: &PublicKey<'_>, at: Position, policy: &Policy) -> Result<(), C
 /// of the path — an anchor that is not self-signed is allowed, because pinning a
 /// key is a legitimate thing for a caller to do.
 ///
+/// `revocation` is the caller's revocation information — see [`Revocation`], and the
+/// module docs for what each mode means. It is an argument rather than a step a caller
+/// performs afterwards because the two are not the same claim: "this chain is valid" and
+/// "and nothing in it was revoked" have to come from one call, or the second one is the
+/// thing that gets skipped.
+///
 /// The chain may include the anchor itself; either way, the last certificate's
 /// issuer must resolve to an anchor.
 pub fn verify_chain(
     chain: &[Certificate<'_>],
     anchors: &[Certificate<'_>],
+    revocation: Revocation<'_>,
     time: UnixTime,
     policy: &Policy,
 ) -> Result<(), ChainError> {
@@ -629,6 +969,10 @@ pub fn verify_chain(
         if certificate.issuer().as_der() != issuer.subject().as_der() {
             return Err(ChainError::BrokenLink { index });
         }
+        // Which key the issuer claims, before any arithmetic: a child that names a
+        // different key than the certificate it is being linked to is not linked, even
+        // though its signature verifies.
+        check_key_identifier(certificate, issuer, Position::Chain(index))?;
         verify_certificate_signature(certificate, issuer.public_key()).map_err(|error| {
             ChainError::Signature {
                 certificate: Position::Chain(index),
@@ -646,6 +990,13 @@ pub fn verify_chain(
             continue;
         }
         let at = Position::Anchor(index);
+        // A candidate that names a different key than the chain's last certificate is not
+        // this chain's anchor; the next candidate is tried, the way every other anchor
+        // check here works.
+        if let Err(error) = check_key_identifier(last, anchor, Position::Chain(last_index)) {
+            failure = Some(error);
+            continue;
+        }
         if let Err(error) = check_anchor_is_ca(anchor, last, at) {
             failure = Some(error);
             continue;
@@ -682,7 +1033,14 @@ pub fn verify_chain(
             continue;
         }
         match verify_certificate_signature(last, anchor.public_key()) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // The path is settled and this anchor is the one it ends at, so the last
+                // certificate's issuer is known and its revocation is answerable.
+                if let Revocation::Required(crls) = revocation {
+                    check_path_revocation(chain, anchor, at, crls, time)?;
+                }
+                return Ok(());
+            }
             Err(error) => {
                 failure = Some(ChainError::Signature {
                     certificate: Position::Chain(last_index),
@@ -699,23 +1057,17 @@ pub fn verify_chain(
     }
 }
 
-/// The whole path from the wire bytes: framing, parsing, then [`verify_chain`].
+/// The certificates of a `certificate_list`, framed and parsed, leaf first.
 ///
-/// `list` is `CertificateVerifyInput::certificate_list` verbatim, and `time` is
-/// `CertificateVerifyInput::validation_time` — so a verifier's whole chain check is
-/// one call with the fields the handshake already hands it.
+/// Public for the same reason [`entries`] is, one step further on: a caller that has to
+/// check things *about* the path — the leaf's name and purpose, say — needs the parsed
+/// certificates, and parsing them twice is both wasteful and a second place the parse could
+/// differ. [`verify_certificate_list`] is this plus [`verify_chain`], and is what a caller
+/// that wants the whole decision should call.
 ///
-/// What a success means, exactly: the entries frame correctly, each certificate
-/// parses, the path respects the structural rules and the policy, each link is
-/// signed by the next certificate's key, and the last one is signed by an anchor's
-/// key. What it does **not** mean is that the leaf is for the server that was
-/// asked for, or that nothing in the path was revoked — see the module docs.
-pub fn verify_certificate_list(
-    list: &[u8],
-    anchors: &[Certificate<'_>],
-    time: UnixTime,
-    policy: &Policy,
-) -> Result<(), ChainError> {
+/// An empty list is [`ChainError::EmptyList`], so a successful call always returns at least
+/// one certificate.
+pub fn parse_certificate_list(list: &[u8]) -> Result<Vec<Certificate<'_>>, ChainError> {
     let entries = entries(list)?;
     let mut chain = Vec::with_capacity(entries.len());
     for (index, der) in entries.iter().enumerate() {
@@ -724,7 +1076,30 @@ pub fn verify_certificate_list(
             Err(error) => return Err(ChainError::Certificate { index, error }),
         }
     }
-    verify_chain(&chain, anchors, time, policy)
+    Ok(chain)
+}
+
+/// The whole path from the wire bytes: framing, parsing, then [`verify_chain`].
+///
+/// `list` is `CertificateVerifyInput::certificate_list` verbatim, and `time` is
+/// `CertificateVerifyInput::validation_time` — so a verifier's whole chain check is
+/// one call with the fields the handshake already hands it.
+///
+/// What a success means, exactly: the entries frame correctly, each certificate
+/// parses, the path respects the structural rules and the policy, each link is
+/// signed by the next certificate's key, the last one is signed by an anchor's key,
+/// and every certificate is either covered by the caller's CRLs or was named by
+/// [`Revocation::Unchecked`] as one the caller does not check. What it does **not**
+/// mean is that the leaf is for the server that was asked for — see the module docs.
+pub fn verify_certificate_list(
+    list: &[u8],
+    anchors: &[Certificate<'_>],
+    revocation: Revocation<'_>,
+    time: UnixTime,
+    policy: &Policy,
+) -> Result<(), ChainError> {
+    let chain = parse_certificate_list(list)?;
+    verify_chain(&chain, anchors, revocation, time, policy)
 }
 
 #[cfg(test)]

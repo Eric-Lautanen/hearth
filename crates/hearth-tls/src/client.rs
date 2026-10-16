@@ -287,6 +287,10 @@ pub struct CertificateVerifyInput<'a> {
 /// A closure is how an accept-all becomes an unremarkable one-liner in a diff,
 /// and it also forces the verifier to capture things like the expected host name
 /// that [`CertificateVerifyInput`] already provides.
+///
+/// Two implementations ship: [`crate::verifier::PinnedVerifier`], which is the whole
+/// decision over anchors and revocation lists the caller supplies, and [`RejectAll`], which
+/// is what a caller who has decided nothing gets.
 pub trait CertificateVerifier {
     /// Checks the chain in `input.certificate_list` and the signature in
     /// `input.signature` over `input.signed_data`.

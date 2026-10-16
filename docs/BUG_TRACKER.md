@@ -38,6 +38,151 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 20 — the verifier: the first thing in the crate that can accept (buffy, 2026-10-16)
+
+Every rule existed and nothing called any of them: `RejectAll` was the only `CertificateVerifier`,
+so no `https://` path could be opened on this crate's account. This slice is the composition, as one
+named type, plus the fixtures that make the composition testable.
+
+- **`verifier.rs` — `PinnedVerifier`**, over anchors and CRLs the *caller* supplies and a `Policy`.
+  Three checks in a stated order: the chain from the wire bytes (`parse_certificate_list` then
+  `verify_chain`), then the leaf's purpose and name (`leaf::verify_leaf`, with the name from our own
+  ClientHello), then the `CertificateVerify` signature with the leaf's key
+  (`verify::verify_handshake_signature`). A failure is a typed `VerifyFailure` per stage
+  (`Chain`/`Leaf`/`Signature`), and the `CertificateVerifier` impl renders it — the trait's `String`
+  is that same `Display`, asserted equal in a test, so a log and a match cannot tell two stories.
+  Order is argued, not incidental: the chain first because a name match against an unanchored
+  certificate means nothing, purpose before name because `leaf.rs` already argues that, and the
+  signature last because it is the only stage that costs arithmetic and the only one that proves the
+  peer holds the key rather than pointing at it.
+- **The anchors are an argument, and the root store stays the caller's.** `chain::verify_chain`
+  already took them; `PinnedVerifier` borrows them (nothing is copied, so a root store can be parsed
+  once at startup and shared). Decided against putting a store here *again*, explicitly, because the
+  tempting version — a small pinned set inside `hearth-tls` — would make the downloader's trust
+  anchors invisible and unreviewable. An empty anchor set is a working verifier that refuses
+  everything; there is no default and no accept-all.
+- **New fixture `LEAF_EC_VALID`, for a reason that is a bug class.** `LEAF_EC`'s window opens after
+  its issuer's has closed, so *no* instant verifies its chain — which meant the whole verifier could
+  only ever be exercised with an RSA leaf. A verifier that only works for RSA is the classic wrong
+  dispatch. The new leaf is P-256 with a window inside the intermediate's, so the same
+  `CertificateVerify` construction is verified end to end with `0x0403`; the oracle also checks the
+  path (`ec-leaf-and-intermediate-to-root`, OpenSSL accepts).
+- **`CertificateVerify` vectors in the generated table**, signed with the fixture leaves' own keys
+  over the RFC 8446 §4.4.3 bytes (64 spaces, the context string, a zero byte, a 32-byte hash): one
+  RSA-PSS, one ECDSA, and the RSA one with its last byte flipped. **Each accepted vector is verified
+  by the OpenSSL CLI before it is written down** (`openssl dgst -verify`, with the PSS options), and
+  the generator *raises* if the forged one verifies — so an accepted vector is one a second
+  implementation accepts, and the refusal is one a second implementation also refuses. The PSS salt
+  is 32 bytes because §4.2.3 requires salt = hash length. RSA-PSS and ECDSA both draw fresh
+  randomness, so those bytes change on every regeneration: the tests assert they *verify*, not that
+  they match, which is why a fresh regeneration is green.
+- **Reachability, run not argued: 6 rounds, every stage caught.** The chain call removed, the caller's
+  `Revocation` replaced with `Unchecked`, the leaf check removed, the signature check replaced with
+  `Ok(())`, `signed_data`/`signature` swapped, and the trait's entry point short-circuited. The last
+  one is caught by the *unit* test in `verifier.rs` and by the fixture suite both — the same
+  two-nets lesson slice 19 recorded, which this script was written with from the start.
+- **Three test-authoring bugs of mine, caught by running rather than by reading:** the context-string
+  slice compared 33 bytes against a 34-byte literal (the string is 33 bytes *plus* the separator) —
+  now sliced by `context.len() + 1`; a `ROOT_SHADOW` anchor was expected to be `Unanchored` when the
+  documented behaviour is `Signature { certificate: Chain(1) }`, because it *is* a name-matched
+  candidate that fails its signature (the wrong-key-anchor case, not the no-candidate case — both are
+  now controls, the second using `SELF_SIGNED_EC`); and a leftover `good` from the previous test.
+- **No inference code touched, so the benchmark mandate did not apply.** **242 checks green** on the
+  hardware path and on `HEARTH_TLS_NO_HW=1` (238 before), clippy `-p hearth-tls --all-targets -D
+  warnings` exit 0, `cargo fmt --check` clean, `cargo doc -p hearth-tls --no-deps` zero warnings, and
+  the generated file fmt-stable and green after a fresh regeneration. 33 certificate fixtures, 14
+  CRLs, 24 oracle paths. Still `std`-only with an empty `[dependencies]`.
+- **Still absent, and stated as such in the code:** no OCSP, no stapling, no CRL fetching (a list is
+  bytes the caller brings, and keeping it fresh needs a network), and no transport — nothing in this
+  crate has ever opened a socket, so the downloader's `https://` wiring is still the next real step.
+
+
+### hearth-tls slice 19 — revocation: CRLs, and the version field two readers had wrong together (buffy, 2026-10-16)
+
+Revocation was the last **absent** check rather than an untested one. It is now present as
+caller-supplied CRLs, and the slice's most useful result was a bug in *both* the parser and the
+fixture generator, which agreed with each other and with nothing else.
+
+- **`crl.rs`**: a strict reader for `CertificateList` — issuer name, `thisUpdate`/`nextUpdate`,
+  revoked serials as magnitudes, and the bytes a signature covers. Critical extensions it does not
+  understand are refusals (§5.2), which is what refuses a **delta CRL** standing in for a complete
+  one and an **indirect** entry (`certificateIssuer`, refused by name whether or not it is critical).
+  `nextUpdate` is optional and its absence means "no stated expiry", and v1 (no version field, no
+  extensions) and v2 are both read.
+- **`chain.rs` gains `Revocation`**: `Unchecked` (a word at the call site, because a revoked
+  certificate verifies in that mode — as it does for every stack that never turned checking on) or
+  `Required(&[CertificateRevocationList])`. In `Required` mode every certificate in the path needs a
+  CRL from its issuer (`NoCrlFor` — unknown is refused, not accepted), the issuer must claim
+  `cRLSign` when it states a `keyUsage`, every supplied CRL for that issuer must verify its
+  signature, **the freshest `thisUpdate` speaks**, a stale or not-yet-valid decisive list is refused,
+  and two equally fresh lists that contradict each other are `AmbiguousRevocation` (this crate's own
+  rule: there is no honest way to pick). The anchor is checked only against a list it published about
+  itself, which is the one case OpenSSL's `-crl_check_all` catches and a permissive reading would not.
+- **The bug: a CRL's `version` is a plain `INTEGER`, not the `[0] EXPLICIT` a certificate wraps its
+  version in** (a `TBSCertList` starts with it, so nothing needs disambiguating it; a certificate
+  starts with a serial number, which is why the tag is there). The parser read the certificate's
+  shape and my hand-built fixtures *wrote* it, so thirteen unit tests passed on CRLs that OpenSSL
+  could not load at all — and every real v2 CRL would have been refused. It surfaced only because
+  the generator asks OpenSSL to read every fixture and **raises when the tool cannot**: "Could not
+  find CRL" is what an invalid version tag looks like from the outside. Fixed in both, with a test
+  that the tagged form is refused here too, and the reachability round for it turns **seven** tests
+  red.
+- **Measured against the OpenSSL CLI, 17 recorded cases** (`openssl verify -crl_check_all` /
+  `-crl_check -CRLfile`): clean path, leaf revoked (23), intermediate revoked (23), **anchor revoked
+  by its own list (23 at depth 2)**, missing CRL at either depth (3), expired (12), not yet valid
+  (11), no `nextUpdate` (accepted), v1 (accepted, and a v1 revoking list still revokes), an unknown
+  critical extension (36), a delta indicator (**accepted** — a divergence, we refuse), a wrong-key
+  signature (8), a stale revoking list beside a fresh clean one (**accepted** — the freshest speaks,
+  which is what that rule copies), and a CA without `cRLSign` (35). Two divergences, both
+  recorded with their reason, both with this crate the stricter side; one case asked with
+  `-crl_check` shows why the leaf alone is not enough.
+- **Reachability, run not argued: 13 rounds, every rule caught.** cRLSign, CRL signature verification,
+  freshest-speaks, ambiguity, the window, the revoked decision, `NoCrlFor`, the anchor exception, the
+  unknown-critical refusal, `certificateIssuer`, the algorithm-agreement rule, the version read, and
+  the v1-with-extensions rule. Three first appeared to survive — because the script ran only the
+  integration target and their nets are the unit tests in `crl.rs`; the script now runs both, which is
+  itself the finding worth keeping.
+- **Harness faults, three of them, all of which looked like verdicts:** `openssl verify` reads the
+  argument after an option as its value, so an option placed *after* the leaf path makes every case
+  come back error 20 (and passing no `-untrusted` does the same); `line.startswith("Serial Number:")`
+  reads *no* serials out of any CRL with entries, because entries are printed indented; and appending
+  an extension to an existing `[0]` element without rebuilding its length produces a CRL OpenSSL
+  rejects for a reason that has nothing to do with the extension. The generator now asks whether the
+  tool can **read** a CRL before recording any verdict about it.
+- **No inference code touched, so the benchmark mandate did not apply.** 238 checks green on the
+  hardware path and on `HEARTH_TLS_NO_HW=1` (217 before), clippy `--all-targets -D warnings`, fmt,
+  `cargo doc` and the workspace check clean, generator output fmt-stable and passing after a fresh
+  regeneration. 32 certificate fixtures, 14 CRLs. Still `std`-only, still an empty `[dependencies]`,
+  still nothing in the crate calling any of it: `RejectAll` remains the only `CertificateVerifier`, and
+  there is still **no OCSP, no stapling and no CRL fetching** — a CRL is bytes the caller brings.
+
+### hearth-tls slice 18 — AKI/SKI matching: a link check the signature cannot make (buffy, 2026-10-16)
+
+Slice 17 ended with the question of whether key identifiers matter beyond `-x509_strict`. Measured, and they do:
+OpenSSL refuses a certificate whose `authorityKeyIdentifier` points nowhere **while this crate accepted it** — a
+disagreement in the direction the oracle test forbids, so it could not be written off.
+
+- **The parser learned the two context-tagged extensions.** `x509.rs` now reads `subjectKeyIdentifier` (an `OCTET
+  STRING` inside the extension) and `authorityKeyIdentifier`, whose `keyIdentifier` field is **`[0]` implicit** —
+  the contents are the identifier bytes with no nested `OCTET STRING` — with the issuer-and-serial form read past
+  rather than read. The generated table now records both for every fixture, so all 30 are compared against
+  OpenSSL's parsing of the same bytes, including the deliberately wrong one.
+- **The rule: when a child states a key identifier and its issuer states one, they must agree**
+  (`ChainError::AuthorityKeyMismatch`, RFC 5280 §4.2.1.1). The signature check **cannot** catch this on its own,
+  and that is the whole point of the rule: a certificate whose identifier points elsewhere was still signed by
+  whoever signed it, so without the comparison the path verifies. OpenSSL's answer is to treat it as a link that
+  cannot be made at all — error 20, "unable to get local issuer certificate" — and our error now says which
+  certificate and why.
+- **Two absences are not refusals**, and the tests say so rather than the comments: a certificate may carry no
+  `authorityKeyIdentifier` (most fixtures here do not) and an issuer may carry no `subjectKeyIdentifier` (`ROOT`
+  does not), and there is then no contradiction to refuse.
+- **Checked on both sides of the anchor**, the way the other anchor rules are: a candidate naming a different key
+  than the chain's last certificate is not this chain's anchor, so the next candidate is tried.
+- **Two independent nets caught the regression**: neutering the check turns both the direct fixture test into
+  `Ok(())` where `AuthorityKeyMismatch(Chain(0))` is expected, and the oracle into "1 of 23 paths disagree".
+- **217 checks green** on both paths (216 before), clippy, fmt, `cargo doc` zero warnings, workspace exit 0.
+  30 fixtures, 23 oracle paths, 5 recorded divergences (all strict, none new).
+
 ### hearth-tls slice 17 — the one rule no fixture could reach: key rollover and the self-issued count (buffy, 2026-10-16)
 
 `intermediates_below` excludes self-issued certificates from a `pathLenConstraint` count, which is the rule

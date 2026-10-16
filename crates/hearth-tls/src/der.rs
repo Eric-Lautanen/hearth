@@ -614,6 +614,11 @@ pub mod oids {
     pub const EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
     /// `subjectAltName`, where a downloader finds the names it may connect to.
     pub const SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
+    /// `subjectKeyIdentifier`, the identity of a certificate's own key.
+    pub const SUBJECT_KEY_IDENTIFIER: &[u8] = &[0x55, 0x1d, 0x0e];
+    /// `authorityKeyIdentifier`, which names the key that signed a certificate —
+    /// and is what tells two certificates with the same distinguished name apart.
+    pub const AUTHORITY_KEY_IDENTIFIER: &[u8] = &[0x55, 0x1d, 0x23];
     /// `serverAuth`, the required purpose for a TLS server certificate.
     pub const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
     /// `commonName`, the only `RDN` this crate reads.
@@ -916,6 +921,8 @@ mod tests {
             ("2.5.29.15", oids::KEY_USAGE),
             ("2.5.29.37", oids::EXT_KEY_USAGE),
             ("2.5.29.17", oids::SUBJECT_ALT_NAME),
+            ("2.5.29.14", oids::SUBJECT_KEY_IDENTIFIER),
+            ("2.5.29.35", oids::AUTHORITY_KEY_IDENTIFIER),
             ("1.3.6.1.5.5.7.3.1", oids::SERVER_AUTH),
             ("2.5.4.3", oids::COMMON_NAME),
         ] {

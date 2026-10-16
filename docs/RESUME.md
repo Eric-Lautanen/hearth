@@ -1,5 +1,56 @@
 # Hearth — next session
 
+> **Session 2026-10-16 (pt 14) in one paragraph.** The crate now has a verifier, which is the first
+> thing in it that can *accept* anything: `verifier.rs`'s `PinnedVerifier` runs the three stages in a
+> stated order — the chain from the wire bytes (framing, parse, structure, links, anchor, windows,
+> revocation), the leaf's purpose and name, then the `CertificateVerify` signature with the leaf's own
+> key — and returns a typed failure per stage, with the trait's `String` being that same `Display`.
+> The anchors and the CRLs stay the caller's (borrowed, not copied, and no root store in this crate);
+> `RejectAll` remains the verifier a caller who has decided nothing gets. The slice's real work was
+> making the composition *testable*: a new `LEAF_EC_VALID` fixture (an EC leaf whose window sits inside
+> its issuer's, which no previous fixture allowed — `LEAF_EC`'s opens after its issuer's closes), so the
+> whole verifier is exercised with `0x0403` as well as `0x0804`, and generated `CertificateVerify`
+> vectors signed with the fixture leaves' keys over the §4.4.3 construction, each **verified by the
+> OpenSSL CLI before being written down**, plus the RSA one with a flipped byte, which the generator
+> refuses to emit if OpenSSL still accepts it. Six neutering rounds (chain call, caller's `Revocation`,
+> leaf check, signature check, `signed_data`/`signature` swap, the trait's entry point) all caught.
+> **242 checks green on both paths** (+4), clippy, fmt, `cargo doc`, workspace and regeneration
+> stability clean. Still no OCSP, no stapling, no CRL fetching and no transport — nothing in this crate
+> has ever opened a socket.
+
+> **Session 2026-10-16 (pt 13) in one paragraph.** The last *absent* check is now present: revocation,
+> as caller-supplied CRLs. `crl.rs` reads a `CertificateList` strictly (unknown critical extensions
+> refused, which is what refuses a delta CRL; `certificateIssuer` refused by name; a v1 CRL with
+> extensions refused), and `chain.rs` gains a `Revocation` argument on `verify_chain` — `Unchecked`,
+> which has to be written out because a revoked certificate verifies in that mode, or `Required(&[crls])`,
+> where every certificate in the path needs a list from its issuer, the issuer must claim `cRLSign`,
+> every supplied list must verify its signature, the freshest `thisUpdate` speaks, and two equally fresh
+> lists that contradict each other are refused rather than guessed between. Seventeen cases were put to
+> the OpenSSL CLI with `-crl_check_all`/`-crl_check` and recorded; two are divergences with this crate
+> the stricter side (a delta CRL, which OpenSSL accepts as a complete one, and the leaf-only scope of
+> `-crl_check`). **The slice's real find was a bug in the parser *and* the fixtures together**: a CRL's
+> `version` is a plain `INTEGER`, not the `[0] EXPLICIT` a certificate uses, so thirteen unit tests were
+> passing on CRLs OpenSSL could not even load, and every real v2 CRL would have been refused — caught
+> only because the generator makes OpenSSL read every fixture and raises when it cannot. All 13 new
+> rules were proven load-bearing by removing them one at a time (238 checks green on both paths, +21),
+> and the neutering script's own bug — it ran one test target, so three rules looked unwatched — is
+> recorded. **Still nothing calls any of it**: `RejectAll` is the only `CertificateVerifier`, and there is
+> no OCSP, no stapling and no CRL fetching.
+
+> **Session 2026-10-16 (pt 12) in one paragraph.** The question slice 17 raised — are key identifiers worth more
+> than `-x509_strict`? — is answered by measurement: with a leaf whose `authorityKeyIdentifier` points at twenty
+> bytes nothing owns, **OpenSSL refuses the path (error 20) while this crate accepted it**, which is the
+> forbidden direction and so could not be written off as a divergence. `x509.rs` now reads
+> `subjectKeyIdentifier` and `authorityKeyIdentifier` (whose `keyIdentifier` is `[0]` **implicit**, the trap in
+> that extension), the generated table records both for all 30 fixtures so the parser is compared against
+> OpenSSL's reading of the same bytes, and `chain.rs` refuses a link when the child states a key identifier and
+> its issuer states a different one (`AuthorityKeyMismatch`, RFC 5280 §4.2.1.1). **The signature check cannot
+> make this one**: a certificate whose identifier lies was still signed by whoever signed it, which is exactly
+> why the fixture that proves the rule has a *valid* signature asserted beside the refusal. Absences are not
+> refusals (no `authorityKeyIdentifier` on the child, no `subjectKeyIdentifier` on the issuer) and the anchor is
+> checked on the same rule. Neutering it turns both the direct test and the oracle red. **217 checks green on
+> both paths** (216 before), clippy, fmt, `cargo doc`, workspace clean; 30 fixtures, 23 oracle paths.
+
 > **Session 2026-10-16 (pt 11) in one paragraph.** A gap found by reading the code rather than by a failing
 > test: `intermediates_below` excludes self-issued certificates from a `pathLenConstraint` count — the rule
 > that makes a **key rollover** legal — and in all 24 fixtures then every intermediate was non-self-issued,
@@ -52,13 +103,17 @@
 
 ## Next session — in this order
 
-1. **Certificate verification — one check short of a decision.** A certificate parses (`x509.rs`), every
-   suite verifies (`rsa.rs`, `ecdsa.rs`), `verify.rs` decides which scheme may verify which key,
-   `chain.rs` builds the path from the wire bytes to a caller-supplied anchor with the structural rules
-   and the validity window, and `leaf.rs` checks that the certificate names the server and may be used as
-   one. **Every check a verifier needs now exists; what is missing is the integration and the trust
-   decision.** Nothing in this crate calls any of it — `RejectAll` is still the only
-   `CertificateVerifier` — and there is still **no revocation checking of any kind**.
+1. **Certificate verification — the decision exists; its *inputs* and its wiring are the work.**
+   A certificate parses (`x509.rs`), every suite verifies (`rsa.rs`, `ecdsa.rs`), `verify.rs` decides
+   which scheme may verify which key, `chain.rs` builds the path from the wire bytes to a
+   caller-supplied anchor with the structural rules, the validity window and revocation, `crl.rs`
+   reads the revocation lists, `leaf.rs` checks that the certificate names the server and may be used
+   as one, and **`verifier.rs`'s `PinnedVerifier` calls all of them in order** — so there is now a
+   `CertificateVerifier` that can accept, not just refuse. What remains is (a) where the anchors come
+   from (below), (b) supplying CRLs or writing `Revocation::Unchecked` at the call site, and (c) the
+   transport that would use either — nothing in this crate has ever opened a socket. There is **no
+   OCSP, no stapling and no CRL fetching**, and there must be no accept-all type, flag or environment
+   variable on any path a URL can reach.
    - **Closed in pt 11: the self-issued branch is now reachable.** `ROLLOVER_CA_A` / `ROLLOVER_CA_B` (the
      same DN, a new key) / `LEAF_OF_ROLLOVER_CA_B` make a key rollover a path, legal only because the
      self-issued certificate does not spend its parent's allowance of none; neutering `self_issued` turns it
@@ -98,9 +153,9 @@
         must not be, chain length is capped by `Policy::max_chain_len`, and a minimum RSA key size is
         enforced on every certificate in the path *and* on the anchor — `rsa.rs` deliberately accepts a
         1024-bit key because RFC 8448's fixture is one, so that policy lives here and not there. **Every
-        structural rule is now in it**, including `pathLenConstraint` and `keyUsage.keyCertSign` (see
-        item 4). Also absent, and deliberately: revocation of any kind, and `extendedKeyUsage` on
-        issuers.
+        structural rule is now in it**, including `pathLenConstraint`, `keyUsage.keyCertSign` (see
+        item 4) and revocation (see item 5). Also absent, and deliberately: `extendedKeyUsage` on
+        issuers, and any policy processing (`policyConstraints`, `inhibitAnyPolicy`, name constraints).
      3. **Host name matching — done, in `leaf.rs`.** `subjectAltName` is the only place a name is looked
         for (no `commonName` fallback — RFC 6125 §6.4.4 deprecated it, and `LEAF_EC` is the fixture that
         refuses its own subject's name), only `dNSName` entries are compared, comparison is ASCII
@@ -119,16 +174,26 @@
         more** — the first time that has been true of this file. The anchor's `basicConstraints` is the
         third rule read out of a CA certificate: stated `cA: FALSE` is refused when the anchor verifies
         someone else's certificate, an absent extension is allowed, and a certificate pinned as *itself*
-        is an identity pin and allowed (see `check_anchor_is_ca`).
-   - **The oracle is in place — extend it instead of trusting prose.** `VERIFY_CASES` in the generated
-     table holds fifteen paths with the OpenSSL CLI's verdicts recorded; the test compares verdicts at the
-     same instant and permits a disagreement only where OpenSSL accepts and this crate refuses. A new path
-     goes in `verify_cases()` in `scripts/tls_x509_fixtures.py`, then regenerate. Two things it exposed and
-     does *not* model: `openssl verify -x509_strict` refuses every one of these fixtures with error 85
-     ("Missing Authority Key Identifier"), so that whole class of extension requirements — AKI/SKI, and the
-     stricter rules behind them — is not implemented and not tested on this side, and the two recorded
-     divergences (`CaUsedAsLeaf`, `Policy::min_rsa_bits`) are this crate's own choices, ours to keep or to
-     reconsider rather than accidents.
+        is an identity pin and allowed (`check_anchor_is_ca`).
+     5. **Revocation — done in pt 13, in `crl.rs` and `chain.rs`.** `Revocation::Required` with CRLs the
+        caller supplies: every certificate in the path needs a list from its issuer, the issuer must
+        claim `cRLSign`, every supplied list for that issuer must verify its signature, the freshest
+        `thisUpdate` speaks, and equally fresh lists that contradict each other are refused. Every rule
+        was proven by removing it (13 rounds). The open questions are **not** in this crate: nothing
+        fetches a CRL, and the design that matters next is the caller's — where CRLs come from, when they
+        are refreshed, and what happens when the refresh fails. The failure to design *out* is the one
+        where a refresh fails quietly and the stale list keeps answering.
+   - **The oracles are in place — extend them instead of trusting prose.** `VERIFY_CASES` holds
+     twenty-three chain paths and `CRL_CASES` seventeen revocation paths, each with the OpenSSL CLI's verdicts
+     recorded; the tests compare verdicts at the same instant and permit a disagreement only where
+     OpenSSL accepts and this crate refuses. New paths go in `verify_cases()` / `crl_cases()` in
+     `scripts/tls_x509_fixtures.py`, then regenerate. Three things they exposed and do *not* model:
+     `openssl verify -x509_strict` refuses every fixture with error 85 ("Missing Authority Key
+     Identifier"), so the stricter extension rules behind it are not implemented here; the five recorded
+     chain divergences (`CaUsedAsLeaf`, `Policy::min_rsa_bits`, and the three about chain *shape*) and the
+     two revocation ones (a delta CRL, and `-crl_check`'s leaf-only scope) are this crate's own choices,
+     ours to keep or to reconsider rather than accidents; and `openssl verify` needs its option arguments
+     to *precede* the certificate path, or every case comes back error 20 and looks like a verdict.
    - **The root store is the caller's decision, and the crate is built that way.** `client.rs` already
      says this crate has no root store and no business having one: [`chain::verify_chain`] takes the
      anchors as an argument. So the question moves to the downloader — a pinned set in `hearth-ui` with
@@ -139,10 +204,31 @@
      not-yet-valid, unknown root, name mismatch, CA used as a leaf, non-CA issuer, broken link, chain too
      long, RSA key too small, scheme that does not match the key type, framing failures, a purpose the
      leaf is not allowed, `pathLenConstraint` on both sides, a CA that does not claim `keyCertSign`, the
-     anchor's own window and key size, and an anchor that states `cA: FALSE`** all have tests. What the
-     crate still has none of is **revocation checking of any kind** — that is now the only *absent check*,
-     as opposed to an untested one, and it must stay a decision rather than an oversight before the
-     downloader takes an `https://` path through this code.
+     anchor's own window and key size, and an anchor that states `cA: FALSE`** all have tests.
+   - **Closed in pt 14: the verifier exists, and it is where a new check belongs.**
+     `PinnedVerifier::new(anchors, revocation, policy)` + `CertificateVerifier`; add a rule inside
+     `verify()` and it is covered by the three fixture tests that drive it end to end, or by nothing —
+     the six neutering rounds in `target/buffy-ab/neuter_verifier.py` are what show which. Two things
+     about it are decided and should not be revisited casually: the anchors are **an argument** (no
+     root store in this crate — see the downloader note below), and an empty anchor set is a valid
+     verifier that refuses everything, not an error to raise at construction. The `CertificateVerify`
+     fixtures (`CV_VECTORS`, `CV_SIGNED_DATA_HEX`) live in the generated table and are re-verified by
+     the OpenSSL CLI on every regeneration; PSS and ECDSA signatures change every run, so a test may
+     only assert that a vector *verifies*, never that it matches pinned bytes.
+   - **What the next slice should be, in order of proof:** (a) an anchor source in `hearth-ui` — a
+     pinned set with fingerprints and a documented update path is reviewable in one screen and needs
+     no platform API, which is why it comes before an OS trust reader; (b) the downloader's `Transport`
+     impl driving `ClientHandshake` with `PinnedVerifier`, which is the first time any of this meets a
+     socket; (c) the CRL refresh question from pt 13 — what happens when a refresh fails must not be
+     "the stale list keeps answering".
+   - **Closed in pt 13: revocation exists, as CRLs the caller supplies.** `crl.rs` reads them and
+     `Revocation::{Unchecked, Required}` decides what is checked; the file's doc comments state what each
+     refusal means and which rules are copied from OpenSSL versus this crate's own. What is still absent
+     is **OCSP, stapling, and fetching**: a CRL is bytes the caller brings, so keeping one fresh — and
+     deciding what to do when a refresh fails — belongs to the downloader, and the failure mode to design
+     *out* is the one where the refresh fails quietly and the stale list keeps answering. `Unchecked` also
+     needs a policy decision at the call site: a caller that never supplies CRLs gets no revocation
+     checking at all, and the word at the call site is the only thing that makes that visible.
    - `Transport` in `hearth-ui/src/http.rs` is the seam and the `https://` branch of
      `downloads.rs::run_transfer` is what gets rewired afterwards. **Do not touch `http.rs` without
      asking — it is SparkOC's file.** Loose thread to close at the same time: the downloader's DNS
