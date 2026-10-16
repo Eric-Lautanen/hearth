@@ -1164,7 +1164,7 @@ function renderDl() {
     const pct = dlPct(it);
     const busy = it.state === "active" || it.state === "queued";
     const isDone = it.state === "done";
-    // Remember the user's ticks across live re-renders (progress refreshes Often).
+    // Remember the user's ticks across live re-renders (progress refreshes often).
     if (!(it.id in S.dl.checked)) S.dl.checked[it.id] = !isDone;
     const action = it.state === "done"
       ? '<button class="dl-btn" disabled>On disk</button>'

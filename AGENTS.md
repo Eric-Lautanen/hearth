@@ -153,7 +153,7 @@ $t = Get-Counter "\Thermal Zone Information(*)\Temperature"; $p = Get-Counter "\
 This system stays at 31-37°C even under sustained LLM inference load — the 10-15% tok/s variance previously blamed on "thermal throttling" is actually Windows CPU frequency scaling ramp-up. Always do a warmup run before benchmarking.
 
 ## Rust version
-Workspace uses `half = "2.6"`, `wide = "1.4"`, `bytemuck = "1"`. `const fn` with `while` loops OK.
+Workspace uses `half = "2.6"`, `wide = "1.3"`, `bytemuck = "1"`. `const fn` with `while` loops OK. MSRV is 1.88 (`slice::as_chunks`); local stable is 1.99.1, which is also what CI runs.
 
 ## Verifications
 After quant kernel changes:

@@ -64,6 +64,8 @@ Full benchmarks with raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md)
 - **Sampler controls** — temperature, top-k, top-p, min-p, typical-p, repetition penalty, seed; every one is settable from the CLI, the service protocol, and the web UI.
 - **Web chat UI** — `hearth-ui` serves a browser chat over the engine's line-JSON service, with a settings drawer seeded from the loaded model (sampling, context, device/residency), live tok/s while it replies, a **model downloader** (per-model progress, queued 1-by-1, resume), and close-the-tab shuts the server down.
 - **GPU stubs** — `hearth-compute` has skeleton API signatures for fused dequant+matmul, flash attention, RMS norm, and RoPE. All methods return `None`/`false` — not yet implemented.
+- **TLS primitives** — `hearth-tls` is pure-std, zero-dependency SHA-256/HMAC/HKDF with RFC test vectors, the first slice of a hand-rolled TLS transport for the model downloader.
+- **Diffusion (experimental)** — `hearth-diffusion` is an unfinished image model; not part of the LLM path.
 
 ## Supported Quantization Formats
 
@@ -89,7 +91,7 @@ Bold = AVX2-optimized. Portable = scalar but still parallelized.
 
 ### 1. Prerequisites
 
-- **[Rust](https://rustup.rs) 1.85+** (tested on 1.95). If you don't have Rust, install it with `winget install Rustlang.Rustup` on Windows or `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` on Linux/macOS.
+- **[Rust](https://rustup.rs) 1.88+** (tested on 1.99). If you don't have Rust, install it with `winget install Rustlang.Rustup` on Windows or `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` on Linux/macOS.
 - **A Bonsai GGUF model file** in the project `models/` folder. Easiest path: open the web UI and use the **download button** (top-right) — pick 1.7B to start, each model downloads individually with its own progress bar. Two good first models:
   - `Bonsai-1.7B-Q1_0.gguf` — 1-bit, fastest, 237 MiB
   - `Ternary-Bonsai-1.7B-Q2_0.gguf` — 2-bit ternary, higher quality, 442 MiB
@@ -213,6 +215,9 @@ want to change** — the rest keep the model's values. Run `hearth-chat-cli --he
 | `HEARTH_THREADS`      | ~3/4 of logical cores                          | Worker count for the 27B `qwen35` path (Bonsai models use n/2)                                     |
 | `HEARTH_PIN_WEIGHTS`  | off                                            | `=1` is the same as `--pin-weights`                                                                |
 | `HEARTH_DUMP_TENSORS` | —                                              | Write layer-0 activations as `<prefix><tensor>.f32` for diffing against a reference implementation |
+| `HEARTH_MODEL_CATALOG_JSON` | built-in catalog                          | JSON array overriding the UI downloader catalog (`{filename, url, ...}` per entry)                   |
+| `HEARTH_DL_ALLOW_HTTP` | off                                           | `=1` permits plain-http custom download URLs (https only by default)                                 |
+| `HEARTH_NO_AUTO_SHUTDOWN` | off                                        | `=1` keeps `hearth-ui` up with no tabs open (default: exits ~25 s after the last tab closes)         |
 
 ## Architecture
 
@@ -225,6 +230,10 @@ hearth-chat-cli
        ├─ hearth-tokenizer ← BPE tokenizer, chat templates
        ├─ hearth-sampler ← temp, top-k, top-p, min-p, rep-pen
        └─ hearth-compute ← GPU stubs (type-compat only)
+
+hearth-ui               ← web chat + model downloader (drives hearth-chat-cli --service)
+hearth-tls              ← hand-rolled SHA-256/HMAC/HKDF for the future TLS transport (zero deps)
+hearth-diffusion        ← experimental image model (unfinished)
 ```
 
 
