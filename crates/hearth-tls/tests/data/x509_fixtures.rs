@@ -337,23 +337,23 @@ const SELF_SIGNED_PSS_DER_HEX: &str = "\
     a00f300d060960864801650304020105 \
     00a11c301a06092a864886f70d010108 \
     300d06096086480165030402010500a2 \
-    030201200382010100014655ff79595a \
-    8723dc60068e2f1df39c6e139fd3e9d2 \
-    98bf724c558c483e0b8ad5689afe4ba0 \
-    742e3f8a4decffcbde98d4a0c697c376 \
-    78203758b22fefa62cda2cb59ea67b6e \
-    9f204d4c30725273e183f914ea86f999 \
-    dd3aae3d3a2881fa2540ea6a542b25f8 \
-    36f260b641cb371eaf84fc4a370d809a \
-    e7838375c2e0eac07f7529c672908009 \
-    435198f67431d685bd1eadd205be5b79 \
-    a5ac29a76c0b06088c2728098c02c45a \
-    65568b7acc39bd19b90ef915590e76aa \
-    82250d0e0b82a2a8169770e98cfec5e8 \
-    9100acc9e170fdc9bbff0dc963f3c69b \
-    27b1ddf24d871b5f9bc59b5ab22cf3da \
-    aad6d1c2ede95a323a7a180ce0ce71b0 \
-    b1b037f02fa2932ecb";
+    03020120038201010019d60aab493f95 \
+    37ad3c91be0e6ed621dbbe2c63a1689b \
+    7d2b30ee19a1be97c379d7aa97b25611 \
+    361b6f919d81f6005957f4255914aa8c \
+    6b0588474b4debf14369dd3912be70f4 \
+    071c59171538b1adfb5db871e98b52f9 \
+    eecfd8099b74387b441188aaa2ff755c \
+    a968f9e4d7264ec3dc4bc7bc1bb9885f \
+    a0c775030125fcc2abcf2ff0e463e082 \
+    5457d4208703b2971491967a7cc126e2 \
+    2e98518d7e86032118c1e2cb7cf44b69 \
+    afc90c006b0425ab1d625aebc12fbb16 \
+    01db57660f063e356a823732640fed06 \
+    0011a786e98bd0d64bbb013fdc1f230a \
+    d48f942d96c8737605956f804e93b106 \
+    af15cde9324c44d814469af22bfa9298 \
+    e8a43750b950bb0b83";
 
 const SELF_SIGNED_EC_DER_HEX: &str = "\
     3082012c3081d3a00302010202010530 \
@@ -370,11 +370,11 @@ const SELF_SIGNED_EC_DER_HEX: &str = "\
     27fd8842b82a3c83ecdc4bdf6a127b19 \
     a1e45d97156f12892b872beb322d51ae \
     6b74f42964944f0641a3300a06082a86 \
-    48ce3d04030203480030450220694b3a \
-    fb6cec84db3f55ad33c9775ea604038e \
-    63920ba980d4be473a0618cf57022100 \
-    dcb43c2fc909400eb0d19e5d84ca1a14 \
-    4b5c172f42270cfe5c9baeaf3489202f";
+    48ce3d0403020348003045022061759c \
+    d2d837edb101cef66d1176a3ca992a7f \
+    97ff61327da25c689ced601879022100 \
+    fb246e72d62009feab23a08e41ec90b9 \
+    b3a7d5794bd4d9b6e1740a6c2e396d8a";
 
 const LEAF_UNKNOWN_CRITICAL_DER_HEX: &str = "\
     30820300308201e8a003020102020106 \
@@ -1631,4 +1631,164 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             key: Key::Rsa { modulus: "992a7521ad3ccfa08a5aa128bfacba3ac95b6c7a6cd7e08c0dba575c9e53d398a7bc307c98a91607547a403138f7be38a7f76201136bcce963f1e103236f56c95e0f365a5446329507cd6620dc72e20a34f3a205806c0f2b4b930bb23ede00780976c46e6a29d0412a05ae637494f911ba3fcd26ced94f23c1a67c09887202209afc5ca80c8bb1ccb3ce3f60d8a87971ff76c6f6ee374a9c5839dc79b84bc2174ad62dc9c5cfff7b0b517a2e877af29bc20d8c6dafbec9160aead72d8d0056a27b7c08cc195e928a8618ff2f0f0c465ec2fb1b43eaa0577dea81805024e326670b0588dd91f85f2a899d4c60da083ee705ee2c9621adfee6cb94f819af1c9d19", exponent: 65537 },
         },
     ),
+];
+
+/// What the OpenSSL CLI says about each of these paths.
+///
+// OpenSSL 3.5.5 27 Jan 2026 (Library: OpenSSL 3.5.5 27 Jan 2026)
+// `openssl verify -partial_chain -auth_level 0 -attime <instant>`
+///
+/// `divergence` is set only where the two are known to disagree, and only ever
+/// where OpenSSL accepts: this crate may be stricter than OpenSSL, never laxer.
+const VERIFY_CASES: &[VerifyCase] = &[
+    VerifyCase {
+        name: "leaf-and-intermediate-to-root",
+        chain: &["LEAF_RSA", "INTERMEDIATE"],
+        anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: None,
+    },
+    VerifyCase {
+        name: "intermediate-pinned-as-the-anchor",
+        chain: &["LEAF_SUB", "SUB_CA"],
+        anchors: &["TOP_CA"],
+        attime: 1767225600,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: None,
+    },
+    VerifyCase {
+        name: "path-deeper-than-the-root-allows",
+        chain: &["LEAF_SUB", "SUB_CA", "TOP_CA"],
+        anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: false,
+        openssl_error: Some(25),
+        openssl_depth: Some(3),
+        divergence: None,
+    },
+    VerifyCase {
+        name: "issuer-without-keyCertSign",
+        chain: &["LEAF_OF_NO_SIGN_CA", "CA_NO_KEY_CERT_SIGN"],
+        anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: false,
+        openssl_error: Some(79),
+        openssl_depth: Some(1),
+        divergence: None,
+    },
+    VerifyCase {
+        name: "anchor-stating-ca-false",
+        chain: &["LEAF_OF_NON_CA_SIGNER"],
+        anchors: &["NON_CA_SIGNER"],
+        attime: 1767225600,
+        openssl_ok: false,
+        openssl_error: Some(79),
+        openssl_depth: Some(1),
+        divergence: None,
+    },
+    VerifyCase {
+        name: "ca-false-certificate-as-a-link",
+        chain: &["LEAF_OF_NON_CA_SIGNER", "NON_CA_SIGNER"],
+        anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: false,
+        openssl_error: Some(79),
+        openssl_depth: Some(1),
+        divergence: None,
+    },
+    VerifyCase {
+        name: "self-signed-ca-false-pinned-as-itself",
+        chain: &["SELF_SIGNED_PSS"],
+        anchors: &["SELF_SIGNED_PSS"],
+        attime: 1772323200,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: None,
+    },
+    VerifyCase {
+        name: "no-basic-constraints-pinned-as-itself",
+        chain: &["SELF_SIGNED_EC"],
+        anchors: &["SELF_SIGNED_EC"],
+        attime: 1772323200,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: None,
+    },
+    VerifyCase {
+        name: "root-the-caller-does-not-trust",
+        chain: &["LEAF_RSA", "INTERMEDIATE"],
+        anchors: &["SELF_SIGNED_EC"],
+        attime: 1767225600,
+        openssl_ok: false,
+        openssl_error: Some(20),
+        openssl_depth: Some(1),
+        divergence: None,
+    },
+    VerifyCase {
+        name: "anchor-whose-window-closed",
+        chain: &["LEAF_OF_EXPIRED_ANCHOR"],
+        anchors: &["EXPIRED_ANCHOR"],
+        attime: 1767225600,
+        openssl_ok: false,
+        openssl_error: Some(10),
+        openssl_depth: Some(1),
+        divergence: None,
+    },
+    VerifyCase {
+        name: "issuer-expired-under-a-valid-leaf",
+        chain: &["LEAF_EC", "INTERMEDIATE"],
+        anchors: &["ROOT"],
+        attime: 2537654400,
+        openssl_ok: false,
+        openssl_error: Some(10),
+        openssl_depth: Some(2),
+        divergence: None,
+    },
+    VerifyCase {
+        name: "broken-link-missing-intermediate",
+        chain: &["LEAF_RSA", "ROOT"],
+        anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: false,
+        openssl_error: Some(20),
+        openssl_depth: Some(0),
+        divergence: None,
+    },
+    VerifyCase {
+        name: "strict-sibling-CA-as-the-anchor",
+        chain: &["LEAF_SUB_STRICT", "SUB_CA_STRICT"],
+        anchors: &["TOP_CA_STRICT"],
+        attime: 1767225600,
+        openssl_ok: false,
+        openssl_error: Some(25),
+        openssl_depth: Some(2),
+        divergence: None,
+    },
+    VerifyCase {
+        name: "ca-certificate-as-the-server",
+        chain: &["INTERMEDIATE"],
+        anchors: &["ROOT"],
+        attime: 1609459200,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: Some("this crate refuses a CA certificate as the server's own (CaUsedAsLeaf); OpenSSL's default purpose does not, and a TLS server certificate may not be a CA"),
+    },
+    VerifyCase {
+        name: "anchor-below-the-key-size-floor",
+        chain: &["LEAF_OF_WEAK_ANCHOR"],
+        anchors: &["WEAK_ANCHOR"],
+        attime: 1767225600,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: Some("this crate's Policy::min_rsa_bits is 2048; OpenSSL at -auth_level 0 has no floor"),
+    },
 ];

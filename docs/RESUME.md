@@ -1,19 +1,21 @@
 # Hearth — next session
 
-> **Session 2026-10-16 (pt 8) in one paragraph.** SparkOC's review of the anchor asymmetry: a trust anchor
-> is a CA in the act, so an anchor that **states** `cA: FALSE` is now refused (`NotACa`) when its key
-> verifies someone else's certificate — but with two deliberate differences from the chain-link rule. An
-> absent `basicConstraints` is allowed on an anchor (a bare or v1-style pin has no extension to contradict)
-> and refused on a link, and an anchor that *is* the certificate it verifies is an **identity pin**, not an
-> issuance, so pinning a self-signed `cA: FALSE` certificate still verifies — which is also what OpenSSL
-> does, and the case that forced the distinction (the rule as first written broke
-> `every_suite_verifies_as_a_chain_link`). `Certificate` grew `has_basic_constraints()` so "absent" and
-> "stated false" can be told apart (`is_ca` is false for both), the generator records it per fixture, and
-> two new certificates (24 total) give the refusal its fixture. Two documentation defects were fixed in the
-> same pass: `chain.rs`'s "two rules" section still claimed `keyCertSign` was *not* required of an anchor —
-> false since slice 12 — and it now enumerates three rules. **214 checks green on the hardware path and on
-> `HEARTH_TLS_NO_HW=1`** (212 before), clippy `--all-targets -D warnings`, fmt, `cargo doc` (zero warnings)
-> and the workspace check clean, `std`-only, empty `[dependencies]`, and still nothing in the crate calls
+> **Session 2026-10-16 (pt 9) in one paragraph.** The crate gets an **oracle**. Every check so far compared
+> our reading of a certificate against OpenSSL's *parser*, which left the policy — which rules run, and what
+> each means — checked only against my own reading of RFC 5280. Fifteen paths are now put to a second
+> implementation of path validation at the same instants (`openssl verify -partial_chain -auth_level 0`,
+> 3.5.5), with the verdicts recorded in the generated `VERIFY_CASES` table rather than taken at test time,
+> so nothing silently skips when the tool is missing. The test enforces the direction a disagreement may
+> take: OpenSSL accepting while this crate refuses, never the reverse. It paid for itself three times over.
+> It **measured** the identity-pin claim from pt 8, which had been recalled from memory rather than shown
+> (OpenSSL accepts a self-signed `cA: FALSE` certificate pinned as its own anchor). It **independently
+> corroborates** the new anchor rule (error 79, "invalid CA certificate", exactly as pt 8 reasoned). And
+> with `keyCertSign` neutered the oracle **fails by name** — a second implementation catching a regression
+> in a rule it was never told about. Two divergences remain, both with this crate the stricter side: a CA
+> certificate used as the server (`CaUsedAsLeaf`) and the `Policy::min_rsa_bits` floor. **215 checks green
+> on the hardware path and on `HEARTH_TLS_NO_HW=1`** (214 before), clippy `--all-targets -D warnings`, fmt,
+> `cargo doc` (zero warnings) and the workspace check clean, `std`-only, empty `[dependencies]`, and still
+> nothing in the crate calls
 > any of it: `RejectAll` is the only `CertificateVerifier`, and there is **no revocation checking of any
 > kind**. History: `docs/BUG_TRACKER.md`.
 
@@ -78,6 +80,15 @@
         third rule read out of a CA certificate: stated `cA: FALSE` is refused when the anchor verifies
         someone else's certificate, an absent extension is allowed, and a certificate pinned as *itself*
         is an identity pin and allowed (see `check_anchor_is_ca`).
+   - **The oracle is in place — extend it instead of trusting prose.** `VERIFY_CASES` in the generated
+     table holds fifteen paths with the OpenSSL CLI's verdicts recorded; the test compares verdicts at the
+     same instant and permits a disagreement only where OpenSSL accepts and this crate refuses. A new path
+     goes in `verify_cases()` in `scripts/tls_x509_fixtures.py`, then regenerate. Two things it exposed and
+     does *not* model: `openssl verify -x509_strict` refuses every one of these fixtures with error 85
+     ("Missing Authority Key Identifier"), so that whole class of extension requirements — AKI/SKI, and the
+     stricter rules behind them — is not implemented and not tested on this side, and the two recorded
+     divergences (`CaUsedAsLeaf`, `Policy::min_rsa_bits`) are this crate's own choices, ours to keep or to
+     reconsider rather than accidents.
    - **The root store is the caller's decision, and the crate is built that way.** `client.rs` already
      says this crate has no root store and no business having one: [`chain::verify_chain`] takes the
      anchors as an argument. So the question moves to the downloader — a pinned set in `hearth-ui` with
@@ -89,10 +100,9 @@
      long, RSA key too small, scheme that does not match the key type, framing failures, a purpose the
      leaf is not allowed, `pathLenConstraint` on both sides, a CA that does not claim `keyCertSign`, the
      anchor's own window and key size, and an anchor that states `cA: FALSE`** all have tests. What the
-     crate still has none of is
-     **revocation checking of any kind** — that is now the only *absent check*, as opposed to an untested
-     one, and it must stay a decision rather than an oversight before the downloader takes an `https://`
-     path through this code.
+     crate still has none of is **revocation checking of any kind** — that is now the only *absent check*,
+     as opposed to an untested one, and it must stay a decision rather than an oversight before the
+     downloader takes an `https://` path through this code.
    - `Transport` in `hearth-ui/src/http.rs` is the seam and the `https://` branch of
      `downloads.rs::run_transfer` is what gets rewired afterwards. **Do not touch `http.rs` without
      asking — it is SparkOC's file.** Loose thread to close at the same time: the downloader's DNS

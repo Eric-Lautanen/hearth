@@ -79,6 +79,27 @@ struct Expectation {
     key: Key,
 }
 
+/// One path, with what OpenSSL's own `verify` said about it.
+///
+/// The paths live in the generated table rather than in the test so that both
+/// implementations are asked about exactly the same thing, and the verdicts are recorded
+/// rather than taken at test time: the file is a reviewed pin, and a test that shells out
+/// to a tool is a test that quietly skips when the tool is absent.
+#[derive(Debug)]
+struct VerifyCase {
+    name: &'static str,
+    /// `chain[0]` is the leaf; the rest are the certificates a server would send, in order.
+    chain: &'static [&'static str],
+    anchors: &'static [&'static str],
+    /// The instant both implementations are asked about.
+    attime: i64,
+    openssl_ok: bool,
+    openssl_error: Option<i32>,
+    openssl_depth: Option<u32>,
+    /// Why a disagreement is expected, or `None` when the two have to agree.
+    divergence: Option<&'static str>,
+}
+
 /// The public key fields OpenSSL reports, ready to compare.
 #[derive(Debug)]
 enum Key {
@@ -1240,6 +1261,95 @@ fn pinning_a_certificate_is_an_identity_and_not_an_issuance() {
     // And the exemption cannot be walked out of: the same stated-`cA: FALSE` certificate
     // is refused the moment it is asked to authenticate anything but itself, in the chain
     // or at the anchor — the two assertions in the test above are what say so.
+}
+
+// ---------------------------------------------------------------------------
+// The oracle: the same paths, put to a second implementation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_path_is_verified_the_same_way_the_openssl_cli_verifies_it() {
+    // Everything above compares our reading of a certificate against OpenSSL's reading of
+    // the same bytes, which leaves the *policy* — which rules run, and what each one means
+    // — checked only against our own understanding of RFC 5280. This asks a second
+    // implementation of path validation about the same paths at the same instants.
+    //
+    // The recorded verdicts come from `openssl verify -partial_chain -auth_level 0` (the
+    // version is in the generated table). `-partial_chain` is the closest equivalent to
+    // this crate's rule that an anchor need not be self-signed; `-auth_level 0` keeps
+    // OpenSSL's separate security-level policy out of a comparison about structure. So a
+    // disagreement is either a bug here or a written-down divergence, and a divergence is
+    // only ever allowed in the safe direction: OpenSSL accepting where this crate refuses.
+    // This crate being the more permissive side is a failure, not a footnote.
+    //
+    // Only the *verdict* is compared. Which certificate gets blamed is not comparable:
+    // OpenSSL numbers depths from the leaf and counts the anchor when it is a chain
+    // element, and it reports the highest expired certificate while this crate reports the
+    // first one it reaches — two refusals for the same expired path, four depths apart.
+    for case in VERIFY_CASES {
+        let chain_ders: Vec<Vec<u8>> = case.chain.iter().map(|label| fixture(label)).collect();
+        let anchor_ders: Vec<Vec<u8>> = case.anchors.iter().map(|label| fixture(label)).collect();
+        let chain = certificates_of(&chain_ders);
+        let anchors = certificates_of(&anchor_ders);
+        let ours = verify_chain(
+            &chain,
+            &anchors,
+            UnixTime::from_secs(case.attime),
+            &Policy::default(),
+        );
+
+        match case.divergence {
+            Some(reason) => {
+                assert!(
+                    !reason.is_empty(),
+                    "{}: a divergence needs a reason",
+                    case.name
+                );
+                assert!(
+                    !ours.is_ok(),
+                    "{}: recorded as a divergence ({reason}) but this crate accepts it, so \
+                     the divergence has gone stale",
+                    case.name
+                );
+                assert!(
+                    case.openssl_ok,
+                    "{}: the recorded divergence is in the wrong direction — OpenSSL refused \
+                     this path as well, so the two implementations do not actually disagree",
+                    case.name
+                );
+            }
+            None => assert_eq!(
+                ours.is_ok(),
+                case.openssl_ok,
+                "{}: this crate says {ours:?}, OpenSSL says ok={} (error {:?} at depth {:?})",
+                case.name,
+                case.openssl_ok,
+                case.openssl_error,
+                case.openssl_depth
+            ),
+        }
+    }
+
+    // A table that only asked about paths everyone accepts would prove nothing, so both
+    // answers have to be in it, and the refusals have to include ones that come from a
+    // *rule* rather than from an issuer simply being missing.
+    assert!(
+        VERIFY_CASES.iter().any(|case| case.openssl_ok),
+        "the table needs at least one path OpenSSL accepts"
+    );
+    assert!(
+        VERIFY_CASES.iter().filter(|case| !case.openssl_ok).count() >= 5,
+        "the table needs a real set of refusals, not one"
+    );
+    assert!(
+        VERIFY_CASES
+            .iter()
+            // 25 is "path length constraint exceeded" and 79 "invalid CA certificate":
+            // the two OpenSSL codes that mean a structural rule refused the path, which is
+            // the half of the policy this crate is actually in the business of deciding.
+            .any(|case| matches!(case.openssl_error, Some(25 | 79))),
+        "the table needs a refusal by a structural rule, not only by a missing issuer"
+    );
 }
 
 #[test]

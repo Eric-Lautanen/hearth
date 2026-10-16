@@ -42,8 +42,13 @@ Requires `pip install cryptography sympy`. Run from the repository root:
     python scripts/tls_x509_fixtures.py
 """
 import datetime
+import os
 import random
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 import sympy
 from cryptography import x509
@@ -125,6 +130,109 @@ def signature_length(der):
     tag, _, size, _ = read_tlv(body, after_algorithm)
     assert tag == 0x03, "the signature is a BIT STRING"
     return size - 1
+
+
+def openssl_version():
+    """The OpenSSL CLI's version line, recorded beside the verdicts it produced."""
+    if shutil.which("openssl") is None:
+        raise SystemExit(
+            "openssl is not on PATH. The path table below records verdicts taken from\n"
+            "the OpenSSL CLI; the committed data file is the pin, and it stays valid\n"
+            "without the tool. Install OpenSSL only to regenerate deliberately."
+        )
+    return subprocess.run(
+        ["openssl", "version"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def openssl_verdict(by_label, chain, anchors, attime):
+    """`(ok, error, depth)` from the OpenSSL CLI for one path.
+
+    Three flags are deliberate. `-attime` puts both implementations at the instant the
+    test uses, because these fixtures were built around particular dates on purpose.
+    `-partial_chain` is the closest equivalent to this crate's rule that an anchor need
+    not be self-signed: pinning an intermediate is explicit here and needs a flag there.
+    `-auth_level 0` keeps OpenSSL's separate security-level policy out of the
+    comparison — this crate has a key-size floor of its own, and that difference is
+    recorded as a divergence rather than buried in a flag.
+
+    `-untrusted` is omitted when there is nothing between the leaf and the anchor:
+    passing an empty file makes openssl refuse to run at all, with a message that looks
+    like a verdict and is not one.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ca = os.path.join(tmp, "ca.pem")
+        leaf = os.path.join(tmp, "leaf.pem")
+        write_pem(by_label, ca, anchors)
+        write_pem(by_label, leaf, [chain[0]])
+        command = [
+            "openssl", "verify",
+            "-CAfile", ca,
+            "-partial_chain",
+            "-attime", str(attime),
+            "-auth_level", "0",
+        ]
+        if chain[1:]:
+            untrusted = os.path.join(tmp, "chain.pem")
+            write_pem(by_label, untrusted, chain[1:])
+            command += ["-untrusted", untrusted]
+        result = subprocess.run(command + [leaf], capture_output=True, text=True)
+
+    found = re.search(r"error (\d+) at (\d+) depth lookup", result.stdout + result.stderr)
+    return (
+        result.returncode == 0,
+        int(found.group(1)) if found else None,
+        int(found.group(2)) if found else None,
+    )
+
+
+def write_pem(by_label, path, labels):
+    with open(path, "wb") as handle:
+        for label in labels:
+            handle.write(by_label[label].public_bytes(serialization.Encoding.PEM))
+
+
+def verify_cases():
+    """The paths both implementations are asked about.
+
+    `(name, chain, anchors, instant-from, note)`, where `chain[0]` is the leaf and the
+    instant comes from that certificate's own `notBefore` — the same instant the tests
+    use, since the fixtures were built around particular dates deliberately.
+
+    `note` is set only where the two are *expected* to disagree, and every such case has
+    to be one where OpenSSL accepts and this crate refuses: being the more permissive
+    side is not an excusable disagreement, and the test enforces that.
+    """
+    return [
+        ("leaf-and-intermediate-to-root", ["LEAF_RSA", "INTERMEDIATE"], ["ROOT"], "LEAF_RSA", None),
+        ("intermediate-pinned-as-the-anchor", ["LEAF_SUB", "SUB_CA"], ["TOP_CA"], "LEAF_SUB", None),
+        ("path-deeper-than-the-root-allows", ["LEAF_SUB", "SUB_CA", "TOP_CA"], ["ROOT"], "LEAF_SUB", None),
+        ("issuer-without-keyCertSign", ["LEAF_OF_NO_SIGN_CA", "CA_NO_KEY_CERT_SIGN"], ["ROOT"], "LEAF_OF_NO_SIGN_CA", None),
+        ("anchor-stating-ca-false", ["LEAF_OF_NON_CA_SIGNER"], ["NON_CA_SIGNER"], "LEAF_OF_NON_CA_SIGNER", None),
+        ("ca-false-certificate-as-a-link", ["LEAF_OF_NON_CA_SIGNER", "NON_CA_SIGNER"], ["ROOT"], "LEAF_OF_NON_CA_SIGNER", None),
+        ("self-signed-ca-false-pinned-as-itself", ["SELF_SIGNED_PSS"], ["SELF_SIGNED_PSS"], "SELF_SIGNED_PSS", None),
+        ("no-basic-constraints-pinned-as-itself", ["SELF_SIGNED_EC"], ["SELF_SIGNED_EC"], "SELF_SIGNED_EC", None),
+        ("root-the-caller-does-not-trust", ["LEAF_RSA", "INTERMEDIATE"], ["SELF_SIGNED_EC"], "LEAF_RSA", None),
+        ("anchor-whose-window-closed", ["LEAF_OF_EXPIRED_ANCHOR"], ["EXPIRED_ANCHOR"], "LEAF_OF_EXPIRED_ANCHOR", None),
+        ("issuer-expired-under-a-valid-leaf", ["LEAF_EC", "INTERMEDIATE"], ["ROOT"], "LEAF_EC", None),
+        ("broken-link-missing-intermediate", ["LEAF_RSA", "ROOT"], ["ROOT"], "LEAF_RSA", None),
+        ("strict-sibling-CA-as-the-anchor", ["LEAF_SUB_STRICT", "SUB_CA_STRICT"], ["TOP_CA_STRICT"], "LEAF_SUB_STRICT", None),
+        (
+            "ca-certificate-as-the-server",
+            ["INTERMEDIATE"],
+            ["ROOT"],
+            "INTERMEDIATE",
+            "this crate refuses a CA certificate as the server's own (CaUsedAsLeaf); "
+            "OpenSSL's default purpose does not, and a TLS server certificate may not be a CA",
+        ),
+        (
+            "anchor-below-the-key-size-floor",
+            ["LEAF_OF_WEAK_ANCHOR"],
+            ["WEAK_ANCHOR"],
+            "LEAF_OF_WEAK_ANCHOR",
+            "this crate's Policy::min_rsa_bits is 2048; OpenSSL at -auth_level 0 has no floor",
+        ),
+    ]
 
 
 def key_usage_mask(usage):
@@ -851,6 +959,38 @@ def main():
         out.append("            key: %s," % want["key"])
         out.append("        },")
         out.append("    ),")
+    out.append("];")
+    out.append("")
+
+    out.append("/// What the OpenSSL CLI says about each of these paths.")
+    out.append("///")
+    out.append("// %s" % openssl_version())
+    out.append("// `openssl verify -partial_chain -auth_level 0 -attime <instant>`")
+    out.append("///")
+    out.append("/// `divergence` is set only where the two are known to disagree, and only ever")
+    out.append("/// where OpenSSL accepts: this crate may be stricter than OpenSSL, never laxer.")
+    out.append("const VERIFY_CASES: &[VerifyCase] = &[")
+    by_label = dict(fixtures)
+    for name, chain, anchors, instant_from, note in verify_cases():
+        attime = int(by_label[instant_from].not_valid_before_utc.timestamp())
+        ok, code, depth = openssl_verdict(by_label, chain, anchors, attime)
+        out.append("    VerifyCase {")
+        out.append('        name: "%s",' % name)
+        out.append("        chain: &[%s]," % ", ".join('"%s"' % label for label in chain))
+        out.append("        anchors: &[%s]," % ", ".join('"%s"' % label for label in anchors))
+        out.append("        attime: %d," % attime)
+        out.append("        openssl_ok: %s," % ("true" if ok else "false"))
+        out.append(
+            "        openssl_error: %s," % ("None" if code is None else "Some(%d)" % code)
+        )
+        out.append(
+            "        openssl_depth: %s," % ("None" if depth is None else "Some(%d)" % depth)
+        )
+        out.append(
+            "        divergence: %s,"
+            % ("None" if note is None else 'Some("%s")' % note.replace('"', '\\"'))
+        )
+        out.append("    },")
     out.append("];")
     out.append("")
 

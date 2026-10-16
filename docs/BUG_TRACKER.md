@@ -38,6 +38,65 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 15 — an oracle outside the crate: the same paths, put to the OpenSSL CLI (buffy, 2026-10-16)
+
+Every check so far compares our reading of a certificate against OpenSSL's *parser*. The **policy** — which
+rules run, and what each one means — was still only compared against my own reading of RFC 5280. So fifteen
+paths are now put to a second implementation of path validation, at the same instants, and the verdicts are
+recorded in the generated table (`VERIFY_CASES`) rather than taken at test time: a test that shells out to a
+tool is a test that quietly skips when the tool is absent.
+
+`openssl verify -partial_chain -auth_level 0 -attime <instant>`, OpenSSL 3.5.5. The flags are part of the
+comparison and documented in the generator: `-partial_chain` is the closest equivalent to this crate's rule
+that an anchor need not be self-signed, and `-auth_level 0` keeps OpenSSL's separate security-level policy
+out of a comparison about structure.
+
+| path | OpenSSL 3.5.5 | this crate |
+|------|---------------|------------|
+| leaf + intermediate → root | OK | `Ok` |
+| intermediate pinned as the anchor | OK (`-partial_chain`) | `Ok` |
+| three deep, root allows one | error 25 at depth 3 | `PathLengthExceeded(Anchor(0))` |
+| issuer without `keyCertSign` | error 79 at depth 1 | `MissingKeyCertSign(Chain(1))` |
+| anchor stating `cA: FALSE` | error 79 at depth 1 | `NotACa(Anchor(0))` |
+| `cA: FALSE` certificate as a link | error 79 at depth 1 | `NotACa(Chain(1))` |
+| self-signed `cA: FALSE` pinned as itself | **OK** | `Ok` |
+| no `basicConstraints`, pinned as itself | OK | `Ok` |
+| root the caller does not trust | error 20 at depth 1 | `Unanchored` |
+| anchor whose window closed | error 10 at depth 1 | `Expired(Anchor(0))` |
+| issuer expired under a valid leaf | error 10 at depth 2 | `Expired(Chain(1))` |
+| broken link, intermediate omitted | error 20 at depth 0 | `BrokenLink { index: 0 }` |
+| strict sibling CA as the anchor | error 25 at depth 2 | `PathLengthExceeded(Anchor(0))` |
+| CA certificate as the server | **OK** | `CaUsedAsLeaf` — divergence, this crate is stricter |
+| 1024-bit anchor | **OK** (`-auth_level 0`) | `KeyTooSmall` — divergence, this crate is stricter |
+
+What the oracle actually bought:
+
+- **It measured the claim I had been repeating from memory.** The identity-pin exemption from slice 14 — a
+  self-signed `cA: FALSE` certificate pinned as its own anchor — is accepted by OpenSSL, which is what the
+  slice-14 commit said and could not previously have shown.
+- **It independently corroborates slice 14's new rule**: OpenSSL refuses a non-CA anchor verifying another
+  certificate with error 79, the same verdict this crate reaches for the same reason.
+- **Two divergences, both in the safe direction**, and the test enforces the direction: a disagreement is
+  only permitted where OpenSSL accepts and this crate refuses. Being the more permissive side is a failure,
+  not a footnote. `CaUsedAsLeaf` is TLS-specific and correct; the key-size floor is this crate's own policy.
+- **With the `keyCertSign` rule neutered, the oracle fails by name** — "issuer-without-keyCertSign: this
+  crate says `Ok(())`, OpenSSL says ok=false (error 79)" — a second implementation catching a regression in
+  a rule it was never told about.
+
+Two harness traps for the record, both of which produced results that looked like verdicts and were not:
+`-untrusted` with an empty file makes openssl refuse to run at all ("Could not find untrusted
+certificates"), and `-x509_strict` fails *every* fixture with error 85, "Missing Authority Key Identifier",
+because these certificates carry no AKI/SKI. The strict mode is therefore not usable here without new
+extensions — a candidate for the next fixture round, not a verdict about the crate.
+
+Also worth writing down: **the blamed certificate is not comparable.** OpenSSL numbers depths from the leaf
+and reports the highest expired one; this crate reports the first it reaches. For the expired-issuer path
+they are four depths apart while both refusing correctly, so the test compares verdicts only.
+
+**215 checks green** on both paths (214 before), clippy `-D warnings`, fmt, `cargo doc` zero warnings,
+workspace check exit 0, and the generator's output is `cargo fmt`-stable (regenerating does not move the
+file). No inference code touched, so the benchmark mandate did not apply.
+
 ### hearth-tls slice 14 — the anchor's `basicConstraints`, and the documentation defect it exposed (buffy, 2026-10-16)
 
 SparkOC's review (#93) settled the asymmetry reported at the end of slice 13: close it, with
