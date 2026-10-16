@@ -4,7 +4,7 @@
 use hearth_gguf::{GgufFile, MetaValue};
 
 fn wht(x: &mut [f32], bs: usize) {
-    if bs == 0 || bs > x.len() || x.len() % bs != 0 {
+    if bs == 0 || bs > x.len() || !x.len().is_multiple_of(bs) {
         return;
     }
     let s = 1.0 / (bs as f32).sqrt();
@@ -111,7 +111,7 @@ fn main() {
         .unwrap_or(0);
     let mut blocks: Vec<usize> = vec![block];
     for bs in [64usize, 128, 256, 512, 1024] {
-        if bs != block && d % bs == 0 {
+        if bs != block && d.is_multiple_of(bs) {
             blocks.push(bs);
         }
     }

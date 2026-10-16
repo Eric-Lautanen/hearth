@@ -3,8 +3,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use hearth_quant;
-
 pub type DotFn = unsafe fn(*const u8, *const u8, usize) -> f32;
 /// Paired-token dot: one weight row against two activations, returning both results.
 /// Lets prefill expand each weight row once for two prompt tokens.

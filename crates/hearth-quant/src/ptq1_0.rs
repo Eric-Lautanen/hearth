@@ -185,6 +185,23 @@ fn avx512_available() -> bool {
     ok
 }
 
+/// Name of the kernel [`dot_ptq1_0_q8_0_ptr`] selects on this machine.
+///
+/// Reports the choice without duplicating the predicates, so a benchmark can
+/// verify dispatch instead of inferring it from timing.
+pub fn kernel_name() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_available() {
+            return "avx512";
+        }
+        if avx2_available() {
+            return "avx2";
+        }
+    }
+    "scalar"
+}
+
 #[cfg(target_arch = "x86_64")]
 static AVX2_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
 

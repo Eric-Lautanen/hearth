@@ -135,10 +135,14 @@ pub fn dot_q2_0_q8_0(weight_row: &[u8], act_data: &[u8], n: usize) -> f32 {
 /// AVX-512 VNNI kernel: uses vpdpbusd (dot product of u8 × i8 → i32)
 /// for the core dot product. Q2_0 values as u8 {0,1,2,3} minus the
 /// activation sum correction: true_dot = vpdpbusd(w_u8, act) - Σact.
+///
+/// # Safety
+/// `w_ptr` must be valid for `n/128*34` bytes and `a_ptr` for `n/32*34` bytes;
+/// the caller must confirm AVX-512F and AVX-512VNNI are present.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "avx512vnni")]
-unsafe fn dot_q2_0_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
+pub unsafe fn dot_q2_0_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     use core::arch::x86_64::*;
     let blocks = n / BLOCK_SIZE;
     let mut acc_global = _mm256_setzero_ps();
@@ -188,11 +192,15 @@ unsafe fn dot_q2_0_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usize
 /// Uses _mm512_dpbusd_epi32 to compute the u8×i8→i32 dot product for 64 elements at once.
 /// The 512-bit result is split into two 256-bit halves with independent Q8_0 scale factors.
 /// Available on Zen 4 (double-pumped 256-bit → front-end μop reduction).
+///
+/// # Safety
+/// `w_ptr` must be valid for `n/128*34` bytes and `a_ptr` for `n/32*34` bytes;
+/// the caller must confirm AVX-512F, AVX-512VNNI and AVX-512DQ are present.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "avx512vnni")]
 #[target_feature(enable = "avx512dq")]
-unsafe fn dot_q2_0_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
+pub unsafe fn dot_q2_0_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     use core::arch::x86_64::*;
     let blocks = n / BLOCK_SIZE;
     let mut acc_global = _mm256_setzero_ps();
@@ -266,9 +274,13 @@ unsafe fn dot_q2_0_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8, n: 
 }
 
 /// AVX2 LUT kernel: 16 elements per batch, FMA accumulation across all blocks, single hsum per row.
+///
+/// # Safety
+/// `w_ptr` must be valid for `n/128*34` bytes and `a_ptr` for `n/32*34` bytes;
+/// the caller must confirm AVX2 is present.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn dot_q2_0_q8_0_lut_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
+pub unsafe fn dot_q2_0_q8_0_lut_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     let blocks = n / BLOCK_SIZE;
     let mut acc_global = _mm256_setzero_ps();
     for b in 0..blocks {
@@ -535,12 +547,14 @@ pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
     {
         // AVX-512 512-bit VNNI: processes 2 sub-blocks (64 elements) per iteration
         // Requires avx512dq for vextracti64x4 in addition to avx512f+avx512vnni.
-        // Skipped on Zen 4 (see crate::avx512_full_width): half-width datapath.
+        // Allowed on Zen 4: `vpdpbusd` cuts the front-end work enough to pay for
+        // the half-width datapath — over a 4B PQ2_0 `blk.0` row set on a Ryzen 7
+        // 8840HS the aggregate was 3.09 GB/s here against 2.91 GB/s for the AVX2
+        // LUT kernel (`benchk <model> pq2_0`).
         #[cfg(target_feature = "avx512f")]
         #[cfg(target_feature = "avx512vnni")]
         #[cfg(target_feature = "avx512dq")]
-        if crate::avx512_full_width()
-            && std::arch::is_x86_feature_detected!("avx512f")
+        if std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512vnni")
             && std::arch::is_x86_feature_detected!("avx512dq")
         {
@@ -550,11 +564,11 @@ pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
     #[cfg(target_arch = "x86_64")]
     {
         // AVX-512 256-bit VNNI fallback: vpdpbusd replaces cvtepi8+madd pair.
-        // Also gated on a full-width datapath (see crate::avx512_full_width).
+        // Gated on the VNNI features only, for the reason above: on Zen 4 this
+        // measured 3.10 GB/s against 2.91 GB/s for the AVX2 LUT kernel.
         #[cfg(target_feature = "avx512f")]
         #[cfg(target_feature = "avx512vnni")]
-        if crate::avx512_full_width()
-            && std::arch::is_x86_feature_detected!("avx512f")
+        if std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512vnni")
         {
             return dot_q2_0_q8_0_vnni_avx512(w_ptr, a_ptr, n);

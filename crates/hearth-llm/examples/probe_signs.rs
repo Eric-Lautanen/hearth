@@ -82,14 +82,11 @@ fn main() {
         .unwrap();
         for (rot, best) in [(1usize, &mut best1), (0usize, &mut best0)] {
             let mut zz = z.clone();
-            match rot {
-                1 => {
-                    for (v, s) in zz.iter_mut().zip(signs.iter()) {
-                        *v *= s;
-                    }
-                    wht(&mut zz, 1024);
+            if rot == 1 {
+                for (v, s) in zz.iter_mut().zip(signs.iter()) {
+                    *v *= s;
                 }
-                _ => {}
+                wht(&mut zz, 1024);
             }
             let dot: f64 = zz
                 .iter()

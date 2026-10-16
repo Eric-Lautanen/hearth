@@ -15,11 +15,15 @@ use hearth_gguf::GgmlDType;
 /// Whether 512-bit vector kernels are expected to beat their 256-bit versions
 /// on this CPU.
 ///
-/// AMD family 25 (Zen 4) splits every 512-bit operation into two 256-bit
-/// micro-ops, so wider registers buy no throughput while wider-kernel overhead
-/// (packing, masked loads) is real: measured on a Ryzen 7 8840HS, the AVX-512
-/// PTQ1_0 dot ran at 0.82 GB/s against 1.28 GB/s for the AVX2 one. Full-width
-/// implementations (Intel server parts, Zen 5+) do benefit.
+/// AMD family 19h (Zen 3 and Zen 4) splits every 512-bit operation into two
+/// 256-bit micro-ops, so wider registers buy no throughput while wider-kernel
+/// overhead (packing, masked loads) is real: measured on a Ryzen 7 8840HS, the
+/// AVX-512 PTQ1_0 dot ran at 1.28 GB/s against 1.76 GB/s for the AVX2 one.
+/// Full-width implementations (Intel server parts, Zen 5+) do benefit.
+///
+/// This is not a blanket "no AVX-512 on Zen 4": the VNNI kernels reduce the
+/// front-end work enough to stay ahead there and are gated on the VNNI feature
+/// alone (see `q2_0::dot_q2_0_q8_0_ptr`).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn avx512_full_width() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -37,7 +41,8 @@ pub(crate) fn avx512_full_width() -> bool {
     ok
 }
 
-/// AMD family 25 is Zen 4, whose 512-bit datapath is two 256-bit halves.
+/// AMD family 19h (Zen 3 / Zen 4): the only AVX-512 part in it is Zen 4, whose
+/// 512-bit datapath is two 256-bit halves.
 ///
 /// `__cpuid` is safe or unsafe depending on the target features the crate is
 /// built with, so the lint is allowed rather than the call being rewritten per
@@ -52,8 +57,14 @@ fn cpu_is_amd_zen4() -> bool {
     if !is_amd {
         return false;
     }
-    let family = ((unsafe { std::arch::x86_64::__cpuid(1) }.eax >> 8) & 0xF) as u8;
-    family == 25
+    // CPUID reports the family in a 4-bit field, so everything from 15h up is
+    // encoded as base 0xF plus an extended family; Zen 4's 19h arrives as
+    // base 15 with extended 0xA and must be reconstructed before comparing.
+    let id = unsafe { std::arch::x86_64::__cpuid(1) };
+    let base = (id.eax >> 8) & 0xF;
+    let ext = (id.eax >> 20) & 0xFF;
+    let family = if base == 0xF { base + ext } else { base };
+    family == 0x19
 }
 
 pub fn dequantize(dtype: GgmlDType, data: &[u8], out: &mut [f32]) -> Result<(), String> {

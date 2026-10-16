@@ -1,6 +1,6 @@
 use crate::attention;
 use crate::ops;
-use crate::weights::{self, ModelWeights};
+use crate::weights::ModelWeights;
 use hearth_compute::{GpuBuffer, GpuCompute, QuantKind};
 use std::collections::HashMap;
 
@@ -165,9 +165,8 @@ impl FluxTransformer {
         let mut x =
             self.linear_bf16_single_idx("time_guidance_embed.timestep_embedder.linear_1", t_emb, d);
         ops::silu(&mut x);
-        let x =
-            self.linear_bf16_single_idx("time_guidance_embed.timestep_embedder.linear_2", &x, d);
-        x
+
+        self.linear_bf16_single_idx("time_guidance_embed.timestep_embedder.linear_2", &x, d)
     }
 
     fn double_stream_block(

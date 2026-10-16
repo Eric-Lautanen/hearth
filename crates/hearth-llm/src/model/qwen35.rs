@@ -476,7 +476,7 @@ impl Qwen35Core {
             for i in 0..config.n_layers as usize {
                 if let Some(info) = gguf.find_tensor(&format!("blk.{}.attn_k.weight", i)) {
                     let rows = *info.shape.get(1).ok_or("qwen35: bad attn_k shape")? as usize;
-                    if rows % n_kv == 0 && rows / n_kv > 0 {
+                    if rows.is_multiple_of(n_kv) && rows / n_kv > 0 {
                         hd = rows / n_kv;
                     }
                     break;
@@ -563,7 +563,8 @@ impl Qwen35Core {
             let mut off = 0usize;
             for wv in widths {
                 let width = meta_int(wv).ok_or("qwen35: bad sign width")? as usize;
-                if width == 0 || width % had_block_size != 0 || off + width > values.len() {
+                if width == 0 || !width.is_multiple_of(had_block_size) || off + width > values.len()
+                {
                     return Err(format!("qwen35: invalid hadamard sign width {}", width));
                 }
                 let vec: Vec<f32> = values[off..off + width]
@@ -1028,7 +1029,7 @@ impl Qwen35Core {
         caches: &mut Qwen35Caches,
         logits: &mut [f32],
     ) -> Result<(), String> {
-        let mut sc = &mut *self.scratch.lock().unwrap();
+        let sc = &mut *self.scratch.lock().unwrap();
         let d = self.d_model;
         let eps = self.config.rms_norm_eps;
         let t_total = std::time::Instant::now();
@@ -1081,14 +1082,14 @@ impl Qwen35Core {
                 dump_layer0(pos, "attn_norm-0", &sc.normed);
             }
             if self.layer_is_gdn[layer] {
-                self.gdn_layer(layer, pos, lyr, &mut sc, caches)?;
+                self.gdn_layer(layer, pos, lyr, sc, caches)?;
                 if self.no_gdn() {
                     for v in sc.act.iter_mut() {
                         *v = 0.0;
                     }
                 }
             } else {
-                self.attn_layer(layer, lyr, pos, &mut sc, caches)?;
+                self.attn_layer(layer, lyr, pos, sc, caches)?;
                 if self.no_attn() {
                     for v in sc.act.iter_mut() {
                         *v = 0.0;

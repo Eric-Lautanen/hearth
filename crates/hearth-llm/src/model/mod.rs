@@ -2129,16 +2129,16 @@ impl LlamaModel {
         }
         let gpu = self.gpu.as_ref().ok_or("GPU not available")?;
         let seq_len = prompt_ids.len() as u32;
-        let d = self.config.d_model as u32;
-        let n_heads = self.config.n_heads as u32;
-        let n_kv_heads = self.config.n_kv_heads as u32;
-        let head_dim = self.config.head_dim as u32;
-        let n_layers = self.config.n_layers as u32;
-        let ffn_dim = self.config.d_ffn as u32;
+        let d = self.config.d_model;
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim;
+        let n_layers = self.config.n_layers;
+        let ffn_dim = self.config.d_ffn;
         let nq = n_heads * head_dim;
         let nkv = n_kv_heads * head_dim;
-        let rope_dim = self.config.rope_dim as u32;
-        let max_s = self.config.max_seq_len as u32;
+        let rope_dim = self.config.rope_dim;
+        let max_s = self.config.max_seq_len;
         let rms_norm_eps = self.config.rms_norm_eps;
         let post_norm = self.config.post_norm;
 
@@ -3007,7 +3007,7 @@ mod tests {
 
         // GPU embedding
         let gpu = gpu_model.gpu.as_ref().unwrap();
-        let embed_gpu_buf = gpu
+        let _embed_gpu_buf = gpu
             .pool
             .lock()
             .unwrap()
@@ -3119,8 +3119,8 @@ mod tests {
 
         // 4) Debug: manually run first layer operations on GPU and compare
         eprintln!("[test] Layer-by-layer debug...");
-        let n_heads = cpu_model.config.n_heads as usize;
-        let ffn_dim = cpu_model.config.d_ffn as usize;
+        let _n_heads = cpu_model.config.n_heads as usize;
+        let _ffn_dim = cpu_model.config.d_ffn as usize;
 
         // Manually run embedding on GPU and read back
         let mut hidden_cpu_input = vec![0.0f32; d];

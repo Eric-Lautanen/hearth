@@ -167,7 +167,7 @@ fn main() {
     let n_v = n_in / hd;
     let mut variants: Vec<(String, Vec<f32>)> = Vec::new();
     for nk in [16usize, 12, 24, 48, 8, 4, 1] {
-        if n_v % nk != 0 {
+        if !n_v.is_multiple_of(nk) {
             continue;
         }
         let rep = n_v / nk;
