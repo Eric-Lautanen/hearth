@@ -5,6 +5,34 @@ use rayon::prelude::*;
 
 use super::LlamaModel;
 
+/// Parameters for the fused gate+up matmul. Grouped so the call stays
+/// under the argument-count lint; field order matches the old signature.
+pub(crate) struct FusedMatmul2Params<'a> {
+    pub weight_a: &'a str,
+    pub weight_b: &'a str,
+    pub x: &'a [f32],
+    pub out_a: &'a mut [f32],
+    pub out_b: &'a mut [f32],
+    pub row_buf: &'a mut Vec<f32>,
+    pub layer: usize,
+    pub x_q8: Option<&'a [u8]>,
+}
+
+/// Parameters for the fused QKV matmul. Grouped so the call stays under
+/// the argument-count lint; field order matches the old signature.
+pub(crate) struct FusedQkvParams<'a> {
+    pub w_q: &'a str,
+    pub w_k: &'a str,
+    pub w_v: &'a str,
+    pub x: &'a [f32],
+    pub out_q: &'a mut [f32],
+    pub out_k: &'a mut [f32],
+    pub out_v: &'a mut [f32],
+    pub row_buf: &'a mut Vec<f32>,
+    pub layer: usize,
+    pub x_q8: Option<&'a [u8]>,
+}
+
 impl LlamaModel {
     pub(crate) fn matmul(
         &self,
@@ -122,15 +150,15 @@ impl LlamaModel {
                 let row_bytes = entry.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let out_ptr = out.as_mut_ptr() as usize;
-                self.pool.par_dot_rows(
-                    n_rows,
+                self.pool.par_dot_rows(crate::pool::DotRowsParams {
+                    n: n_rows,
                     w_base,
                     a_ptr,
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    hearth_quant::dot_q2_0_q8_0_ptr,
-                );
+                    dot_fn: hearth_quant::dot_q2_0_q8_0_ptr,
+                });
             }
             GgmlDType::PTQ1_0 => {
                 // Prism PTQ1_0 (type 143): dense-trit ternary, 128-el blocks, 28 bytes.
@@ -146,15 +174,15 @@ impl LlamaModel {
                 let row_bytes = entry.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let out_ptr = out.as_mut_ptr() as usize;
-                self.pool.par_dot_rows(
-                    n_rows,
+                self.pool.par_dot_rows(crate::pool::DotRowsParams {
+                    n: n_rows,
                     w_base,
                     a_ptr,
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    hearth_quant::dot_ptq1_0_q8_0_ptr,
-                );
+                    dot_fn: hearth_quant::dot_ptq1_0_q8_0_ptr,
+                });
             }
             GgmlDType::Q1_0_G128 => {
                 let x_q8_data;
@@ -169,15 +197,15 @@ impl LlamaModel {
                 let row_bytes = entry.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let out_ptr = out.as_mut_ptr() as usize;
-                self.pool.par_dot_rows(
-                    n_rows,
+                self.pool.par_dot_rows(crate::pool::DotRowsParams {
+                    n: n_rows,
                     w_base,
                     a_ptr,
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    hearth_quant::dot_q1_0g128_q8_0_ptr,
-                );
+                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                });
             }
             GgmlDType::Q1_0 => {
                 // Prism Q1_0 (type 41) uses 128-element, 18-byte blocks (same as Q1_0_G128)
@@ -193,15 +221,15 @@ impl LlamaModel {
                 let row_bytes = entry.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let out_ptr = out.as_mut_ptr() as usize;
-                self.pool.par_dot_rows(
-                    n_rows,
+                self.pool.par_dot_rows(crate::pool::DotRowsParams {
+                    n: n_rows,
                     w_base,
                     a_ptr,
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    hearth_quant::dot_q1_0g128_q8_0_ptr,
-                );
+                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                });
             }
             GgmlDType::Q8_0 => {
                 let x_q8_data;
@@ -216,15 +244,15 @@ impl LlamaModel {
                 let row_bytes = entry.dtype.byte_size(n_cols);
                 let a_ptr = q8.as_ptr() as usize;
                 let out_ptr = out.as_mut_ptr() as usize;
-                self.pool.par_dot_rows(
-                    n_rows,
+                self.pool.par_dot_rows(crate::pool::DotRowsParams {
+                    n: n_rows,
                     w_base,
                     a_ptr,
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    hearth_quant::dot_q8_0_q8_0_ptr,
-                );
+                    dot_fn: hearth_quant::dot_q8_0_q8_0_ptr,
+                });
             }
             GgmlDType::Q4_K => {
                 let rows: Vec<usize> = (0..n_rows).collect();
@@ -339,17 +367,17 @@ impl LlamaModel {
     /// Fused matmul for two weight tensors sharing the same input and Q8 activation.
     /// Processes both weight matrices in a single parallel pass over combined rows.
     /// Only Q1_0_G128 path is fused; other dtypes fall back to two separate matmul calls.
-    pub(crate) fn matmul_fused2(
-        &self,
-        weight_a: &str,
-        weight_b: &str,
-        x: &[f32],
-        out_a: &mut [f32],
-        out_b: &mut [f32],
-        row_buf: &mut Vec<f32>,
-        layer: usize,
-        x_q8: Option<&[u8]>,
-    ) -> Result<(), String> {
+    pub(crate) fn matmul_fused2(&self, p: FusedMatmul2Params<'_>) -> Result<(), String> {
+        let FusedMatmul2Params {
+            weight_a,
+            weight_b,
+            x,
+            out_a,
+            out_b,
+            row_buf,
+            layer,
+            x_q8,
+        } = p;
         let entry_a = self
             .tensors
             .get(weight_a)
@@ -395,24 +423,24 @@ impl LlamaModel {
                 let a_ptr = q8.as_ptr() as usize;
                 let out_a_ptr = out_a.as_mut_ptr() as usize;
                 let out_b_ptr = out_b.as_mut_ptr() as usize;
-                self.pool.par_dot_rows(
-                    n_rows_a,
-                    w_base_a,
+                self.pool.par_dot_rows(crate::pool::DotRowsParams {
+                    n: n_rows_a,
+                    w_base: w_base_a,
                     a_ptr,
-                    out_a_ptr,
+                    out_ptr: out_a_ptr,
                     row_bytes,
                     n_cols,
-                    hearth_quant::dot_q1_0g128_q8_0_ptr,
-                );
-                self.pool.par_dot_rows(
-                    n_rows_b,
-                    w_base_b,
+                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                });
+                self.pool.par_dot_rows(crate::pool::DotRowsParams {
+                    n: n_rows_b,
+                    w_base: w_base_b,
                     a_ptr,
-                    out_b_ptr,
+                    out_ptr: out_b_ptr,
                     row_bytes,
                     n_cols,
-                    hearth_quant::dot_q1_0g128_q8_0_ptr,
-                );
+                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                });
             }
             _ => {
                 self.matmul(weight_a, x, out_a, row_buf, layer, x_q8)?;
@@ -425,19 +453,19 @@ impl LlamaModel {
     /// Fused QKV matmul: processes Q, K, V weight matrices in a single parallel pass.
     /// Reduces Rayon dispatch overhead and improves activation cache reuse.
     /// All three must share the same n_cols and quantized dtype (Q1_0 or Q1_0_G128).
-    pub(crate) fn matmul_fused_qkv(
-        &self,
-        w_q: &str,
-        w_k: &str,
-        w_v: &str,
-        x: &[f32],
-        out_q: &mut [f32],
-        out_k: &mut [f32],
-        out_v: &mut [f32],
-        row_buf: &mut Vec<f32>,
-        layer: usize,
-        x_q8: Option<&[u8]>,
-    ) -> Result<(), String> {
+    pub(crate) fn matmul_fused_qkv(&self, p: FusedQkvParams<'_>) -> Result<(), String> {
+        let FusedQkvParams {
+            w_q,
+            w_k,
+            w_v,
+            x,
+            out_q,
+            out_k,
+            out_v,
+            row_buf,
+            layer,
+            x_q8,
+        } = p;
         let eq = self
             .tensors
             .get(w_q)
@@ -488,33 +516,33 @@ impl LlamaModel {
                 let oq = out_q.as_mut_ptr() as usize;
                 let ok = out_k.as_mut_ptr() as usize;
                 let ov = out_v.as_mut_ptr() as usize;
-                self.pool.par_dot_rows(
-                    nr_q,
-                    wq,
+                self.pool.par_dot_rows(crate::pool::DotRowsParams {
+                    n: nr_q,
+                    w_base: wq,
                     a_ptr,
-                    oq,
+                    out_ptr: oq,
                     row_bytes,
                     n_cols,
-                    hearth_quant::dot_q1_0g128_q8_0_ptr,
-                );
-                self.pool.par_dot_rows(
-                    nr_k,
-                    wk,
+                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                });
+                self.pool.par_dot_rows(crate::pool::DotRowsParams {
+                    n: nr_k,
+                    w_base: wk,
                     a_ptr,
-                    ok,
+                    out_ptr: ok,
                     row_bytes,
                     n_cols,
-                    hearth_quant::dot_q1_0g128_q8_0_ptr,
-                );
-                self.pool.par_dot_rows(
-                    nr_v,
-                    wv,
+                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                });
+                self.pool.par_dot_rows(crate::pool::DotRowsParams {
+                    n: nr_v,
+                    w_base: wv,
                     a_ptr,
-                    ov,
+                    out_ptr: ov,
                     row_bytes,
                     n_cols,
-                    hearth_quant::dot_q1_0g128_q8_0_ptr,
-                );
+                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                });
             }
             _ => {
                 self.matmul(w_q, x, out_q, row_buf, layer, x_q8)?;
@@ -603,18 +631,19 @@ impl LlamaModel {
                 _q8_hold = buf;
                 &_q8_hold[..]
             };
-            self.pool.par_dot_rows_batched(
-                m,
-                seq_len,
-                q8_size,
-                entry.data().as_ptr() as usize,
-                q8_buf.as_ptr() as usize,
-                out.as_mut_ptr() as usize,
-                entry.dtype.byte_size(k),
-                k,
-                dot_fn,
-                dot_fn2,
-            );
+            self.pool
+                .par_dot_rows_batched(crate::pool::BatchedDotRowsParams {
+                    n: m,
+                    seq_len,
+                    q8_stride: q8_size,
+                    w_base: entry.data().as_ptr() as usize,
+                    a_ptr: q8_buf.as_ptr() as usize,
+                    out_ptr: out.as_mut_ptr() as usize,
+                    row_bytes: entry.dtype.byte_size(k),
+                    n_cols: k,
+                    dot_fn,
+                    dot_fn2,
+                });
         } else {
             for s in 0..seq_len {
                 self.matmul(

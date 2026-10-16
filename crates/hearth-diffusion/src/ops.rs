@@ -150,36 +150,50 @@ pub fn rope_2d(
     }
 }
 
-pub fn attention(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    seq_len: usize,
-    head_dim: usize,
-    n_heads: usize,
-    out: &mut [f32],
-    scores: &mut [f32],
-) {
+/// Parameters for [`attention`]. Grouped so the call stays under the
+/// argument-count lint; field order matches the old signature.
+pub struct AttentionParams<'a> {
+    pub q: &'a [f32],
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    pub seq_len: usize,
+    pub head_dim: usize,
+    pub n_heads: usize,
+    pub out: &'a mut [f32],
+    pub scores: &'a mut [f32],
+}
+
+pub fn attention(p: AttentionParams<'_>) {
+    let AttentionParams {
+        q,
+        k,
+        v,
+        seq_len,
+        head_dim,
+        n_heads,
+        out,
+        scores,
+    } = p;
     let scale = 1.0 / (head_dim as f32).sqrt();
     for h in 0..n_heads {
         let q_off = h * head_dim;
-        for s in 0..seq_len {
+        for (s, slot) in scores.iter_mut().enumerate().take(seq_len) {
             let mut dot = 0.0f32;
             let k_off = s * n_heads * head_dim + h * head_dim;
             for d in 0..head_dim {
                 dot += q[q_off + d] * k[k_off + d];
             }
-            scores[s] = dot * scale;
+            *slot = dot * scale;
         }
         softmax(&mut scores[..seq_len]);
         let o_off = h * head_dim;
         for d in 0..head_dim {
             out[o_off + d] = 0.0;
         }
-        for s in 0..seq_len {
+        for (s, &sc) in scores.iter().enumerate().take(seq_len) {
             let v_off = s * n_heads * head_dim + h * head_dim;
             for d in 0..head_dim {
-                out[o_off + d] += scores[s] * v[v_off + d];
+                out[o_off + d] += sc * v[v_off + d];
             }
         }
     }

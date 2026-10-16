@@ -32,11 +32,13 @@ pub(crate) fn upload_tensors_to_gpu(gpu: &GpuCompute, tensors: &HashMap<String, 
             GgmlDType::BF16 => {
                 let n = entry.data().len() / 2;
                 let mut f32_data = vec![0.0f32; n];
-                for (i, chunk) in entry.data().chunks_exact(2).enumerate() {
+                // as_chunks::<2> needs Rust 1.88+.
+                let (chunks, _remainder) = entry.data().as_chunks::<2>();
+                for (i, chunk) in chunks.iter().enumerate() {
                     if i >= n {
                         break;
                     }
-                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    let bits = u16::from_le_bytes(*chunk);
                     f32_data[i] = f32::from_bits((bits as u32) << 16);
                 }
                 gpu.upload_f32(&f32_data, &format!("weight:{}", name))

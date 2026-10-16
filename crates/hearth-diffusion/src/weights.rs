@@ -98,10 +98,9 @@ pub fn load_weights(path: &Path) -> std::io::Result<ModelWeights> {
         let data = read_bytes(&mut r, byte_len)?;
         match dtype {
             0 => {
-                let f32_data: Vec<f32> = data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
+                // as_chunks::<4> needs Rust 1.88+.
+                let (chunks, _remainder) = data.as_chunks::<4>();
+                let f32_data: Vec<f32> = chunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
                 tensors.insert(
                     name,
                     StoredTensor::F32(F32Tensor {
@@ -153,8 +152,10 @@ impl ModelWeights {
         match self.tensors.get(name) {
             Some(StoredTensor::Bf16(t)) => {
                 let mut out = Vec::with_capacity(t.data.len() / 2);
-                for chunk in t.data.chunks_exact(2) {
-                    let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
+                // as_chunks::<2> needs Rust 1.88+.
+                let (chunks, _remainder) = t.data.as_chunks::<2>();
+                for chunk in chunks {
+                    let raw = u16::from_le_bytes(*chunk);
                     out.push(f32::from_bits((raw as u32) << 16));
                 }
                 Some(out)

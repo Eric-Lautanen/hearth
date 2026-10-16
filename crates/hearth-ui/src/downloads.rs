@@ -465,7 +465,10 @@ impl Manager {
             if e.size_bytes > 0 && have >= e.size_bytes {
                 return Ok((target_id, "done".to_string()));
             }
-            if e.size_bytes > 0 && part_len(&dir, &e.filename) >= e.size_bytes && have < e.size_bytes {
+            if e.size_bytes > 0
+                && part_len(&dir, &e.filename) >= e.size_bytes
+                && have < e.size_bytes
+            {
                 // Complete .part but incomplete final: adopt the partial.
                 let part = dir.join(format!("{}.part", e.filename));
                 let dest = dir.join(&e.filename);

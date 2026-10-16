@@ -27,9 +27,7 @@ fn stub_decode(latent: &[f32], lh: usize, lw: usize, c: usize, h: usize, w: usiz
                     let py = ly * scale_h + dy;
                     let px = lx * scale_w + dx;
                     let p_idx = (py * w + px) * c;
-                    for ch in 0..c {
-                        upscaled[p_idx + ch] = latent[l_idx + ch];
-                    }
+                    upscaled[p_idx..p_idx + c].copy_from_slice(&latent[l_idx..l_idx + c]);
                 }
             }
         }
@@ -136,23 +134,43 @@ fn group_norm(
 }
 
 #[allow(dead_code)]
-fn resnet_block(
-    x: &[f32],
+struct ResnetBlockParams<'a> {
+    x: &'a [f32],
     h: usize,
     w: usize,
     in_ch: usize,
     out_ch: usize,
-    norm1_w: &[f32],
-    norm1_b: &[f32],
-    conv1_w: &[f32],
-    conv1_b: &[f32],
-    norm2_w: &[f32],
-    norm2_b: &[f32],
-    conv2_w: &[f32],
-    conv2_b: &[f32],
-    shortcut_w: Option<&[f32]>,
-    shortcut_b: Option<&[f32]>,
-) -> Vec<f32> {
+    norm1_w: &'a [f32],
+    norm1_b: &'a [f32],
+    conv1_w: &'a [f32],
+    conv1_b: &'a [f32],
+    norm2_w: &'a [f32],
+    norm2_b: &'a [f32],
+    conv2_w: &'a [f32],
+    conv2_b: &'a [f32],
+    shortcut_w: Option<&'a [f32]>,
+    shortcut_b: Option<&'a [f32]>,
+}
+
+#[allow(dead_code)]
+fn resnet_block(p: ResnetBlockParams<'_>) -> Vec<f32> {
+    let ResnetBlockParams {
+        x,
+        h,
+        w,
+        in_ch,
+        out_ch,
+        norm1_w,
+        norm1_b,
+        conv1_w,
+        conv1_b,
+        norm2_w,
+        norm2_b,
+        conv2_w,
+        conv2_b,
+        shortcut_w,
+        shortcut_b,
+    } = p;
     let hw = h * w;
     let n_groups = 32;
 

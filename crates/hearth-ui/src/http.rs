@@ -464,7 +464,9 @@ mod tests {
 
     /// Serve once, capturing the request head for assertions. Returns
     /// (base URL, captured request, server handle).
-    fn serve_capture(response: Vec<u8>) -> (String, Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
+    fn serve_capture(
+        response: Vec<u8>,
+    ) -> (String, Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
         let seen: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let seen2 = seen.clone();
         let ln = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -493,8 +495,10 @@ mod tests {
 
     #[test]
     fn range_survives_redirect() {
-        let (final_url, final_seen, h2) =
-            serve_capture(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nConnection: close\r\n\r\ntail!".to_vec());
+        let (final_url, final_seen, h2) = serve_capture(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nConnection: close\r\n\r\ntail!"
+                .to_vec(),
+        );
         let resp = format!(
             "HTTP/1.1 302 Found\r\nLocation: {}\r\nConnection: close\r\n\r\n",
             final_url
@@ -515,7 +519,11 @@ mod tests {
         assert_eq!(out, b"tail!");
         // The second hop must still carry the Range request.
         let req = String::from_utf8(final_seen.lock().unwrap().clone()).unwrap();
-        assert!(req.contains("Range: bytes=5-"), "second hop lost Range:\n{}", req);
+        assert!(
+            req.contains("Range: bytes=5-"),
+            "second hop lost Range:\n{}",
+            req
+        );
         h1.join().unwrap();
         h2.join().unwrap();
     }

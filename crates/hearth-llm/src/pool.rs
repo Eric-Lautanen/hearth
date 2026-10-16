@@ -111,6 +111,34 @@ pub struct ThreadPool {
     num_threads: usize,
 }
 
+/// Row-parallel dot-product dispatch parameters. Grouped so the pool API
+/// stays under the argument-count lint as dispatch variants grow.
+#[derive(Clone, Copy)]
+pub struct DotRowsParams {
+    pub n: usize,
+    pub w_base: usize,
+    pub a_ptr: usize,
+    pub out_ptr: usize,
+    pub row_bytes: usize,
+    pub n_cols: usize,
+    pub dot_fn: DotFn,
+}
+
+/// Batched (prefill) variant: one weight pass serves `seq_len` activation rows.
+#[derive(Clone, Copy)]
+pub struct BatchedDotRowsParams {
+    pub n: usize,
+    pub seq_len: usize,
+    pub q8_stride: usize,
+    pub w_base: usize,
+    pub a_ptr: usize,
+    pub out_ptr: usize,
+    pub row_bytes: usize,
+    pub n_cols: usize,
+    pub dot_fn: DotFn,
+    pub dot_fn2: Option<DotFn2>,
+}
+
 impl ThreadPool {
     pub fn new(num_threads: usize) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -333,16 +361,16 @@ impl ThreadPool {
         }
     }
 
-    pub fn par_dot_rows(
-        &self,
-        n: usize,
-        w_base: usize,
-        a_ptr: usize,
-        out_ptr: usize,
-        row_bytes: usize,
-        n_cols: usize,
-        dot_fn: DotFn,
-    ) {
+    pub fn par_dot_rows(&self, p: DotRowsParams) {
+        let DotRowsParams {
+            n,
+            w_base,
+            a_ptr,
+            out_ptr,
+            row_bytes,
+            n_cols,
+            dot_fn,
+        } = p;
         if n == 0 {
             return;
         }
@@ -395,19 +423,19 @@ impl ThreadPool {
         }
     }
 
-    pub fn par_dot_rows_batched(
-        &self,
-        n: usize,
-        seq_len: usize,
-        q8_stride: usize,
-        w_base: usize,
-        a_ptr: usize,
-        out_ptr: usize,
-        row_bytes: usize,
-        n_cols: usize,
-        dot_fn: DotFn,
-        dot_fn2: Option<DotFn2>,
-    ) {
+    pub fn par_dot_rows_batched(&self, p: BatchedDotRowsParams) {
+        let BatchedDotRowsParams {
+            n,
+            seq_len,
+            q8_stride,
+            w_base,
+            a_ptr,
+            out_ptr,
+            row_bytes,
+            n_cols,
+            dot_fn,
+            dot_fn2,
+        } = p;
         if n == 0 || seq_len == 0 {
             return;
         }

@@ -71,6 +71,20 @@ pub struct LlamaModel {
     dispatch: hearth_quant::DispatchReport,
 }
 
+/// Parameters for the GPU forward pass. Grouped so the call stays under
+/// the argument-count lint; field order matches the old signature.
+struct ForwardGpuParams<'a> {
+    token_ids: &'a [u32],
+    pos: usize,
+    caches: &'a mut [KVCache],
+    logits: &'a mut [f32],
+    cancel: &'a AtomicBool,
+    greedy: bool,
+    rb: &'a mut Vec<f32>,
+    repeat_pen: f32,
+    past_tokens: &'a [u32],
+}
+
 impl LlamaModel {
     pub fn load(path: &str, strategy: LoadStrategy) -> Result<Self, String> {
         let gguf = GgufFile::open(path).map_err(|e| format!("GGUF: {}", e))?;
@@ -504,18 +518,18 @@ impl LlamaModel {
             sc.timers.qkv_quant_us += t0.elapsed().as_micros();
 
             let t0 = std::time::Instant::now();
-            self.matmul_fused_qkv(
-                &ln.attn_q,
-                &ln.attn_k,
-                &ln.attn_v,
-                &sc.residual[..d],
-                &mut sc.q_buf[..nq],
-                &mut sc.k_buf[..nkv],
-                &mut sc.v_buf[..nkv],
-                rb,
+            self.matmul_fused_qkv(matmul::FusedQkvParams {
+                w_q: &ln.attn_q,
+                w_k: &ln.attn_k,
+                w_v: &ln.attn_v,
+                x: &sc.residual[..d],
+                out_q: &mut sc.q_buf[..nq],
+                out_k: &mut sc.k_buf[..nkv],
+                out_v: &mut sc.v_buf[..nkv],
+                row_buf: rb,
                 layer,
-                Some(&sc.x_q8[..]),
-            )?;
+                x_q8: Some(&sc.x_q8[..]),
+            })?;
 
             sc.q_heads[..nq].copy_from_slice(&sc.q_buf[..nq]);
             sc.k_heads[..nkv].copy_from_slice(&sc.k_buf[..nkv]);
@@ -715,16 +729,16 @@ impl LlamaModel {
                 sc.timers.ffn_quant_us += t0.elapsed().as_micros();
 
                 let t0 = std::time::Instant::now();
-                self.matmul_fused2(
-                    &ln.ffn_gate,
-                    &ln.ffn_up,
-                    &sc.residual[..d],
-                    &mut sc.gate[..ffn_dim],
-                    &mut sc.up[..ffn_dim],
-                    rb,
+                self.matmul_fused2(matmul::FusedMatmul2Params {
+                    weight_a: &ln.ffn_gate,
+                    weight_b: &ln.ffn_up,
+                    x: &sc.residual[..d],
+                    out_a: &mut sc.gate[..ffn_dim],
+                    out_b: &mut sc.up[..ffn_dim],
+                    row_buf: rb,
                     layer,
-                    Some(&sc.ffn_q8[..]),
-                )?;
+                    x_q8: Some(&sc.ffn_q8[..]),
+                })?;
                 sc.timers.ffn_gate_up_matmul_us += t0.elapsed().as_micros();
 
                 let t0 = std::time::Instant::now();
@@ -1052,37 +1066,37 @@ impl LlamaModel {
                 if bs.attn_scores.len() < scratch_needed {
                     bs.attn_scores.resize(scratch_needed, 0.0f32);
                 }
-                ops::attention_batch_q8_0_parallel(
-                    &bs.q_heads[..seq_len * nq],
-                    &caches[layer].k_q8,
-                    &caches[layer].v_q8,
+                ops::attention_batch_q8_0_parallel(ops::AttnBatchQ8Params {
+                    q_heads: &bs.q_heads[..seq_len * nq],
+                    k_q8: &caches[layer].k_q8,
+                    v_q8: &caches[layer].v_q8,
                     seq_len,
-                    n_heads,
+                    n_q_heads: n_heads,
                     n_kv_heads,
                     head_dim,
-                    max_seq,
-                    &mut bs.attn_out[..seq_len * nq],
-                    &mut bs.attn_scores,
-                    &self.pool,
-                );
+                    max_seq_len: max_seq,
+                    out: &mut bs.attn_out[..seq_len * nq],
+                    scratch: &mut bs.attn_scores,
+                    pool: &self.pool,
+                });
             } else {
                 let scratch_needed = self.pool.num_threads() * max_seq;
                 if bs.attn_scores.len() < scratch_needed {
                     bs.attn_scores.resize(scratch_needed, 0.0f32);
                 }
-                ops::attention_batch_parallel(
-                    &bs.q_heads[..seq_len * nq],
-                    &caches[layer].k,
-                    &caches[layer].v,
+                ops::attention_batch_parallel(ops::AttnBatchParams {
+                    q_heads: &bs.q_heads[..seq_len * nq],
+                    k_cache: &caches[layer].k,
+                    v_cache: &caches[layer].v,
                     seq_len,
-                    n_heads,
+                    n_q_heads: n_heads,
                     n_kv_heads,
                     head_dim,
-                    max_seq,
-                    &mut bs.attn_out[..seq_len * nq],
-                    &mut bs.attn_scores,
-                    &self.pool,
-                );
+                    max_seq_len: max_seq,
+                    out: &mut bs.attn_out[..seq_len * nq],
+                    scratch: &mut bs.attn_scores,
+                    pool: &self.pool,
+                });
             }
 
             let aq8 = nq.div_ceil(32) * 34;
@@ -1268,7 +1282,7 @@ impl LlamaModel {
             }
         }
 
-        for layer in 0..n_layers {
+        for (layer, cache) in caches.iter_mut().enumerate().take(n_layers) {
             let p = format!("blk.{}", layer);
 
             // --- ATTENTION NORM ---
@@ -1384,7 +1398,7 @@ impl LlamaModel {
                 for h in 0..n_kv_heads {
                     let k_off = s * nkv + h * head_dim;
                     let v_off = s * nkv + h * head_dim;
-                    caches[layer].write_kv(
+                    cache.write_kv(
                         s,
                         h,
                         &bs.k_heads[k_off..k_off + head_dim],
@@ -1393,24 +1407,24 @@ impl LlamaModel {
                 }
             }
 
-            if caches[layer].is_q8_0() {
-                ops::attention_batch_q8_0(
-                    &bs.q_heads[..seq_len * nq],
-                    &caches[layer].k_q8,
-                    &caches[layer].v_q8,
+            if cache.is_q8_0() {
+                ops::attention_batch_q8_0(ops::AttnBatchQ8SerialParams {
+                    q_heads: &bs.q_heads[..seq_len * nq],
+                    k_q8: &cache.k_q8,
+                    v_q8: &cache.v_q8,
                     seq_len,
-                    n_heads,
+                    n_q_heads: n_heads,
                     n_kv_heads,
                     head_dim,
-                    max_seq,
-                    &mut bs.attn_out[..seq_len * nq],
-                    &mut bs.attn_scores,
-                );
+                    max_seq_len: max_seq,
+                    out: &mut bs.attn_out[..seq_len * nq],
+                    scratch: &mut bs.attn_scores,
+                });
             } else {
                 ops::attention_batch(
                     &bs.q_heads[..seq_len * nq],
-                    &caches[layer].k,
-                    &caches[layer].v,
+                    &cache.k,
+                    &cache.v,
                     seq_len,
                     n_heads,
                     n_kv_heads,
@@ -1638,18 +1652,18 @@ impl LlamaModel {
         self.config.clone()
     }
 
-    fn forward_gpu(
-        &self,
-        token_ids: &[u32],
-        pos: usize,
-        _caches: &mut [KVCache],
-        logits: &mut [f32],
-        cancel: &AtomicBool,
-        greedy: bool,
-        rb: &mut Vec<f32>,
-        repeat_pen: f32,
-        past_tokens: &[u32],
-    ) -> Result<(), String> {
+    fn forward_gpu(&self, p: ForwardGpuParams<'_>) -> Result<(), String> {
+        let ForwardGpuParams {
+            token_ids,
+            pos,
+            caches: _caches,
+            logits,
+            cancel,
+            greedy,
+            rb,
+            repeat_pen,
+            past_tokens,
+        } = p;
         if cfg!(debug_assertions) {
             eprintln!(
                 "[forward_gpu] executing GPU forward pass token={} pos={}",
@@ -1803,20 +1817,20 @@ impl LlamaModel {
                 let qw = pool
                     .get(&wnames[layer][0])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][0]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][0].as_str()))?;
                 let kw = pool
                     .get(&wnames[layer][1])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][1]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][1].as_str()))?;
                 let vw = pool
                     .get(&wnames[layer][2])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][2]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][2].as_str()))?;
                 drop(pool);
                 let qk_q = hearth_compute::QuantKind::from_gguf_dtype(
                     self.tensors[&wnames[layer][0]].dtype,
                 )
-                .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][0]));
+                .ok_or_else(|| format!("Unsupported dtype for {}", wnames[layer][0].as_str()));
                 // Fallback: if non-Q1_0_G128 or fused_qkv unavailable, use separate matmuls
                 if qk_q != Ok(hearth_compute::QuantKind::Q1_0G128)
                     || !gpu.fused_qkv(
@@ -1835,21 +1849,25 @@ impl LlamaModel {
                     let wr = |i| self.tensors[&wnames[layer][i]].n_rows();
                     let qb = gpu
                         .dequant_matmul_fused(&qw, &qk_q?, &norm_tmp, wr(0) as u32, 1, d as u32)
-                        .ok_or_else(|| format!("Failed matmul {}", &wnames[layer][0]))?;
+                        .ok_or_else(|| format!("Failed matmul {}", wnames[layer][0].as_str()))?;
                     let qk_k = hearth_compute::QuantKind::from_gguf_dtype(
                         self.tensors[&wnames[layer][1]].dtype,
                     )
-                    .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][1]))?;
+                    .ok_or_else(|| {
+                        format!("Unsupported dtype for {}", wnames[layer][1].as_str())
+                    })?;
                     let kb = gpu
                         .dequant_matmul_fused(&kw, &qk_k, &norm_tmp, wr(1) as u32, 1, d as u32)
-                        .ok_or_else(|| format!("Failed matmul {}", &wnames[layer][1]))?;
+                        .ok_or_else(|| format!("Failed matmul {}", wnames[layer][1].as_str()))?;
                     let qk_v = hearth_compute::QuantKind::from_gguf_dtype(
                         self.tensors[&wnames[layer][2]].dtype,
                     )
-                    .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][2]))?;
+                    .ok_or_else(|| {
+                        format!("Unsupported dtype for {}", wnames[layer][2].as_str())
+                    })?;
                     let vb = gpu
                         .dequant_matmul_fused(&vw, &qk_v, &norm_tmp, wr(2) as u32, 1, d as u32)
-                        .ok_or_else(|| format!("Failed matmul {}", &wnames[layer][2]))?;
+                        .ok_or_else(|| format!("Failed matmul {}", wnames[layer][2].as_str()))?;
                     // Copy fallback outputs into pre-allocated buffers
                     gpu.copy_buffer(&qb, &q_buf);
                     gpu.copy_buffer(&kb, &k_buf);
@@ -1946,26 +1964,26 @@ impl LlamaModel {
                 let aw = pool
                     .get(&wnames[layer][3])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][3]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][3].as_str()))?;
                 let gw = pool
                     .get(&wnames[layer][4])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][4]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][4].as_str()))?;
                 let uw = pool
                     .get(&wnames[layer][5])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][5]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][5].as_str()))?;
                 let dw = pool
                     .get(&wnames[layer][6])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][6]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][6].as_str()))?;
                 drop(pool);
-                let wr = |i| self.tensors[&wnames[layer][i]].n_rows();
-                let qk = |i| {
+                let wr = |i: usize| self.tensors[&wnames[layer][i]].n_rows();
+                let qk = |i: usize| {
                     hearth_compute::QuantKind::from_gguf_dtype(
                         self.tensors[&wnames[layer][i]].dtype,
                     )
-                    .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][i]))
+                    .ok_or_else(|| format!("Unsupported dtype for {}", wnames[layer][i].as_str()))
                 };
 
                 // attn_out projection (fused matmul+add avoids intermediate buffer)
@@ -1986,7 +2004,7 @@ impl LlamaModel {
                             1,
                             nq as u32,
                         )
-                        .ok_or_else(|| format!("Failed matmul {}", &wnames[layer][3]))?;
+                        .ok_or_else(|| format!("Failed matmul {}", wnames[layer][3].as_str()))?;
                     gpu.add_inplace(&hidden_buf, &aob, d as u32);
                 }
 
@@ -2004,7 +2022,7 @@ impl LlamaModel {
                 let qk_gu = hearth_compute::QuantKind::from_gguf_dtype(
                     self.tensors[&wnames[layer][4]].dtype,
                 )
-                .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][4]));
+                .ok_or_else(|| format!("Unsupported dtype for {}", wnames[layer][4].as_str()));
                 if qk_gu != Ok(hearth_compute::QuantKind::Q1_0G128)
                     || !gpu.fused_gate_up(
                         &gw,
@@ -2025,14 +2043,16 @@ impl LlamaModel {
                             1,
                             d as u32,
                         )
-                        .ok_or_else(|| format!("Failed matmul {}", &wnames[layer][4]))?;
+                        .ok_or_else(|| format!("Failed matmul {}", wnames[layer][4].as_str()))?;
                     let qk_u = hearth_compute::QuantKind::from_gguf_dtype(
                         self.tensors[&wnames[layer][5]].dtype,
                     )
-                    .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][5]))?;
+                    .ok_or_else(|| {
+                        format!("Unsupported dtype for {}", wnames[layer][5].as_str())
+                    })?;
                     let ub = gpu
                         .dequant_matmul_fused(&uw, &qk_u, &ffn_norm_tmp, wr(5) as u32, 1, d as u32)
-                        .ok_or_else(|| format!("Failed matmul {}", &wnames[layer][5]))?;
+                        .ok_or_else(|| format!("Failed matmul {}", wnames[layer][5].as_str()))?;
                     gpu.copy_buffer(&gb, &gate_buf);
                     gpu.copy_buffer(&ub, &up_buf);
                 }
@@ -2057,7 +2077,7 @@ impl LlamaModel {
                             1,
                             ffn_dim as u32,
                         )
-                        .ok_or_else(|| format!("Failed matmul {}", &wnames[layer][6]))?;
+                        .ok_or_else(|| format!("Failed matmul {}", wnames[layer][6].as_str()))?;
                     gpu.add_inplace(&hidden_buf, &db, d as u32);
                 }
             }
@@ -2302,22 +2322,22 @@ impl LlamaModel {
                 let qw = pool
                     .get(&wnames[layer][0])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][0]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][0].as_str()))?;
                 let kw = pool
                     .get(&wnames[layer][1])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][1]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][1].as_str()))?;
                 let vw = pool
                     .get(&wnames[layer][2])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][2]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][2].as_str()))?;
                 drop(pool);
 
-                let qk = |i| {
+                let qk = |i: usize| {
                     hearth_compute::QuantKind::from_gguf_dtype(
                         self.tensors[&wnames[layer][i]].dtype,
                     )
-                    .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][i]))
+                    .ok_or_else(|| format!("Unsupported dtype for {}", wnames[layer][i].as_str()))
                 };
 
                 // Fused QKV batch: one dispatch replaces 3 matmuls + 3 copies
@@ -2434,25 +2454,25 @@ impl LlamaModel {
                 let aw = pool
                     .get(&wnames[layer][3])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][3]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][3].as_str()))?;
                 let gw = pool
                     .get(&wnames[layer][4])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][4]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][4].as_str()))?;
                 let uw = pool
                     .get(&wnames[layer][5])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][5]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][5].as_str()))?;
                 let dw = pool
                     .get(&wnames[layer][6])
                     .cloned()
-                    .ok_or_else(|| format!("Missing {}", &wnames[layer][6]))?;
+                    .ok_or_else(|| format!("Missing {}", wnames[layer][6].as_str()))?;
                 drop(pool);
 
                 let qk_a = hearth_compute::QuantKind::from_gguf_dtype(
                     self.tensors[&wnames[layer][3]].dtype,
                 )
-                .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][3]))?;
+                .ok_or_else(|| format!("Unsupported dtype for {}", wnames[layer][3].as_str()))?;
 
                 // attn_out projection: batch matmul then add to hidden
                 let a_out = gpu
@@ -2475,7 +2495,7 @@ impl LlamaModel {
                 let qk_gu = hearth_compute::QuantKind::from_gguf_dtype(
                     self.tensors[&wnames[layer][4]].dtype,
                 )
-                .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][4]))?;
+                .ok_or_else(|| format!("Unsupported dtype for {}", wnames[layer][4].as_str()))?;
 
                 if qk_gu == hearth_compute::QuantKind::Q1_0G128
                     && gpu.fused_gate_up_batch(
@@ -2495,7 +2515,9 @@ impl LlamaModel {
                     let qk_u = hearth_compute::QuantKind::from_gguf_dtype(
                         self.tensors[&wnames[layer][5]].dtype,
                     )
-                    .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][5]))?;
+                    .ok_or_else(|| {
+                        format!("Unsupported dtype for {}", wnames[layer][5].as_str())
+                    })?;
 
                     let g_out = gpu
                         .dequant_matmul_batch(&gw, &qk_gu, &ffn_norm_tmp, ffn_dim, d, seq_len)
@@ -2515,7 +2537,7 @@ impl LlamaModel {
                 let qk_d = hearth_compute::QuantKind::from_gguf_dtype(
                     self.tensors[&wnames[layer][6]].dtype,
                 )
-                .ok_or_else(|| format!("Unsupported dtype for {}", &wnames[layer][6]))?;
+                .ok_or_else(|| format!("Unsupported dtype for {}", wnames[layer][6].as_str()))?;
 
                 let d_out = gpu
                     .dequant_matmul_batch(&dw, &qk_d, &ffn_tmp_buf, d, ffn_dim, seq_len)
@@ -2813,17 +2835,17 @@ impl LlamaModel {
                     return Ok(());
                 }
                 if use_gpu {
-                    self.forward_gpu(
-                        &[tid],
-                        i,
-                        &mut caches,
-                        &mut logits,
+                    self.forward_gpu(ForwardGpuParams {
+                        token_ids: &[tid],
+                        pos: i,
+                        caches: &mut caches,
+                        logits: &mut logits,
                         cancel,
-                        sampler_config.temperature == 0.0,
-                        &mut rb,
-                        sampler_config.repeat_pen,
-                        &past_tokens,
-                    )?;
+                        greedy: sampler_config.temperature == 0.0,
+                        rb: &mut rb,
+                        repeat_pen: sampler_config.repeat_pen,
+                        past_tokens: &past_tokens,
+                    })?;
                 } else {
                     self.forward(
                         &[tid],
@@ -2914,17 +2936,17 @@ impl LlamaModel {
             generated += 1;
 
             if use_gpu {
-                self.forward_gpu(
-                    &[token],
+                self.forward_gpu(ForwardGpuParams {
+                    token_ids: &[token],
                     pos,
-                    &mut caches,
-                    &mut logits,
+                    caches: &mut caches,
+                    logits: &mut logits,
                     cancel,
-                    sampler_config.temperature == 0.0,
-                    &mut rb,
-                    sampler_config.repeat_pen,
-                    &past_tokens,
-                )?;
+                    greedy: sampler_config.temperature == 0.0,
+                    rb: &mut rb,
+                    repeat_pen: sampler_config.repeat_pen,
+                    past_tokens: &past_tokens,
+                })?;
             } else {
                 self.forward(
                     &[token],
@@ -3097,17 +3119,17 @@ mod tests {
         let mut dummy_rb = Vec::new();
         let empty_tokens = Vec::new();
         gpu_model
-            .forward_gpu(
-                &[0u32],
-                0,
-                &mut gpu_caches,
-                &mut logits_gpu,
-                &cancel,
-                false,
-                &mut dummy_rb,
-                1.0,
-                &empty_tokens,
-            )
+            .forward_gpu(ForwardGpuParams {
+                token_ids: &[0u32],
+                pos: 0,
+                caches: &mut gpu_caches,
+                logits: &mut logits_gpu,
+                cancel: &cancel,
+                greedy: false,
+                rb: &mut dummy_rb,
+                repeat_pen: 1.0,
+                past_tokens: &empty_tokens,
+            })
             .expect("GPU forward failed");
 
         // Compare

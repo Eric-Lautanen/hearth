@@ -14,28 +14,23 @@
 
 ## Next session — in this order
 
-0. **Finish the clippy pass: CI is red with 31 sites left.** `cargo clippy -p hearth-llm --all-targets --
-   -D warnings` had 36 sites when this pass started; it is now 31. Done so far (`model/mod.rs`, 7 → 2):
-   a real bug where `drop(gpu)` was called on a **reference** in `test_gpu_decode_with_real_model` and so
-   did nothing while reading like a resource release; a `manual_checked_division` in the timers display
-   (`checked_div` now, same output); and three test-only index loops. All five were in the test or cold
-   path, so no benchmark gate applied. Remaining, by file:
-   - **`ops.rs` — 21 sites.** 18 × `needless_range_loop` (103, 112, 120, 633, 761, 787, 804, 826, 828,
-     903, 929, 943, 946, 973, 1021, 1047, 1061, 1088) and 3 × `too_many_arguments` (674, 845, 987).
-   - **`model/qwen35.rs` — 4:** `ptr_arg` at 897 (`&mut Vec<f32>` → `&mut [f32]`) and loops at 286, 623,
-     1818.
-   - **`model/mod.rs` — 2:** the `layer`/`caches` loop at 1271 and `forward_gpu`'s 10 arguments (1641).
-   - **`pool.rs` — 2** (`par_dot_rows` 336, `par_dot_rows_batched` 398); **`model/matmul.rs` — 2**
-     (342, 428).
-   Two counting traps worth knowing, because both of us got this wrong once: a single `--all-targets`
-   run reports each site **once** and appends two `could not compile ... due to N previous errors`
-   lines, so 33 error lines == 31 sites; and summing separate `lib` and `lib-test` runs **double
-   counts** the same sites (that is how this briefly looked like 68). `#[allow]` is banned by AGENTS.md,
-   so the rewrites are the only route to green. **Protocol:** the `too_many_arguments` sites are ABI
-   changes — grouping arguments into a struct is *not* automatically codegen-neutral — and the
-   `needless_range_loop` sites are inside the SIMD helpers, so both halves need a before/after
-   benchmark on all six models, one at a time. Do not start while SparkOC's README benchmark sweep is
-   running; that contention is exactly what produced the phantom 2× prefill figure.
+0. **Clippy pass: DONE (SparkOC finished it, 2026-10-15 night).**
+   `cargo clippy --workspace --all-targets -- -D warnings` is green on
+   stable 1.99.1, 98 tests pass, fmt clean. What it took beyond the 31
+   counted sites: the newer toolchain added `redundant-reference-in-format`
+   (32 sites, all `&wnames[` in cold error strings → `.as_str()`; two needed
+   `|i: usize|` annotations), `ptr_arg` (`tmp: &mut Vec` → slice; `q8`
+   keeps `Vec` for `clear()`), `chunks_exact_to_as_chunks` (quant BF16,
+   gpu.rs, probes, diffusion weights — needs Rust 1.88+, README still says
+   1.85), 8 signature groupings into params structs (pool ×2, fused ×2,
+   attention ×3, forward_gpu), all hot index loops to order-preserving
+   iterators, diffusion loops/signatures/dead-stub removal, 5 probe files,
+   chat-cli test module moved to file end. Benchmark gate HELD then
+   CLEARED: post-change sweep first looked 10–25% down on Q2_0 models, but
+   an interleaved old-vs-new A/B (pre-pass binary from an isolated worktree
+   at `d571b8a`) agreed within ~3% on all four disputed models — machine
+   drift across the evening, not code. Lesson: single-run charts carry
+   ±20% machine noise; interleave before believing a delta.
 1. **TLS slice 2: AES-128-GCM, then X25519.** `crates/hearth-tls` exists and is in the workspace;
    `sha256.rs` (SHA-256 + HMAC-SHA256) and `hkdf.rs` (`hkdf_extract`/`hkdf_expand`/`hkdf_expand_label`/
    `derive_secret`) are done, 15 tests, all against published vectors (FIPS 180-4, RFC 4231, RFC 5869).

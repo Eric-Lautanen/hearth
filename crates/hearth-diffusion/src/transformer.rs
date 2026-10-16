@@ -65,10 +65,12 @@ impl FluxTransformer {
                         gpu_q2_bufs.insert(name.clone(), buf);
                     }
                     crate::weights::StoredTensor::Bf16(bf16) => {
-                        // Convert BF16 → f32 on CPU, upload as f32 buffer
+                        // Convert BF16 → f32 on CPU, upload as f32 buffer.
+                        // as_chunks::<2> needs Rust 1.88+.
                         let mut f32_data = Vec::with_capacity(bf16.data.len() / 2);
-                        for chunk in bf16.data.chunks_exact(2) {
-                            let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        let (chunks, _remainder) = bf16.data.as_chunks::<2>();
+                        for chunk in chunks {
+                            let raw = u16::from_le_bytes(*chunk);
                             f32_data.push(f32::from_bits((raw as u32) << 16));
                         }
                         let buf = g.upload_f32(&f32_data, &format!("diffusion:{}", name));
@@ -102,10 +104,10 @@ impl FluxTransformer {
         &self,
         img: &[f32],
         txt: &[f32],
-        pooled: &[f32],
+        _pooled: &[f32],
         t_emb: &[f32],
-        img_h: usize,
-        img_w: usize,
+        _img_h: usize,
+        _img_w: usize,
     ) -> Vec<f32> {
         let d = self.cfg.d_model;
         let seq_img = img.len() / d;
@@ -115,24 +117,13 @@ impl FluxTransformer {
         let mut img_emb = self.linear_bf16("x_embedder", img, d, self.cfg.in_channels);
         let mut txt_emb = self.linear_bf16("context_embedder", txt, d, self.cfg.joint_dim);
 
-        // Pooled text projection
-        let pooled_proj = self.linear_bf16_single(pooled, d);
-
         // Time + guidance embedding
         let guidance = vec![0.0f32; 0]; // no guidance embedding
         let t_full = self.time_embed(t_emb, &guidance);
 
         // Double-stream blocks
         for i in 0..self.cfg.n_double_layers {
-            let (new_img, new_txt) = self.double_stream_block(
-                i,
-                &img_emb,
-                &txt_emb,
-                &pooled_proj,
-                &t_full,
-                img_h,
-                img_w,
-            );
+            let (new_img, new_txt) = self.double_stream_block(i, &img_emb, &txt_emb, &t_full);
             img_emb = new_img;
             txt_emb = new_txt;
         }
@@ -143,16 +134,7 @@ impl FluxTransformer {
 
         // Single-stream blocks
         for i in 0..self.cfg.n_single_layers {
-            hidden = self.single_stream_block(
-                i,
-                &hidden,
-                &pooled_proj,
-                &t_full,
-                seq_img,
-                seq_txt,
-                img_h,
-                img_w,
-            );
+            hidden = self.single_stream_block(i, &hidden, &t_full, seq_img, seq_txt);
         }
 
         // Split off img portion
@@ -177,10 +159,7 @@ impl FluxTransformer {
         idx: usize,
         img: &[f32],
         txt: &[f32],
-        _pooled: &[f32],
         t_emb: &[f32],
-        _img_h: usize,
-        _img_w: usize,
     ) -> (Vec<f32>, Vec<f32>) {
         let d = self.cfg.d_model;
 
@@ -548,12 +527,9 @@ impl FluxTransformer {
         &self,
         idx: usize,
         hidden: &[f32],
-        _pooled: &[f32],
         t_emb: &[f32],
         seq_img: usize,
         seq_txt: usize,
-        _img_h: usize,
-        _img_w: usize,
     ) -> Vec<f32> {
         let d = self.cfg.d_model;
         let seq = seq_img + seq_txt;
@@ -699,38 +675,29 @@ impl FluxTransformer {
         out
     }
 
-    fn linear_bf16_single(&self, x: &[f32], out_dim: usize) -> Vec<f32> {
-        let in_dim = x.len();
-        let out = vec![0.0f32; out_dim];
-        if in_dim == 0 {
-            return out;
-        }
-        out
-    }
-
     fn linear_bf16_single_idx(&self, name: &str, x: &[f32], out_dim: usize) -> Vec<f32> {
         let in_dim = x.len();
         if let Some(w) = self.weights.bf16_as_f32(name) {
             let mut out = vec![0.0f32; out_dim];
             // w has shape [out_dim, in_dim]
-            for i in 0..out_dim {
+            for (i, slot) in out.iter_mut().enumerate() {
                 let mut sum = 0.0f32;
                 let w_row = &w[i * in_dim..(i + 1) * in_dim];
                 for j in 0..in_dim {
                     sum += w_row[j] * x[j];
                 }
-                out[i] = sum;
+                *slot = sum;
             }
             out
         } else if let Some(w) = self.weights.f32(name) {
             let mut out = vec![0.0f32; out_dim];
-            for i in 0..out_dim {
+            for (i, slot) in out.iter_mut().enumerate() {
                 let mut sum = 0.0f32;
                 let w_row = &w.data[i * in_dim..(i + 1) * in_dim];
                 for j in 0..in_dim {
                     sum += w_row[j] * x[j];
                 }
-                out[i] = sum;
+                *slot = sum;
             }
             out
         } else {

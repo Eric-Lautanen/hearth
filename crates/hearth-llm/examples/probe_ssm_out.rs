@@ -20,18 +20,18 @@ fn wht(x: &mut [f32], bs: usize) {
             }
             h <<= 1;
         }
-        for i in off..off + bs {
-            x[i] *= s;
+        for slot in &mut x[off..off + bs] {
+            *slot *= s;
         }
     }
 }
 
 fn load_f32(p: &str) -> Vec<f32> {
-    std::fs::read(p)
-        .unwrap()
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    let b = std::fs::read(p).unwrap();
+    // as_chunks::<4> needs Rust 1.88+; the remainder (short tail) is dropped,
+    // same as chunks_exact did.
+    let (chunks, _remainder) = b.as_chunks::<4>();
+    chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 fn cos(a: &[f32], b: &[f32]) -> f64 {
@@ -78,10 +78,15 @@ fn check_ffn(gguf: &GgufFile) {
     let tmp = std::env::var("TEMP").unwrap_or_else(|_| "C:/Users/ericl/AppData/Local/Temp".into());
     let p = |n: &str| format!("{}\\{}", tmp, n);
     let x = match std::fs::read(p("ffn_down_in-0.f32")) {
-        Ok(b) => b
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect::<Vec<f32>>(),
+        Ok(b) => {
+            // as_chunks::<4> needs Rust 1.88+; the remainder is dropped,
+            // same as chunks_exact did.
+            let (chunks, _remainder) = b.as_chunks::<4>();
+            chunks
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect::<Vec<f32>>()
+        }
         Err(_) => {
             println!("ffn check skipped (no ffn_down_in dump)");
             return;

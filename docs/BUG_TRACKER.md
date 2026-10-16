@@ -3,6 +3,17 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers. Ref: llama.cpp-prism.
 
+### Clippy pass completed (SparkOC, 2026-10-15 night) — CI green, no perf change
+
+Finished buffy's pass: 64 sites across `hearth-llm` (format borrows,
+8 signature groupings, 22 hot-loop iterator rewrites), `hearth-diffusion`
+(loops, signatures, dead-stub removal), examples and bins. `cargo clippy
+--workspace --all-targets -- -D warnings` green on stable 1.99.1, 98 tests
+pass, fmt clean. Benchmark gate: post-change sweep vs chart baseline looked
+down on Q2_0 models, but an interleaved A/B against a pre-pass binary built
+from an isolated worktree agreed within ~3% on all four disputed models —
+machine drift, not code. Charts stand.
+
 ### Sweep 2026-10-15 — all 14 models, post-Zen4-fix snapshot (SparkOC)
 
 Release build at `50c88bc` (includes the Zen4 per-kernel dispatch fix).

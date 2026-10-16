@@ -100,25 +100,23 @@ impl RopeCache {
                 };
                 let corr_low = (corr_dim(32.0)).floor().max(0.0);
                 let corr_high = (corr_dim(1.0)).ceil().min(n_dims - 1.0);
-                for i in 0..half {
+                for (i, slot) in eff_rate.iter_mut().enumerate() {
                     let ramp_y = (i as f32 - corr_low) / (corr_high - corr_low).max(0.001);
                     let ramp_mix = 1.0 - ramp_y.clamp(0.0, 1.0);
-                    eff_rate[i] = freq_scale * (1.0 - ramp_mix) + ramp_mix;
+                    *slot = freq_scale * (1.0 - ramp_mix) + ramp_mix;
                 }
                 mscale = 1.0 + 0.1 * factor.ln();
             }
             Some("linear") if factor > 1.0 => {
                 let scale = 1.0 / factor;
-                for i in 0..half {
-                    eff_rate[i] = scale;
-                }
+                eff_rate.fill(scale);
             }
             _ => {}
         }
 
         let mut inv_freq = vec![0.0f32; half];
-        for i in 0..half {
-            inv_freq[i] = 1.0 / theta.powf(2.0 * (i as f32) / rope_dim as f32);
+        for (i, slot) in inv_freq.iter_mut().enumerate() {
+            *slot = 1.0 / theta.powf(2.0 * (i as f32) / rope_dim as f32);
         }
 
         let mut data = vec![0.0f32; max_seq_len * half * 2];
@@ -367,7 +365,7 @@ pub fn attention(
     let chunks = head_dim / 8;
     let rem = head_dim % 8;
     let inv_sqrt_hd = 1.0 / (head_dim as f32).sqrt();
-    for pos in 0..seq_len {
+    for (pos, slot) in scratch.iter_mut().enumerate().take(seq_len) {
         let k_start = pos * head_dim;
         let mut vsum = f32x8::ZERO;
         for i in 0..chunks {
@@ -379,7 +377,7 @@ pub fn attention(
         for i in head_dim - rem..head_dim {
             score += q[i] * k_cache[k_start + i];
         }
-        scratch[pos] = score * inv_sqrt_hd;
+        *slot = score * inv_sqrt_hd;
     }
 
     // Softmax over scores
@@ -391,8 +389,7 @@ pub fn attention(
     for i in 0..chunks {
         let start = i * 8;
         let mut vacc = f32x8::ZERO;
-        for pos in 0..seq_len {
-            let att = scratch[pos];
+        for (pos, &att) in scratch.iter().enumerate().take(seq_len) {
             let v_start = pos * head_dim;
             let vatt = f32x8::splat(att);
             let vv = f32x8::from(&v_cache[v_start + start..v_start + start + 8]);
@@ -402,8 +399,8 @@ pub fn attention(
     }
     for i in head_dim - rem..head_dim {
         let mut sum = 0.0f32;
-        for pos in 0..seq_len {
-            sum += scratch[pos] * v_cache[pos * head_dim + i];
+        for (pos, &s) in scratch.iter().enumerate().take(seq_len) {
+            sum += s * v_cache[pos * head_dim + i];
         }
         out[i] = sum;
     }
@@ -545,7 +542,7 @@ pub fn attention_batch(
             let chunks = head_dim / 8;
             let rem = head_dim % 8;
             let inv_sqrt_hd = 1.0 / (head_dim as f32).sqrt();
-            for pos in 0..attended_len {
+            for (pos, slot) in scratch.iter_mut().enumerate().take(attended_len) {
                 let k_start = pos * head_dim;
                 let mut vsum = f32x8::ZERO;
                 for i in 0..chunks {
@@ -557,7 +554,7 @@ pub fn attention_batch(
                 for i in head_dim - rem..head_dim {
                     score += q_row[i] * ks[k_start + i];
                 }
-                scratch[pos] = score * inv_sqrt_hd;
+                *slot = score * inv_sqrt_hd;
             }
 
             softmax(&mut scratch[..attended_len]);
@@ -566,16 +563,16 @@ pub fn attention_batch(
             for i in 0..chunks {
                 let start = i * 8;
                 let mut vacc = f32x8::ZERO;
-                for pos in 0..attended_len {
+                for (pos, &s) in scratch.iter().enumerate().take(attended_len) {
                     let vv = f32x8::from(&vs[pos * head_dim + start..pos * head_dim + start + 8]);
-                    vacc = vv.mul_add(f32x8::splat(scratch[pos]), vacc);
+                    vacc = vv.mul_add(f32x8::splat(s), vacc);
                 }
                 out_row[start..start + 8].copy_from_slice(&vacc.to_array());
             }
             for i in head_dim - rem..head_dim {
                 let mut sum = 0.0f32;
-                for pos in 0..attended_len {
-                    sum += scratch[pos] * vs[pos * head_dim + i];
+                for (pos, &s) in scratch.iter().enumerate().take(attended_len) {
+                    sum += s * vs[pos * head_dim + i];
                 }
                 out_row[i] = sum;
             }
@@ -596,6 +593,51 @@ struct AttnBatchCtx {
     scratch: *mut f32,
     kv_repeat: usize,
     d: usize,
+}
+
+/// Parameters for [`attention_batch_parallel`]. Grouped so the call stays
+/// under the argument-count lint; field order matches the old signature.
+pub struct AttnBatchParams<'a> {
+    pub q_heads: &'a [f32],
+    pub k_cache: &'a [f32],
+    pub v_cache: &'a [f32],
+    pub seq_len: usize,
+    pub n_q_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub max_seq_len: usize,
+    pub out: &'a mut [f32],
+    pub scratch: &'a mut [f32],
+    pub pool: &'a ThreadPool,
+}
+
+/// Parameters for [`attention_batch_q8_0_parallel`]; same shape, Q8 KV.
+pub struct AttnBatchQ8Params<'a> {
+    pub q_heads: &'a [f32],
+    pub k_q8: &'a [u8],
+    pub v_q8: &'a [u8],
+    pub seq_len: usize,
+    pub n_q_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub max_seq_len: usize,
+    pub out: &'a mut [f32],
+    pub scratch: &'a mut [f32],
+    pub pool: &'a ThreadPool,
+}
+
+/// Parameters for [`attention_batch_q8_0`] (serial batch path).
+pub struct AttnBatchQ8SerialParams<'a> {
+    pub q_heads: &'a [f32],
+    pub k_q8: &'a [u8],
+    pub v_q8: &'a [u8],
+    pub seq_len: usize,
+    pub n_q_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub max_seq_len: usize,
+    pub out: &'a mut [f32],
+    pub scratch: &'a mut [f32],
 }
 
 unsafe fn attn_batch_worker(worker_id: usize, kvh_begin: usize, kvh_end: usize, ctx_ptr: usize) {
@@ -630,7 +672,7 @@ unsafe fn attn_batch_worker(worker_id: usize, kvh_begin: usize, kvh_end: usize, 
                 let vs = &v_cache[head_offset..head_offset + attended_len * head_dim];
                 let out_row = &mut out[s * d + qh * head_dim..][..head_dim];
 
-                for pos in 0..attended_len {
+                for (pos, slot) in scratch.iter_mut().enumerate().take(attended_len) {
                     let k_start = pos * head_dim;
                     let mut vsum = f32x8::ZERO;
                     for i in 0..chunks {
@@ -642,7 +684,7 @@ unsafe fn attn_batch_worker(worker_id: usize, kvh_begin: usize, kvh_end: usize, 
                     for i in head_dim - rem..head_dim {
                         score += q_row[i] * ks[k_start + i];
                     }
-                    scratch[pos] = score * inv_sqrt_hd;
+                    *slot = score * inv_sqrt_hd;
                 }
 
                 softmax(&mut scratch[..attended_len]);
@@ -650,17 +692,17 @@ unsafe fn attn_batch_worker(worker_id: usize, kvh_begin: usize, kvh_end: usize, 
                 for i in 0..chunks {
                     let start = i * 8;
                     let mut vacc = f32x8::ZERO;
-                    for pos in 0..attended_len {
+                    for (pos, &s) in scratch.iter().enumerate().take(attended_len) {
                         let vv =
                             f32x8::from(&vs[pos * head_dim + start..pos * head_dim + start + 8]);
-                        vacc = vv.mul_add(f32x8::splat(scratch[pos]), vacc);
+                        vacc = vv.mul_add(f32x8::splat(s), vacc);
                     }
                     out_row[start..start + 8].copy_from_slice(&vacc.to_array());
                 }
                 for i in head_dim - rem..head_dim {
                     let mut sum = 0.0f32;
-                    for pos in 0..attended_len {
-                        sum += scratch[pos] * vs[pos * head_dim + i];
+                    for (pos, &s) in scratch.iter().enumerate().take(attended_len) {
+                        sum += s * vs[pos * head_dim + i];
                     }
                     out_row[i] = sum;
                 }
@@ -671,19 +713,20 @@ unsafe fn attn_batch_worker(worker_id: usize, kvh_begin: usize, kvh_end: usize, 
 
 /// Parallel batched attention: dispatches query positions across thread pool workers.
 /// scratch must be sized >= pool.num_threads * max_seq_len.
-pub fn attention_batch_parallel(
-    q_heads: &[f32],
-    k_cache: &[f32],
-    v_cache: &[f32],
-    seq_len: usize,
-    n_q_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    max_seq_len: usize,
-    out: &mut [f32],
-    scratch: &mut [f32],
-    pool: &ThreadPool,
-) {
+pub fn attention_batch_parallel(p: AttnBatchParams<'_>) {
+    let AttnBatchParams {
+        q_heads,
+        k_cache,
+        v_cache,
+        seq_len,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+        out,
+        scratch,
+        pool,
+    } = p;
     let kv_repeat = n_q_heads / n_kv_heads;
     let d = n_q_heads * head_dim;
     out[..seq_len * d].fill(0.0f32);
@@ -758,7 +801,7 @@ unsafe fn attn_batch_q8_worker(worker_id: usize, begin: usize, end: usize, ctx_p
                 let ks = &k_q8[head_off..head_off + attend_bytes];
                 let vs = &v_q8[head_off..head_off + attend_bytes];
                 let out_row = &mut out[s * d + qh * head_dim..][..head_dim];
-                for pos in 0..attended_len {
+                for (pos, slot) in scratch.iter_mut().enumerate().take(attended_len) {
                     let bp = pos * q8_row;
                     let mut vsum = f32x8::ZERO;
                     for b in 0..blocks {
@@ -784,15 +827,16 @@ unsafe fn attn_batch_q8_worker(worker_id: usize, begin: usize, end: usize, ctx_p
                     }
                     let mut score = vsum.reduce_add();
                     if rem > 0 {
-                        for i in head_dim - rem..head_dim {
+                        for (j, &qv) in q_row[head_dim - rem..].iter().enumerate() {
+                            let i = head_dim - rem + j;
                             let blk = i / 32;
                             let in_blk = i % 32;
                             let bo = bp + blk * 34;
                             let d_scale = f16::from_le_bytes([ks[bo], ks[bo + 1]]).to_f32();
-                            score += q_row[i] * (ks[bo + 2 + in_blk] as i8 as f32) * d_scale;
+                            score += qv * (ks[bo + 2 + in_blk] as i8 as f32) * d_scale;
                         }
                     }
-                    scratch[pos] = score * inv_sqrt_hd;
+                    *slot = score * inv_sqrt_hd;
                 }
 
                 softmax(&mut scratch[..attended_len]);
@@ -801,7 +845,7 @@ unsafe fn attn_batch_q8_worker(worker_id: usize, begin: usize, end: usize, ctx_p
                 for i in 0..(head_dim / 8) {
                     let start = i * 8;
                     let mut vacc = f32x8::ZERO;
-                    for pos in 0..attended_len {
+                    for (pos, &s) in scratch.iter().enumerate().take(attended_len) {
                         let bp = pos * q8_row;
                         let blk = i / 4;
                         let off_in_blk = (i % 4) * 8;
@@ -819,21 +863,22 @@ unsafe fn attn_batch_q8_worker(worker_id: usize, begin: usize, end: usize, ctx_p
                             vs[vs_off + 6] as i8 as f32,
                             vs[vs_off + 7] as i8 as f32,
                         ]);
-                        vacc = vv.mul_add(f32x8::splat(scratch[pos]) * vd, vacc);
+                        vacc = vv.mul_add(f32x8::splat(s) * vd, vacc);
                     }
                     out_row[start..start + 8].copy_from_slice(&vacc.to_array());
                 }
-                for i in head_dim - rem..head_dim {
+                for (j, slot) in out_row[head_dim - rem..].iter_mut().enumerate() {
+                    let i = head_dim - rem + j;
                     let mut sum = 0.0f32;
-                    for pos in 0..attended_len {
+                    for (pos, &s) in scratch.iter().enumerate().take(attended_len) {
                         let bp = pos * q8_row;
                         let blk = i / 32;
                         let in_blk = i % 32;
                         let bo = bp + blk * 34;
                         let d_scale = f16::from_le_bytes([vs[bo], vs[bo + 1]]).to_f32();
-                        sum += scratch[pos] * (vs[bo + 2 + in_blk] as i8 as f32) * d_scale;
+                        sum += s * (vs[bo + 2 + in_blk] as i8 as f32) * d_scale;
                     }
-                    out_row[i] = sum;
+                    *slot = sum;
                 }
             }
         }
@@ -842,19 +887,20 @@ unsafe fn attn_batch_q8_worker(worker_id: usize, begin: usize, end: usize, ctx_p
 
 /// Parallel batched attention with Q8_0 K/V cache.
 /// scratch must be sized >= pool.num_threads * max_seq_len.
-pub fn attention_batch_q8_0_parallel(
-    q_heads: &[f32],
-    k_q8: &[u8],
-    v_q8: &[u8],
-    seq_len: usize,
-    n_q_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    max_seq_len: usize,
-    out: &mut [f32],
-    scratch: &mut [f32],
-    pool: &ThreadPool,
-) {
+pub fn attention_batch_q8_0_parallel(p: AttnBatchQ8Params<'_>) {
+    let AttnBatchQ8Params {
+        q_heads,
+        k_q8,
+        v_q8,
+        seq_len,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+        out,
+        scratch,
+        pool,
+    } = p;
     let kv_repeat = n_q_heads / n_kv_heads;
     let d = n_q_heads * head_dim;
     let blocks = head_dim.div_ceil(32);
@@ -900,7 +946,7 @@ pub fn attention_q8_0(
     let inv_sqrt_hd = 1.0 / (head_dim as f32).sqrt();
 
     // Score computation with on-the-fly K dequant
-    for pos in 0..seq_len {
+    for (pos, slot) in scratch.iter_mut().enumerate().take(seq_len) {
         let bp = pos * q8_row;
         let mut vsum = f32x8::ZERO;
         for b in 0..blocks {
@@ -926,25 +972,23 @@ pub fn attention_q8_0(
         }
         let mut score = vsum.reduce_add();
         if rem > 0 {
-            for i in head_dim - rem..head_dim {
+            for (j, &qv) in q[head_dim - rem..].iter().enumerate() {
+                let i = head_dim - rem + j;
                 let blk = i / 32;
                 let in_blk = i % 32;
                 let bo = bp + blk * 34;
                 let d = f16::from_le_bytes([k_q8[bo], k_q8[bo + 1]]).to_f32();
-                score += q[i] * (k_q8[bo + 2 + in_blk] as i8 as f32) * d;
+                score += qv * (k_q8[bo + 2 + in_blk] as i8 as f32) * d;
             }
         }
-        scratch[pos] = score * inv_sqrt_hd;
+        *slot = score * inv_sqrt_hd;
     }
 
     softmax(&mut scratch[..seq_len]);
 
     // Weighted sum with on-the-fly V dequant
-    for i in 0..head_dim {
-        out[i] = 0.0;
-    }
-    for pos in 0..seq_len {
-        let att = scratch[pos];
+    out[..head_dim].fill(0.0);
+    for (pos, &att) in scratch.iter().enumerate().take(seq_len) {
         let bp = pos * q8_row;
         let vatt = f32x8::splat(att);
         for b in 0..blocks {
@@ -970,12 +1014,13 @@ pub fn attention_q8_0(
             }
         }
         if rem > 0 {
-            for i in head_dim - rem..head_dim {
+            for (j, slot) in out[head_dim - rem..].iter_mut().enumerate() {
+                let i = head_dim - rem + j;
                 let blk = i / 32;
                 let in_blk = i % 32;
                 let bo = bp + blk * 34;
                 let d = f16::from_le_bytes([v_q8[bo], v_q8[bo + 1]]).to_f32();
-                out[i] += att * (v_q8[bo + 2 + in_blk] as i8 as f32) * d;
+                *slot += att * (v_q8[bo + 2 + in_blk] as i8 as f32) * d;
             }
         }
     }
@@ -984,18 +1029,19 @@ pub fn attention_q8_0(
 /// Batched attention with Q8_0-encoded K/V cache for prefill.
 /// k_q8, v_q8 hold all KV heads' data (same layout as k_q8/v_q8 in KVCache).
 /// max_seq_len is the stride between heads (same as KVCache).
-pub fn attention_batch_q8_0(
-    q_heads: &[f32],
-    k_q8: &[u8],
-    v_q8: &[u8],
-    seq_len: usize,
-    n_q_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    max_seq_len: usize,
-    out: &mut [f32],
-    scratch: &mut [f32],
-) {
+pub fn attention_batch_q8_0(p: AttnBatchQ8SerialParams<'_>) {
+    let AttnBatchQ8SerialParams {
+        q_heads,
+        k_q8,
+        v_q8,
+        seq_len,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+        out,
+        scratch,
+    } = p;
     let blocks = head_dim.div_ceil(32);
     let q8_row = blocks * 34;
     let q8_stride = max_seq_len * q8_row;
@@ -1018,7 +1064,7 @@ pub fn attention_batch_q8_0(
             let out_row = &mut out[s * d + qh * head_dim..][..head_dim];
 
             // Score computation with on-the-fly K dequant
-            for pos in 0..attended_len {
+            for (pos, slot) in scratch.iter_mut().enumerate().take(attended_len) {
                 let bp = pos * q8_row;
                 let mut vsum = f32x8::ZERO;
                 for b in 0..blocks {
@@ -1044,22 +1090,22 @@ pub fn attention_batch_q8_0(
                 }
                 let mut score = vsum.reduce_add();
                 if rem > 0 {
-                    for i in head_dim - rem..head_dim {
+                    for (j, &qv) in q_row[head_dim - rem..].iter().enumerate() {
+                        let i = head_dim - rem + j;
                         let blk = i / 32;
                         let in_blk = i % 32;
                         let bo = bp + blk * 34;
                         let d_scale = f16::from_le_bytes([ks[bo], ks[bo + 1]]).to_f32();
-                        score += q_row[i] * (ks[bo + 2 + in_blk] as i8 as f32) * d_scale;
+                        score += qv * (ks[bo + 2 + in_blk] as i8 as f32) * d_scale;
                     }
                 }
-                scratch[pos] = score * inv_sqrt_hd;
+                *slot = score * inv_sqrt_hd;
             }
 
             softmax(&mut scratch[..attended_len]);
 
             // Weighted sum with on-the-fly V dequant
-            for pos in 0..attended_len {
-                let att = scratch[pos];
+            for (pos, &att) in scratch.iter().enumerate().take(attended_len) {
                 let bp = pos * q8_row;
                 let vatt = f32x8::splat(att);
                 for b in 0..blocks {
@@ -1085,12 +1131,13 @@ pub fn attention_batch_q8_0(
                     }
                 }
                 if rem > 0 {
-                    for i in head_dim - rem..head_dim {
+                    for (j, slot) in out_row[head_dim - rem..].iter_mut().enumerate() {
+                        let i = head_dim - rem + j;
                         let blk = i / 32;
                         let in_blk = i % 32;
                         let bo = bp + blk * 34;
                         let d_scale = f16::from_le_bytes([vs[bo], vs[bo + 1]]).to_f32();
-                        out_row[i] += att * (vs[bo + 2 + in_blk] as i8 as f32) * d_scale;
+                        *slot += att * (vs[bo + 2 + in_blk] as i8 as f32) * d_scale;
                     }
                 }
             }

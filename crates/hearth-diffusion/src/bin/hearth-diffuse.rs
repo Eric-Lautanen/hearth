@@ -165,16 +165,16 @@ fn main() {
     eprintln!("Generating image...");
     let start = std::time::Instant::now();
 
-    match hearth_diffusion::generate(
+    match hearth_diffusion::generate(hearth_diffusion::GenerateParams {
         model_path,
-        &prompt_embeds,
-        &pooled_embeds,
+        prompt_embeds: &prompt_embeds,
+        pooled_embeds: &pooled_embeds,
         height,
         width,
-        steps,
+        num_steps: steps,
         guidance,
         seed,
-    ) {
+    }) {
         Ok(png_bytes) => {
             let elapsed = start.elapsed();
             eprintln!("Done in {:.1}s", elapsed.as_secs_f32());

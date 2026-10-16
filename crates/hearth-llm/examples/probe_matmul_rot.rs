@@ -20,18 +20,18 @@ fn wht(x: &mut [f32], bs: usize) {
             }
             h <<= 1;
         }
-        for i in off..off + bs {
-            x[i] *= s;
+        for slot in &mut x[off..off + bs] {
+            *slot *= s;
         }
     }
 }
 
 fn load_f32(p: &str) -> Vec<f32> {
-    std::fs::read(p)
-        .unwrap()
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    let b = std::fs::read(p).unwrap();
+    // as_chunks::<4> needs Rust 1.88+; the remainder (short tail) is dropped,
+    // same as chunks_exact did.
+    let (chunks, _remainder) = b.as_chunks::<4>();
+    chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 fn cos(a: &[f32], b: &[f32]) -> f64 {

@@ -10,16 +10,30 @@ use transformer::{FluxConfig, FluxTransformer};
 
 pub use text_encoder::TextEncoder;
 
-pub fn generate(
-    model_path: &Path,
-    prompt_embeds: &[f32],
-    pooled_embeds: &[f32],
-    height: usize,
-    width: usize,
-    num_steps: usize,
-    _guidance: f32,
-    seed: u64,
-) -> Result<Vec<u8>, String> {
+/// Parameters for [`generate`]. Grouped so the call stays under the
+/// argument-count lint; field order matches the old signature.
+pub struct GenerateParams<'a> {
+    pub model_path: &'a Path,
+    pub prompt_embeds: &'a [f32],
+    pub pooled_embeds: &'a [f32],
+    pub height: usize,
+    pub width: usize,
+    pub num_steps: usize,
+    pub guidance: f32,
+    pub seed: u64,
+}
+
+pub fn generate(p: GenerateParams<'_>) -> Result<Vec<u8>, String> {
+    let GenerateParams {
+        model_path,
+        prompt_embeds,
+        pooled_embeds,
+        height,
+        width,
+        num_steps,
+        guidance: _guidance,
+        seed,
+    } = p;
     let w = weights::load_weights(model_path).map_err(|e| format!("load: {}", e))?;
     let cfg = FluxConfig::default();
     let transformer = FluxTransformer::new(cfg, w);

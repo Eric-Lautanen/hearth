@@ -26,55 +26,6 @@ struct SamplerOverrides {
     seed: Option<u64>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SamplerOverrides;
-    use hearth_core::SamplerConfig;
-
-    /// What a model declares in its `general.sampling.*` metadata.
-    fn model_defaults() -> SamplerConfig {
-        SamplerConfig {
-            temperature: 0.5,
-            top_k: 20,
-            top_p: 0.85,
-            min_p: 0.05,
-            typical_p: 0.0,
-            repeat_pen: 1.05,
-            seed: 7,
-        }
-    }
-
-    /// No flags: the model's values are used verbatim (not the built-in
-    /// 0.7/0.9/40 profile this code used to hardcode).
-    #[test]
-    fn no_flags_keeps_model_defaults() {
-        let merged = SamplerOverrides::default().apply(model_defaults());
-        assert_eq!(merged.temperature, 0.5);
-        assert_eq!(merged.top_k, 20);
-        assert_eq!(merged.top_p, 0.85);
-        assert_eq!(merged.min_p, 0.05);
-        assert_eq!(merged.repeat_pen, 1.05);
-        assert_eq!(merged.seed, 7);
-        assert!(!SamplerOverrides::default().any());
-    }
-
-    /// The regression this guards: `--temp 0` used to discard the model's
-    /// top-k/top-p/min-p along with it.
-    #[test]
-    fn one_flag_overrides_only_its_own_field() {
-        let overrides = SamplerOverrides {
-            temperature: Some(0.0),
-            ..Default::default()
-        };
-        assert!(overrides.any());
-        let merged = overrides.apply(model_defaults());
-        assert_eq!(merged.temperature, 0.0);
-        assert_eq!(merged.top_k, 20, "model top_k must survive --temp");
-        assert_eq!(merged.top_p, 0.85, "model top_p must survive --temp");
-        assert_eq!(merged.min_p, 0.05, "model min_p must survive --temp");
-    }
-}
-
 impl SamplerOverrides {
     fn any(&self) -> bool {
         self.temperature.is_some()
@@ -625,5 +576,54 @@ fn main() {
         if !reply_trimmed.is_empty() {
             history.push((input, reply_trimmed));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SamplerOverrides;
+    use hearth_core::SamplerConfig;
+
+    /// What a model declares in its `general.sampling.*` metadata.
+    fn model_defaults() -> SamplerConfig {
+        SamplerConfig {
+            temperature: 0.5,
+            top_k: 20,
+            top_p: 0.85,
+            min_p: 0.05,
+            typical_p: 0.0,
+            repeat_pen: 1.05,
+            seed: 7,
+        }
+    }
+
+    /// No flags: the model's values are used verbatim (not the built-in
+    /// 0.7/0.9/40 profile this code used to hardcode).
+    #[test]
+    fn no_flags_keeps_model_defaults() {
+        let merged = SamplerOverrides::default().apply(model_defaults());
+        assert_eq!(merged.temperature, 0.5);
+        assert_eq!(merged.top_k, 20);
+        assert_eq!(merged.top_p, 0.85);
+        assert_eq!(merged.min_p, 0.05);
+        assert_eq!(merged.repeat_pen, 1.05);
+        assert_eq!(merged.seed, 7);
+        assert!(!SamplerOverrides::default().any());
+    }
+
+    /// The regression this guards: `--temp 0` used to discard the model's
+    /// top-k/top-p/min-p along with it.
+    #[test]
+    fn one_flag_overrides_only_its_own_field() {
+        let overrides = SamplerOverrides {
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        assert!(overrides.any());
+        let merged = overrides.apply(model_defaults());
+        assert_eq!(merged.temperature, 0.0);
+        assert_eq!(merged.top_k, 20, "model top_k must survive --temp");
+        assert_eq!(merged.top_p, 0.85, "model top_p must survive --temp");
+        assert_eq!(merged.min_p, 0.05, "model min_p must survive --temp");
     }
 }

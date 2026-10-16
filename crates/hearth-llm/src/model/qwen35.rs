@@ -283,11 +283,12 @@ impl ConvState {
         let c = self.conv_dim;
         let hist = (k - 1) * c;
         let base = layer * hist;
-        for ch in 0..c {
-            // shift history left by one tap
+        // shift history left by one tap
+        assert!(x.len() >= c);
+        for (ch, &xv) in x.iter().enumerate().take(c) {
             let w = ch * k;
             window.copy_within(w..w + k - 1, w);
-            window[w + k - 1] = x[ch];
+            window[w + k - 1] = xv;
         }
         // store back the newest kernel-1 taps for the next step
         for ch in 0..c {
@@ -620,8 +621,7 @@ impl Qwen35Core {
 
         let n_layers = config.n_layers as usize;
         let mut layers = Vec::with_capacity(n_layers);
-        for i in 0..n_layers {
-            let is_gdn = layer_is_gdn[i];
+        for (i, &is_gdn) in layer_is_gdn.iter().enumerate().take(n_layers) {
             let p = format!("blk.{}.", i);
             let layer = if is_gdn {
                 let conv_w = gguf
@@ -894,7 +894,7 @@ impl Qwen35Core {
         w: &W,
         x: &[f32],
         out: &mut [f32],
-        tmp: &mut Vec<f32>,
+        tmp: &mut [f32],
         q8: &mut Vec<u8>,
         had: bool,
     ) -> Result<(), String> {
@@ -968,8 +968,15 @@ impl Qwen35Core {
                 ))
             }
         };
-        self.pool
-            .par_dot_rows(n_rows, w_base, a_ptr, out_ptr, row_bytes, n_cols, dot);
+        self.pool.par_dot_rows(crate::pool::DotRowsParams {
+            n: n_rows,
+            w_base,
+            a_ptr,
+            out_ptr,
+            row_bytes,
+            n_cols,
+            dot_fn: dot,
+        });
         Ok(())
     }
 
@@ -1001,8 +1008,15 @@ impl Qwen35Core {
         let a_ptr = q8.as_ptr() as usize;
         let out_ptr = out.as_mut_ptr() as usize;
         let row_bytes = entry.dtype.byte_size(n_cols);
-        self.pool
-            .par_dot_rows(n_rows, w_base, a_ptr, out_ptr, row_bytes, n_cols, dot);
+        self.pool.par_dot_rows(crate::pool::DotRowsParams {
+            n: n_rows,
+            w_base,
+            a_ptr,
+            out_ptr,
+            row_bytes,
+            n_cols,
+            dot_fn: dot,
+        });
         Ok(())
     }
 
@@ -1815,13 +1829,13 @@ fn softplus(x: f32) -> f32 {
 /// (matching ggml_ssm_conv: c[i0 + i1*nc] where i0 = tap, i1 = channel), and the
 /// window uses the same [channel][tap] layout with tap 0 = oldest.
 fn depthwise_conv(window: &[f32], w: &[f32], kernel: usize, conv_dim: usize, out: &mut [f32]) {
-    for c in 0..conv_dim {
+    for (c, slot) in out.iter_mut().enumerate().take(conv_dim) {
         let wo = c * kernel;
         let mut acc = 0.0f32;
         for k in 0..kernel {
             acc += w[wo + k] * window[wo + k];
         }
-        out[c] = acc;
+        *slot = acc;
     }
 }
 

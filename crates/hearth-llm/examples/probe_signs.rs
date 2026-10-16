@@ -18,8 +18,8 @@ fn wht(x: &mut [f32], bs: usize) {
             }
             h <<= 1;
         }
-        for i in off..off + bs {
-            x[i] *= s;
+        for slot in &mut x[off..off + bs] {
+            *slot *= s;
         }
     }
 }
@@ -59,10 +59,10 @@ fn main() {
     let mut w = vec![0.0f32; d];
     hearth_quant::dequantize(nw.dtype, gguf.tensor_data(nw), &mut w).unwrap();
     let rdata = std::fs::read(r"C:\Users\ericl\AppData\Local\Temp\.attn_norm-0.f32").unwrap();
-    let r: Vec<f32> = rdata
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    // as_chunks::<4> needs Rust 1.88+; the remainder (short tail) is dropped,
+    // same as chunks_exact did.
+    let (rchunks, _remainder) = rdata.as_chunks::<4>();
+    let r: Vec<f32> = rchunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
     // de-norm (divide by w, where w ~= 0 breaks)
     let mut rdn = vec![0.0f32; d];
     for i in 0..d {
