@@ -456,12 +456,23 @@ impl Manager {
                 return Ok((target_id, "queued".to_string()));
             }
         }
-        // Already complete on disk? Report done without queueing.
+        // Already complete on disk? Report done without queueing. A complete
+        // .part with no final file (cancelled at the last byte, crashed
+        // rename) heals itself here via rename instead of re-downloading.
         if let Some(e) = self.find(&target_id) {
+            let dir = self.inner.lock().unwrap().dir.clone();
             let have = self.on_disk(&e);
-            let complete = e.size_bytes > 0 && have >= e.size_bytes;
-            if complete {
+            if e.size_bytes > 0 && have >= e.size_bytes {
                 return Ok((target_id, "done".to_string()));
+            }
+            if e.size_bytes > 0 && part_len(&dir, &e.filename) >= e.size_bytes && have < e.size_bytes {
+                // Complete .part but incomplete final: adopt the partial.
+                let part = dir.join(format!("{}.part", e.filename));
+                let dest = dir.join(&e.filename);
+                let _ = std::fs::remove_file(&dest);
+                if std::fs::rename(&part, &dest).is_ok() {
+                    return Ok((target_id, "done".to_string()));
+                }
             }
         }
         {
@@ -640,6 +651,19 @@ impl Manager {
                 Ok(_) => return Ok(()),
                 Err(m) if m == "cancelled" => return Err(m),
                 Err(m) if m == "range_ignored" && attempt == 0 => continue,
+                // 416 while resuming: the partial already holds everything.
+                // Publish it iff its length matches the catalog size; the
+                // shared finalize below re-checks before renaming.
+                Err(m) if m == "range_complete" && e.size_bytes > 0 => {
+                    let got = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+                    if got >= e.size_bytes {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "server says complete but partial is short: {} of {} bytes",
+                        got, e.size_bytes
+                    ));
+                }
                 Err(m) => return Err(m),
             }
         }

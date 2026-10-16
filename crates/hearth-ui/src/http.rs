@@ -85,11 +85,11 @@ impl ResponseHead {
     }
 }
 
-fn read_head<T: Transport>(s: &mut T, cap: usize) -> Result<(ResponseHead, Vec<u8>), String> {
+fn read_head<T: Transport>(s: &mut T, cap: usize) -> Result<ResponseHead, String> {
     let mut buf = Vec::with_capacity(1024);
     let mut one = [0u8; 1];
     loop {
-        if buf.len() > cap {
+        if buf.len() >= cap {
             return Err("response head too large".to_string());
         }
         let n = s.read(&mut one).map_err(|e| format!("head read: {}", e))?;
@@ -121,7 +121,7 @@ fn read_head<T: Transport>(s: &mut T, cap: usize) -> Result<(ResponseHead, Vec<u
             .ok_or_else(|| format!("bad header line: {}", line))?;
         headers.insert(k.trim().to_lowercase(), v.trim().to_string());
     }
-    Ok((ResponseHead { status, headers }, Vec::new()))
+    Ok(ResponseHead { status, headers })
 }
 
 fn read_exact_progress<T: Transport>(
@@ -267,13 +267,20 @@ pub fn get(
         if u.scheme == "https" {
             return Err("https needs the TLS transport (not landed yet)".to_string());
         }
-        let addr = (u.host.as_str(), u.port)
+        // Try every resolved address in turn (a dead first record — e.g. an
+        // unreachable IPv6 — must not doom the whole fetch).
+        let mut addrs = (u.host.as_str(), u.port)
             .to_socket_addrs()
-            .map_err(|e| format!("DNS/resolve {}: {}", u.host, e))?
-            .next()
-            .ok_or_else(|| format!("no address for {}", u.host))?;
-        let mut s = TcpStream::connect_timeout(&addr, timeout)
-            .map_err(|e| format!("connect {}: {}", addr, e))?;
+            .map_err(|e| format!("DNS/resolve {}: {}", u.host, e))?;
+        let mut s = loop {
+            let Some(a) = addrs.next() else {
+                return Err(format!("no reachable address for {}", u.host));
+            };
+            match TcpStream::connect_timeout(&a, timeout) {
+                Ok(s) => break s,
+                Err(_) => continue,
+            }
+        };
         s.set_read_timeout(Some(timeout))
             .map_err(|e| format!("set timeout: {}", e))?;
         s.set_write_timeout(Some(timeout))
@@ -291,7 +298,7 @@ pub fn get(
             .map_err(|e| format!("request write: {}", e))?;
         s.flush().map_err(|e| format!("request flush: {}", e))?;
 
-        let (head, _) = read_head(&mut s, 65536)?;
+        let head = read_head(&mut s, 65536)?;
         if matches!(head.status, 301 | 302 | 303 | 307 | 308) {
             let loc = head
                 .header("location")
@@ -311,6 +318,11 @@ pub fn get(
                 format!("{}://{}:{}{}{}", u.scheme, u.host, u.port, base, loc)
             };
             continue;
+        }
+        if head.status == 416 && resume_from > 0 {
+            // Range beyond EOF: the partial file already holds everything the
+            // server has. Nothing to write; the caller verifies and publishes.
+            return Err("range_complete".to_string());
         }
         if head.status != 200 && head.status != 206 {
             return Err(format!("HTTP {}", head.status));
@@ -346,6 +358,7 @@ mod tests {
     use std::io::Write as IoWrite;
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
     /// Serve one canned HTTP response, then close. Returns the base URL.
     fn serve_once(response: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
@@ -449,6 +462,64 @@ mod tests {
         h2.join().unwrap();
     }
 
+    /// Serve once, capturing the request head for assertions. Returns
+    /// (base URL, captured request, server handle).
+    fn serve_capture(response: Vec<u8>) -> (String, Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
+        let seen: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/file", ln.local_addr().unwrap().port());
+        let h = std::thread::spawn(move || {
+            let (mut sock, _) = ln.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut got = 0;
+            while got < buf.len() {
+                match sock.read(&mut buf[got..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        got += n;
+                        if got >= 4 && buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            *seen2.lock().unwrap() = buf[..got].to_vec();
+            sock.write_all(&response).unwrap();
+            sock.flush().unwrap();
+        });
+        (url, seen, h)
+    }
+
+    #[test]
+    fn range_survives_redirect() {
+        let (final_url, final_seen, h2) =
+            serve_capture(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nConnection: close\r\n\r\ntail!".to_vec());
+        let resp = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {}\r\nConnection: close\r\n\r\n",
+            final_url
+        )
+        .into_bytes();
+        let (url, _, h1) = serve_capture(resp);
+        let cancel = AtomicBool::new(false);
+        let mut out = Vec::new();
+        get(
+            &url,
+            5,
+            Duration::from_secs(10),
+            &cancel,
+            &mut |_, _| {},
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, b"tail!");
+        // The second hop must still carry the Range request.
+        let req = String::from_utf8(final_seen.lock().unwrap().clone()).unwrap();
+        assert!(req.contains("Range: bytes=5-"), "second hop lost Range:\n{}", req);
+        h1.join().unwrap();
+        h2.join().unwrap();
+    }
+
     #[test]
     fn range_resume_206() {
         // Client asks from byte 5; server answers 206 with the tail.
@@ -468,6 +539,28 @@ mod tests {
         // Progress reports resume_base + written; total is the full size.
         assert_eq!(seen, 10);
         assert_eq!(total, Some(10));
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn range_complete_416_is_not_a_dead_end() {
+        // Full-size .part asks beyond EOF: server answers 416. The caller
+        // must be able to distinguish this from a failure.
+        let resp = b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */100\r\nConnection: close\r\n\r\n".to_vec();
+        let (url, h) = serve_once(resp);
+        let cancel = AtomicBool::new(false);
+        let mut out = Vec::new();
+        let err = get(
+            &url,
+            100,
+            Duration::from_secs(10),
+            &cancel,
+            &mut |_, _| {},
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(err, "range_complete");
+        assert!(out.is_empty());
         h.join().unwrap();
     }
 
