@@ -157,6 +157,25 @@ resumption/PSK or 0-RTT, no ALPN, no post-handshake authentication, and `aarch64
 missing for macOS. `NewSessionTicket` and similar post-handshake messages are refused explicitly
 rather than swallowed.
 
+**Peer review caught a real hole in the "no accept-all" claim. It is fixed, and now enforced
+(SparkOC, same session).** The trait carried a blanket `impl CertificateVerifier for F where F:
+Fn(..)`, which left `ClientHandshake::new(config, |_| Ok(()))` available as a one-line accept-all at
+any future call site — the exact shorthand the module docs said did not exist. Worse, my own tests
+used it (`accept_anything`, `verifier_accepting`), so the tests were themselves the pattern a later
+contributor would copy. The blanket impl is gone: every verifier is a named type (`AcceptTestChain`
+and `ExpectingChain` in the tests, `RejectAll` in the crate). SparkOC's related note is fixed too:
+`CertificateVerifyInput` now carries `server_name`, the one input a verifier cannot derive from the
+messages it is handed, so a verifier no longer has to capture the expected host name — and a captured
+copy cannot silently drift from the name on the wire.
+
+**The property is now checkable rather than asserted in prose, which is the part worth keeping.** A
+`compile_fail` doctest in the module docs requires the closure form to be rejected, so CI enforces it.
+It was verified to fail for the *right* reason rather than for a typo: with the closure line disabled
+the same snippet compiles, and with it enabled the error is exactly `E0277: the trait bound
+`{closure}: CertificateVerifier` is not satisfied`. Both halves of that check were run before the
+doctest was left in place. 102 checks green on both the hardware and the forced-software path
+(96 unit + 5 integration + 1 doctest).
+
 ### hearth-tls slice 3 — AES-NI and PCLMULQDQ, runtime-dispatched (buffy, 2026-10-16)
 
 Measured on one binary, interleaved, with `HEARTH_TLS_NO_HW=1` forcing the software path

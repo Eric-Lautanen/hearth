@@ -26,6 +26,35 @@
 //! a later slice; until it exists, this state machine can complete a handshake
 //! only against a verifier that a test provided.
 //!
+//! **A verifier has to be a named type, and that is deliberate.** The trait is
+//! not implemented for closures, so the shorthand that would turn an accept-all
+//! into one line at any call site —
+//! `ClientHandshake::new(config, |_| Ok(()))` — does not exist. A type named
+//! `AcceptTestChain` in a test is visible in review; a closure that happens to
+//! return `Ok` is not, and the difference matters more than the handful of lines
+//! it costs. [`CertificateVerifyInput`] carries everything the decision needs,
+//! including the name the ClientHello asked for, so a verifier never has to
+//! capture state to be usable.
+//!
+//! That property is checkable, so it is checked rather than asserted in prose:
+//! the block below must not compile.
+//!
+//! ```compile_fail
+//! use hearth_tls::client::{CertificateVerifyInput, CertificateVerifier};
+//!
+//! struct RefusesToDecide;
+//! impl CertificateVerifier for RefusesToDecide {
+//!     fn verify_certificate(&self, _: &CertificateVerifyInput<'_>) -> Result<(), String> {
+//!         Err("no".to_string())
+//!     }
+//! }
+//! fn needs_a_verifier<V: CertificateVerifier>(_: V) {}
+//!
+//! needs_a_verifier(RefusesToDecide); // a named type is fine
+//! // The shortest "accept everything" is a closure — and it is rejected:
+//! needs_a_verifier(|_: &CertificateVerifyInput<'_>| -> Result<(), String> { Ok(()) });
+//! ```
+//!
 //! # Every error is fatal
 //!
 //! TLS has no recoverable protocol error, so the first failure puts the client
@@ -224,6 +253,12 @@ pub struct CertificateVerifyInput<'a> {
     pub signature: &'a [u8],
     /// Exactly the bytes the signature must cover.
     pub signed_data: &'a [u8],
+    /// The SNI name the ClientHello asked for, if any. This is the one input a
+    /// verifier cannot derive from the messages it is handed, so it is carried
+    /// here rather than expected to be captured in the verifier: the client
+    /// already knows it, and a name that is checked against a captured copy is a
+    /// name that can silently drift from the one on the wire.
+    pub server_name: Option<&'a [u8]>,
 }
 
 /// Decides whether the server's certificate chain and its signature should be
@@ -232,23 +267,20 @@ pub struct CertificateVerifyInput<'a> {
 /// Returning `Err` is fatal to the handshake, and it must be: this is the one
 /// decision in the protocol that is about *who* the peer is rather than whether
 /// the bytes are intact.
+///
+/// Implement it on a named type: there is deliberately no `CertificateVerifier`
+/// implementation for closures, so `|_| Ok(())` cannot be passed at a call site.
+/// A closure is how an accept-all becomes an unremarkable one-liner in a diff,
+/// and it also forces the verifier to capture things like the expected host name
+/// that [`CertificateVerifyInput`] already provides.
 pub trait CertificateVerifier {
     /// Checks the chain in `input.certificate_list` and the signature in
     /// `input.signature` over `input.signed_data`.
     ///
-    /// The chain, the leaf's name for the server, the expiry, and the signature
-    /// itself are all the verifier's to check. Returning `Ok(())` claims all of
-    /// them hold.
+    /// The chain, the leaf's name for the server (`input.server_name`), the
+    /// expiry, and the signature itself are all the verifier's to check.
+    /// Returning `Ok(())` claims all of them hold.
     fn verify_certificate(&self, input: &CertificateVerifyInput<'_>) -> Result<(), String>;
-}
-
-impl<F> CertificateVerifier for F
-where
-    F: Fn(&CertificateVerifyInput<'_>) -> Result<(), String>,
-{
-    fn verify_certificate(&self, input: &CertificateVerifyInput<'_>) -> Result<(), String> {
-        self(input)
-    }
 }
 
 /// The only verifier this crate provides, and it can only refuse.
@@ -792,6 +824,7 @@ impl<V: CertificateVerifier> ClientHandshake<V> {
             signature_scheme: scheme,
             signature,
             signed_data: &signed_data,
+            server_name: self.server_name.as_deref().map(str::as_bytes),
         };
         self.verifier
             .verify_certificate(&input)
@@ -1053,18 +1086,6 @@ mod tests {
     /// never read one.
     const FAKE_CERTIFICATE: [u8; 40] = [0xca; 40];
 
-    type TestVerifier = Box<dyn Fn(&CertificateVerifyInput<'_>) -> Result<(), String>>;
-
-    /// A verifier that trusts everything. It exists only in tests, which is
-    /// exactly why `RejectAll` is the crate's one built-in verifier.
-    fn accept_anything(_: &CertificateVerifyInput<'_>) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn verifier_accepting() -> TestVerifier {
-        Box::new(accept_anything)
-    }
-
     fn sha(parts: &[&[u8]]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         for part in parts {
@@ -1073,10 +1094,27 @@ mod tests {
         hasher.finalize()
     }
 
+    /// A verifier that trusts everything, and it is a *named type* on purpose:
+    /// the trait is not implemented for closures precisely so that "accept it"
+    /// reads as a type in the diff rather than as a stray `|_| Ok(())`. It lives
+    /// only in these tests, which is why the crate itself ships no such thing.
+    struct AcceptTestChain;
+
+    impl CertificateVerifier for AcceptTestChain {
+        fn verify_certificate(&self, _input: &CertificateVerifyInput<'_>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     /// A verifier that checks every field the state machine is supposed to hand
     /// over, against values the test computed on its own.
-    fn verifier_expecting(through_certificate: [u8; 32], chain: Vec<u8>) -> TestVerifier {
-        Box::new(move |input: &CertificateVerifyInput<'_>| {
+    struct ExpectingChain {
+        through_certificate: [u8; 32],
+        chain: Vec<u8>,
+    }
+
+    impl CertificateVerifier for ExpectingChain {
+        fn verify_certificate(&self, input: &CertificateVerifyInput<'_>) -> Result<(), String> {
             assert_eq!(input.signature_scheme, SIG_ECDSA_SECP256R1_SHA256);
             assert_eq!(input.signed_data.len(), 130, "64 + 33 + 1 + 32");
             assert_eq!(&input.signed_data[..64], &[0x20u8; 64][..], "64 spaces");
@@ -1087,12 +1125,17 @@ mod tests {
             assert_eq!(input.signed_data[97], 0, "the separator");
             assert_eq!(
                 &input.signed_data[98..],
-                &through_certificate[..],
+                &self.through_certificate[..],
                 "the transcript hash, hashed here from the messages we sent"
             );
             assert_eq!(
+                input.server_name,
+                Some(SNI.as_bytes()),
+                "the name the ClientHello asked for reaches the verifier, so it never has to capture it"
+            );
+            assert_eq!(
                 input.certificate_list,
-                &chain[..],
+                &self.chain[..],
                 "the chain from Certificate"
             );
             // The fake server "signs" by hashing the signed data, so this holds
@@ -1101,14 +1144,14 @@ mod tests {
             hasher.update(input.signed_data);
             assert_eq!(input.signature, hasher.finalize());
             Ok(())
-        })
+        }
     }
 
-    fn client(
-        verifier: TestVerifier,
+    fn client<V: CertificateVerifier>(
+        verifier: V,
         session_id: Vec<u8>,
         server_name: Option<&str>,
-    ) -> (ClientHandshake<TestVerifier>, Vec<u8>) {
+    ) -> (ClientHandshake<V>, Vec<u8>) {
         let mut client = ClientHandshake::new(
             ClientConfig {
                 server_name,
@@ -1471,8 +1514,8 @@ mod tests {
 
     /// A client that has sent its ClientHello and is waiting for the
     /// ServerHello, with a verifier that raises no objection of its own.
-    fn waiting_client(server_name: Option<&str>) -> (ClientHandshake<TestVerifier>, Vec<u8>) {
-        client(verifier_accepting(), SESSION_ID.to_vec(), server_name)
+    fn waiting_client(server_name: Option<&str>) -> (ClientHandshake<AcceptTestChain>, Vec<u8>) {
+        client(AcceptTestChain, SESSION_ID.to_vec(), server_name)
     }
 
     /// A server that has read the ClientHello and installed its keys, but has
@@ -1566,11 +1609,14 @@ mod tests {
     /// The verifier can only be supplied at construction and it has to know what
     /// the flight will contain, so the ClientHello is built twice. That is
     /// itself a check: the second one must be byte-identical.
-    fn connected() -> (ClientHandshake<TestVerifier>, Server, Vec<Out>) {
+    fn connected() -> (ClientHandshake<ExpectingChain>, Server, Vec<Out>) {
         let (_, first) = waiting_client(Some(SNI));
         let mut flight = honest_flight(&first);
         let (mut client, again) = client(
-            verifier_expecting(flight.through_certificate, flight.chain.clone()),
+            ExpectingChain {
+                through_certificate: flight.through_certificate,
+                chain: flight.chain.clone(),
+            },
             SESSION_ID.to_vec(),
             Some(SNI),
         );
@@ -1613,7 +1659,7 @@ mod tests {
         );
 
         // An empty session id means no compatibility mode, so no CCS.
-        let (_client, first) = client(verifier_accepting(), Vec::new(), Some(SNI));
+        let (_client, first) = client(AcceptTestChain, Vec::new(), Some(SNI));
         let hello_len = u16::from_be_bytes([first[3], first[4]]) as usize;
         assert_eq!(first.len(), 5 + hello_len);
     }
@@ -2049,7 +2095,7 @@ mod tests {
                 session_id: Vec::new(),
                 private_key: CLIENT_PRIV,
             },
-            verifier_accepting(),
+            AcceptTestChain,
         )
         .unwrap();
         assert_eq!(client.feed(&[0u8; 5]), Err(ClientError::NotStarted));

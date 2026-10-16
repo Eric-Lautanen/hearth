@@ -26,6 +26,12 @@
    ships exactly one, `RejectAll`, which can only refuse — **keep it that way**: no accept-all type, no
    flag, no environment variable, nothing a URL can reach that weakens verification. A failed chain, a
    wrong signature, an expired certificate or a hostname mismatch must abort the connection.
+   - **The verifier interface is settled and enforced — do not widen it.** `CertificateVerifier` is
+     deliberately **not** implemented for closures (a `compile_fail` doctest in `client.rs` requires
+     `|_| Ok(())` to be rejected), so every verifier is a named type, and `CertificateVerifyInput`
+     carries `server_name` beside the chain, the scheme, the signature and the 130-byte `signed_data`.
+     This came out of SparkOC's review: the blanket `Fn` impl had made an accept-all a one-liner, and
+     the tests were using it. Keep `RejectAll` the only verifier in the crate.
    - Build it in the order that can be *proven* first. Start with **signature verification**, because
      RFC 8448 gives a vector for it: the trace's `CertificateVerify` is `rsa_pss_rsae_sha256` over the
      130-byte `signed_data` we already reconstruct byte-for-byte, with a 128-byte signature (the trace's
