@@ -122,12 +122,13 @@ pub fn dequantize(dtype: GgmlDType, data: &[u8], out: &mut [f32]) -> Result<(), 
             }
         }
         GgmlDType::BF16 => {
-            let chunks = data.chunks_exact(2);
-            for (i, chunk) in chunks.enumerate() {
+            // as_chunks::<2> needs Rust 1.88+ (repo previously said 1.85).
+            let (chunks, _remainder) = data.as_chunks::<2>();
+            for (i, chunk) in chunks.iter().enumerate() {
                 if i >= out.len() {
                     break;
                 }
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                let bits = u16::from_le_bytes(*chunk);
                 out[i] = f32::from_bits((bits as u32) << 16);
             }
         }

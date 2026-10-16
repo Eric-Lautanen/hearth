@@ -87,5 +87,9 @@ fn main() {
         q8_sum += y.abs() as f64;
     }
     eprintln!("(q8 path shown for first {} rows)", n_show);
+    eprintln!(
+        "mean|q8|={:.6}",
+        q8_sum / n_show.min(n_rows).max(1) as f64
+    );
     let _ = (abs_raw, abs_rot, GgmlDType::Q8_0);
 }
