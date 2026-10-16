@@ -548,55 +548,17 @@ impl Manager {
             "",
         );
         // Resume partials with -C -; --fail surfaces HTTP errors.
-        // Resume partials with -C -; --fail surfaces HTTP errors.
-        // NOTE: temporary transport — operator direction is a hand-rolled
-        // pure-std HTTPS client so users without curl are covered.
+        // NOTE: curl is the temporary transport for https:// — the hand-rolled
+        // pure-std client (http.rs) takes plain http:// today and https:// once
+        // the TLS transport lands, so users without curl are covered.
         // -s: silent (a progress bar would go nowhere; output is nulled).
-        let mut child = match std::process::Command::new("curl")
-            .args(["-s", "-L", "--fail", "-C", "-", "--retry", "2", "-o"])
-            .arg(&part)
-            .arg(&e.url)
-            .stderr(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(err) => {
-                self.finish(e, Err(format!("failed to launch curl: {}", err)));
-                return;
-            }
+        let transfer: Result<(), String> = if e.url.starts_with("http://") {
+            // Hand-rolled pure-std path (no subprocess).
+            self.run_http(e, cancel, &part)
+        } else {
+            self.run_curl(e, cancel, &dir, &part)
         };
-        let result: Result<(), String> = loop {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err("cancelled".to_string());
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if status.success() {
-                        break Ok(());
-                    } else {
-                        break Err(format!("curl exited with status {}", status));
-                    }
-                }
-                Ok(None) => {
-                    self.emit(
-                        &e.id,
-                        "active",
-                        part_len(&dir, &e.filename),
-                        e.size_bytes,
-                        "",
-                    );
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-                Err(err) => {
-                    let _ = child.kill();
-                    break Err(format!("curl wait failed: {}", err));
-                }
-            }
-        };
-        let result = match result {
+        let result = match transfer {
             Err(msg) if msg == "cancelled" => Err((true, msg)),
             Err(msg) => Err((false, msg)),
             Ok(()) => {
@@ -624,6 +586,112 @@ impl Manager {
                     self.finish(e, Err("cancelled".to_string()));
                 } else {
                     self.finish(e, Err(msg));
+                }
+            }
+        }
+    }
+
+    /// Hand-rolled transfer for plain-http URLs: resume, redirect and
+    /// progress all come from http.rs, no subprocess involved.
+    fn run_http(
+        &self,
+        e: &CatalogEntry,
+        cancel: &Arc<AtomicBool>,
+        part: &std::path::Path,
+    ) -> Result<(), String> {
+        let mut resume = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+        for attempt in 0..2 {
+            // write+append: append keeps all writes at the end (resume).
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(part)
+                .map_err(|err| format!("open partial: {}", err))?;
+            if attempt == 1 {
+                // Server ignored Range on attempt 0: drop the stale partial
+                // and restart from scratch (delete+recreate dodges
+                // truncate-on-append-handle quirks on Windows).
+                drop(f);
+                std::fs::remove_file(part).map_err(|err| format!("reset partial: {}", err))?;
+                resume = 0;
+                f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(part)
+                    .map_err(|err| format!("open partial: {}", err))?;
+            }
+            let mut last_emit = std::time::Instant::now();
+            let r = crate::http::get(
+                &e.url,
+                resume,
+                Duration::from_secs(15),
+                cancel,
+                &mut |got, total_opt| {
+                    // Prefer the server's total for size-unknown (custom) URLs.
+                    let total = total_opt.unwrap_or(e.size_bytes);
+                    if last_emit.elapsed() > Duration::from_millis(500) {
+                        self.emit(&e.id, "active", got, total, "");
+                        last_emit = std::time::Instant::now();
+                    }
+                },
+                &mut f,
+            );
+            match r {
+                Ok(_) => return Ok(()),
+                Err(m) if m == "cancelled" => return Err(m),
+                Err(m) if m == "range_ignored" && attempt == 0 => continue,
+                Err(m) => return Err(m),
+            }
+        }
+        Err("server ignored Range twice".to_string())
+    }
+
+    /// Subprocess transfer for https:// until the TLS transport lands.
+    fn run_curl(
+        &self,
+        e: &CatalogEntry,
+        cancel: &Arc<AtomicBool>,
+        dir: &std::path::Path,
+        part: &std::path::Path,
+    ) -> Result<(), String> {
+        let mut child = match std::process::Command::new("curl")
+            .args(["-s", "-L", "--fail", "-C", "-", "--retry", "2", "-o"])
+            .arg(part)
+            .arg(&e.url)
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(err) => return Err(format!("failed to launch curl: {}", err)),
+        };
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("cancelled".to_string());
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        return Ok(());
+                    } else {
+                        return Err(format!("curl exited with status {}", status));
+                    }
+                }
+                Ok(None) => {
+                    self.emit(
+                        &e.id,
+                        "active",
+                        part_len(dir, &e.filename),
+                        e.size_bytes,
+                        "",
+                    );
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    return Err(format!("curl wait failed: {}", err));
                 }
             }
         }

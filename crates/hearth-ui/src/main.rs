@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use hearth_core::json::{self, Json};
 
 mod downloads;
+mod http;
 mod web;
 
 // ---------------------------------------------------------------------------
@@ -1035,7 +1036,10 @@ fn spawn_tab_reaper(ctx: Arc<AppCtx>) {
     // Testing escape hatch (screenshots, endpoint probes): set
     // HEARTH_NO_AUTO_SHUTDOWN=1 to keep the server up with no tabs open.
     // Default (unset) is close-chat-closes-server.
-    if std::env::var("HEARTH_NO_AUTO_SHUTDOWN").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("HEARTH_NO_AUTO_SHUTDOWN")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return;
     }
     std::thread::Builder::new()
