@@ -590,6 +590,40 @@ pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
     }
 }
 
+/// Name of the kernel [`dot_q2_0_q8_0_ptr`] selects on this machine.
+///
+/// Reports the choice without duplicating the predicates, so a benchmark or a
+/// startup log can verify dispatch instead of inferring it from timing. Note the
+/// VNNI entries are deliberately *not* gated on [`crate::avx512_full_width`]:
+/// `vpdpbusd` cuts enough front-end work to beat the AVX2 LUT kernel even on a
+/// double-pumped Zen 4 datapath. See [`crate::selected_kernel`].
+pub fn kernel_name() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[cfg(target_feature = "avx512f")]
+        {
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512vnni")
+                && std::arch::is_x86_feature_detected!("avx512dq")
+            {
+                return "vnni512x2";
+            }
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512vnni")
+            {
+                return "vnni256";
+            }
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return "avx2_lut";
+        }
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            return "sse41_lut";
+        }
+    }
+    "scalar"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

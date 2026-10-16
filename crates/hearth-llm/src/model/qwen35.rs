@@ -1838,7 +1838,11 @@ pub fn load(path: &str, _strategy: hearth_core::LoadStrategy) -> Result<LlamaMod
         &gguf,
         Tokenizer::from_gguf(&gguf).map_err(|e| format!("Tokenizer: {}", e))?,
     )?;
-    Ok(LlamaModel::from_hybrid(core, config, tokenizer))
+    // Which kernel each weight format will use, for the `[kernel]` load banner
+    // and the service's `kernels` JSON. Captured here because the shell that is
+    // returned does not retain the tensor map.
+    let dispatch = hearth_quant::dispatch_report(gguf.tensors.iter().map(|t| t.dtype));
+    Ok(LlamaModel::from_hybrid(core, config, tokenizer, dispatch))
 }
 
 // ---------------------------------------------------------------------------

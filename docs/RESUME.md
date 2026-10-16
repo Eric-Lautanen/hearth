@@ -6,20 +6,35 @@
 > GB/s) — 2B 15.6→19.1, 4B 6.6→7.7, 9B 4.0→5.0, 27B 1.23→1.41 tok/s, output byte-identical. The
 > gate is now correct (family reconstructed, 19h = 0x19) and **per-kernel**: PTQ1_0 → AVX2, Q2_0
 > VNNI → kept (3.10 vs 2.91 GB/s for AVX2 LUT), because a blanket "no AVX-512 on Zen 4" would have
-> regressed Q2_0. Kernel-level numbers and the `benchk` verification are in BUG_TRACKER
-> "Session 2026-10-15". 33 quant tests pass, clippy/fmt clean, **nothing committed**.
+> regressed Q2_0. The decision was then made testable (pure `cpuid_family` +
+> `avx512_full_width_for`, **33 → 40 tests**, the key one pinning that a real Zen 4 reports `0xF` in the
+> 4-bit family field) and self-reporting: a `[kernel] PTQ1_0=avx2 · zen4 · avx512_full_width=false`
+> load banner plus `event.model.kernels` JSON from the service for the UI. Kernel-level numbers and the
+> `benchk` verification are in BUG_TRACKER "Session 2026-10-15". clippy/fmt/check clean,
+> **nothing committed**.
 
 ## Next session — things to do/try
 
-1. **Prefill on the 27B is the last thing that makes the chat feel broken, and it is now the only hot
-   format without a paired kernel.** pt 5 added `DotFn2` in `pool.rs` (each weight row expanded once
-   for two prompt tokens) and it bought Q2_0 31% and Q1_0_G128 8–11% on prefill. **PTQ1_0 and PQ2_0
-   have no x2 variant at all**, so every Ternary Bonsai 2 model still re-expands each row once per
-   token: ~1.8–2.3 s per *prompt* token vs ~0.9 s per *decoded* token on the 27B. Write
-   `dot_ptq1_0_q8_0x2_ptr` and `dot_pq2_0_q8_0x2_ptr` and wire them into the `dot_fn2` table. While
-   in there, answer the open question: why is prefill ~2× *slower* per token than decode on these
-   hybrids, when a fixed-size recurrence should make the two cost about the same? (An x4 variant
-   regressed 3.2× in pt 5 — measure before merging.)
+1. **Hybrid prefill: first explain the 2× asymmetry, then decide on a chunked prefill.** Correcting an
+   earlier claim in this file — **PQ2_0 already has a paired kernel** (`matmul.rs`:
+   `Q2_0 | PQ2_0 => Some(dot_q2_0_q8_0x2_ptr)`); only PTQ1_0 lacked one, and `dot_ptq1_0_q8_0x2_ptr` now
+   exists and is bit-identical to two single calls (test `paired_matches_two_single_calls`), **but it
+   has no reachable caller**: `DotFn2` is consumed only by `matmul_batch`, that is called only from the
+   dense path, and every PTQ1_0 model is a `qwen35` hybrid whose prefill is explicitly token-by-token
+   with x1-only dispatch. Do not re-wire it into `matmul_batch`; that is the trap that made this look
+   done. Two concrete jobs, in this order:
+   - **(a) Explain the prefill/decode asymmetry — cheap, maybe free.** The hybrid prefill re-streams
+     every weight row once per prompt token, i.e. identical per-token memory traffic to decode, so
+     "1.8–2.3 s per *prompt* token vs 0.9 s per *decoded* token" should not happen. Measure it: prompt
+     lengths 1, 8, 32, 128 on the 4B PTQ1_0 with `--max-tokens 1`, and separate template/tokenization
+     time from `forward` time (`HEARTH_Q35_TIMERS=1`, `timers_report("prefill", …)` already exists at
+     `qwen35.rs`). If it is attention over the growing prefix, that is O(n²) and shows up as a
+     superlinear curve; if it is lazy init, a warm-up run hides it; if it is a timer artifact, fix the
+     timer. Only then is a prefill optimisation measurable at all.
+   - **(b) Then design the real fix: chunked prefill.** Give two tokens' activations to one weight pass
+     while keeping the GDN recurrence sequential. This is a hybrid-forward redesign (touches
+     `qwen35.rs`'s `forward`/`mm`), needs a design note first, and the x2 kernel above is its
+     prerequisite primitive. An x4 variant regressed 3.2× in pt 5 — measure before merging.
 2. **Sweep for other gate mistakes.** `cpu_is_amd_zen4()` was the only family check, but the class of
    bug is "a feature gate that is silently always-false (or always-true)". Grep `hearth-quant` and
    `hearth-llm` for `is_x86_feature_detected!`, `target_feature`, and `avx512`, and confirm each
@@ -30,18 +45,42 @@
    full-width AVX-512 — but there is no such hardware here to confirm that, and the comment in
    `avx512_full_width()` now states the 19h rule. Re-measure PTQ1_0's AVX-512 vs AVX2 on the first
    non-Zen-4 AVX-512 machine the repo runs on before trusting the gate.
-4. **Give the other dtypes the same introspection.** Only PTQ1_0 has a `kernel_name()`, so Q2_0's and
-   Q1_0_G128's dispatch can still only be inferred from timing — which is exactly how this bug hid for
-   so long. Prefer one shared `selected_kernel(dtype)` report printed in the model-load banner.
+4. **Keep the introspection honest as formats are added.** ~~Give the other dtypes the same
+   introspection~~ — done this session: `selected_kernel(dtype)` + `dispatch_report()` now cover PTQ1_0,
+   PQ2_0, Q2_0, Q1_0 and Q1_0_G128, the `[kernel]` banner prints at load on both the dense and hybrid
+   paths, and the service exposes `event.model.kernels` as JSON. The remaining work is the *next* format:
+   a new quant type must add a `kernel_name()` arm and a `selected_kernel` arm, or it will silently have
+   no reported dispatch again. `Q8_0` (the activation format) still has none — add it if a Q8_0 weight
+   kernel ever appears. **Rule agreed with SparkOC: add a format to `selected_kernel` only when it has more
+   than one implementation to choose between** — a name that can never vary is only noise.
 5. **Two smaller things.** (a) AGENTS.md's verifications block says `cargo test --test-threads=1 -p
    hearth-quant`; that is rejected by cargo (it must be `cargo test -p hearth-quant --
    --test-threads=1`). (b) Re-run the mandate set on a fully idle box interleaved with the reference
    fork (`bench_results/run_cpu_bench.bat`) — today's pass was clean but the fork was not present.
 
-**Working-copy warning.** Another agent (SparkOC) holds `task2-ui-docs-downloader` in this same
-checkout, so `crates/hearth-llm/src/model/mod.rs`, `qwen35.rs`, `pool.rs`,
-`crates/hearth-diffusion/src/transformer.rs` and the probe examples are modified by *them*, not by
-this session. Do not revert or commit those alongside AVX-512 work.
+**Cross-agent state (2026-10-15).** SparkOC owns `crates/hearth-ui`, `README.md` and
+`docs/screenshots`; `hearth-quant` + `hearth-llm` are mine. Two threads are open — check them rather
+than re-derive them:
+- SparkOC accepted all three downloader findings from my review and is applying them in
+  `hearth-ui/src/downloads.rs`: (1) `curl_available()` costs a measured **68–71 ms per call** and ran on
+  every `/api/downloads` poll at 1 Hz (cache it in a `OnceLock`); (2) `finish()` emits the *expected*
+  size as `downloaded_bytes` even on failure, so an incomplete transfer renders a 100% bar; (3)
+  `snapshot()` reads the final filename only, so a resumable `.part` shows `idle`/0. **Re-verify each
+  against their diff** once they say it is in — a reply is not a verification.
+- **Open operator question: hand-rolled TLS for the downloader.** My position, left in the room:
+  pure-std SHA-256/HKDF/X25519/AES-GCM is ~600–900 lines and provably testable against RFC/NIST
+  vectors, but X.509 chain validation + RSA/ECDSA verification + a pinned root store is 2000–3000 lines
+  of security-critical code whose failure mode is a **silent MITM**, so prefer bundling
+  `rustls`/`rustls-webpki`/`webpki-roots` (pure Rust, no C). Hand-roll only if the operator bans
+  dependencies outright, and then with a verify step that is **fatal and never downgradeable**. Do not
+  start it without that answer — it is a multi-session project.
+
+**Verification habits for a shared checkout.** `cargo fmt --all` formats the *whole workspace*,
+including the other agent's in-progress `hearth-ui/src/main.rs` — use `cargo fmt -p hearth-quant -p
+hearth-llm`. `target/release/hearth-chat-cli.exe` is often locked by their running UI, so build to a
+spare `CARGO_TARGET_DIR` rather than killing a process you do not own. And my first sweep of the model
+catalog appeared to fail with HTTP 000 on all 14 URLs purely because a helper script wrote CRLF line
+endings and curl rejected them — suspect your own harness before reporting someone else's data broken.
 
 ---
 

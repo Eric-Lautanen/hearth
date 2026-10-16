@@ -580,6 +580,13 @@ impl LlamaModel {
                 GgmlDType::Q1_0 | GgmlDType::Q1_0_G128 => {
                     Some(hearth_quant::dot_q1_0g128_q8_0x2_ptr)
                 }
+                // PTQ1_0 deliberately stays None here. A paired PTQ1_0 kernel
+                // exists (`hearth_quant::dot_ptq1_0_q8_0x2_ptr`, bit-identical to
+                // two single calls), but this is the *dense* batch path and every
+                // PTQ1_0 model in the catalog is a qwen35 hybrid that never calls
+                // `matmul_batch` — wiring it here would be a no-op that reads like
+                // a prefill speedup. The kernel belongs in the hybrid prefill,
+                // which is still token-by-token; see docs/RESUME.md.
                 _ => None,
             };
             let _q8_hold;

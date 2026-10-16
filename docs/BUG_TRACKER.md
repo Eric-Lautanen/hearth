@@ -62,14 +62,75 @@ block. The Rust parser uses dtype **143** and a **28-byte**/128-element block; P
 The script's dtype census was silently wrong for the new formats (it reported 71.4 MB where the file
 really holds 111.2 MB), which would have hidden exactly the kind of layout mistake this session chased.
 
-**Files touched:** `crates/hearth-quant/src/lib.rs`, `q2_0.rs`, `ptq1_0.rs`;
-`crates/hearth-llm/examples/benchk.rs` (rewritten as a head-to-head kernel bench that also reports the
-ground-truth dispatch); `scripts/gguf_info.py`. **Nothing committed** — the tree also holds
-another agent's in-progress edits (see RESUME).
+**Follow-up in the same session — making the same mistake impossible to repeat.** The bug was a
+predicate that could never be true and that nothing in the suite could see, so both halves got fixed:
 
-**Still open, unchanged by this session:** PTQ1_0 and PQ2_0 have **no x2 (paired) kernel**, so prefill
-on every Ternary Bonsai 2 model still re-expands each weight row once per prompt token. On the 27B that
-is the remaining UX blocker: ~1.8–2.3 s per *prompt* token against ~0.9 s per *decoded* token.
+- `cpuid_family(eax)` and `cpuid_is_amd(...)` are pure `const fn`s, and the policy is now a separate
+  `avx512_full_width_for(is_amd, family, has_avx512f, has_avx512bw)`. `avx512_full_width()` only feeds
+  them detected values, so the decision is testable for parts this machine is not.
+- **33 → 40 tests.** `raw_family_field_can_never_match_19h` pins the bug itself: a real Zen 4 reports
+  `0xF` in the 4-bit family field, so any comparison against `0x19` — or the decimal 25 — is false on
+  every Zen 4 part. Around it, a decision matrix: Zen 3 (19h, no AVX-512), Zen 4 (19h, loses),
+  Zen 5 (1Ah, keeps), Intel (keeps), an *Intel* part reporting 19h (must keep — the check is
+  vendor-qualified), and the missing-feature cases. Writing the matrix caught a factual error in the
+  test data itself: **Zen 3 is family 19h too**, so family alone cannot separate Zen 3 from Zen 4 — the
+  feature bits do.
+- **Dispatch is now self-reporting.** `ptq1_0::kernel_name()` was joined by `q2_0::kernel_name()` and
+  `q1_0g128::kernel_name()`, each reusing the real predicates rather than copying them, plus
+  `hearth_quant::selected_kernel(dtype)` and `dispatch_report(dtypes) -> DispatchReport`
+  (`cpu`, `cpu_family`, `avx512_full_width`, per-format `kernels`). Before this, only PTQ1_0 could say
+  which kernel it had chosen; Q2_0 and Q1_0_G128 could not, which is exactly how a 34% loss hid.
+
+Load banner, dense and hybrid paths alike (same `·` separator as the `[kv]` line):
+
+```
+[kernel] PTQ1_0=avx2 · zen4 · avx512_full_width=false
+[kernel] PQ2_0=vnni512x2 · zen4 · avx512_full_width=false
+```
+
+And machine-readable for the UI, in the service's loaded event at `event.model.kernels`:
+
+```json
+{"avx512_full_width": false, "cpu": "zen4", "cpu_family": "0x19", "ptq1_0": "avx2"}
+```
+
+Verified by driving `hearth-chat-cli --service` with line-JSON (`load`/`unload`/`shutdown`) and parsing
+stdout, so the UI can report the live dispatch without parsing log lines. `cpu` distinguishes Zen 3 from
+Zen 4 by whether AVX-512 is actually present, not by the shared 19h family.
+
+**Files touched:** `crates/hearth-quant/src/lib.rs` (family decode + `DispatchReport` + tests), `q2_0.rs`,
+`ptq1_0.rs`, `q1_0g128.rs`;
+`crates/hearth-llm/src/model/mod.rs` (banner + `dispatch()` accessor), `model/qwen35.rs` (hybrid path),
+`src/bin/hearth-chat-cli/service.rs` (`kernels` JSON), `examples/benchk.rs` (rewritten as a head-to-head
+kernel bench that also reports the ground-truth dispatch); `scripts/gguf_info.py`. **Nothing committed**
+— the tree also holds another agent's in-progress edits (see RESUME).
+
+**Correction and a bigger finding (same session, after the above).** I first wrote that "PTQ1_0 and
+PQ2_0 have no x2 (paired) kernel". **That was wrong about PQ2_0**: it shares Q2_0's paired kernel
+(`matmul.rs`: `Q2_0 | PQ2_0 => Some(dot_q2_0_q8_0x2_ptr)`). Only PTQ1_0 lacked one. Then the
+replacement turned out to be inert for a more interesting reason.
+
+`dot_ptq1_0_q8_0x2_ptr` was written (weights decoded once into `wvals[128]`, two activation rows, and
+**bit-identical to two single calls** — pinned by `paired_matches_two_single_calls`, which also asserts
+real magnitude rather than merely "not zero", after a first fixture attempt produced an exactly-zero
+dot that would have let a stub pass). 33 → 41 tests. But **no model can reach it**: `DotFn2` is consumed
+only by `matmul_batch`, `matmul_batch` is called only from the dense path (`model/mod.rs`), and every
+PTQ1_0 model in the catalog is a `qwen35` hybrid. The hybrid prefill is explicitly token-by-token
+(`qwen35.rs`: *"Prefill: token by token (GDN recurrence is inherently sequential)"*) and dispatches
+single-token kernels only (`qwen35.rs` x1 tables). So the wiring was **reverted** rather than left as a
+no-op that reads like a prefill speedup; the kernel stays as the tested, currently-unreferenced
+primitive, with its doc comment saying so and pointing at where it belongs. **No performance claim.**
+
+**What that uncovered — the hybrid prefill has no weight reuse at all.** It re-streams every weight row
+once per prompt token, i.e. *identical memory traffic per token* to decode. That reframes the earlier
+number: "~1.8–2.3 s per *prompt* token vs ~0.9 s per *decoded* token" cannot be explained by matmul work
+(it should be about equal), so the 2× is either attention over the growing prefix, first-token/lazy-init
+effects, or a measurement artifact — **currently unexplained and possibly free speed**.
+
+**Where the real prefill win is:** not another kernel but a *chunked* hybrid prefill — carry two tokens
+through the dense projections per weight pass while keeping the GDN recurrence sequential. The x2 kernel
+is exactly the primitive that needs (one weight row, two Q8 activation rows, bit-identical). That is a
+hybrid-forward redesign, needs its own design note, and is **not** claimed here.
 
 ### Session 2026-09-19 pt 6 — the 27B chat was unusable: KV cache sized from the model's *declared* context
 

@@ -858,6 +858,26 @@ pub unsafe fn dot_q1_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
     }
 }
 
+/// Name of the kernel [`dot_q1_0g128_q8_0_ptr`] selects on this machine.
+///
+/// Reports the choice without duplicating the predicates, so a benchmark or a
+/// startup log can verify dispatch instead of inferring it from timing. See
+/// [`crate::selected_kernel`].
+pub fn kernel_name() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            "avx2"
+        } else {
+            "sse41"
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        "scalar"
+    }
+}
+
 /// Dispatch: dot_q1_0g128_q8_0 using raw pointers (no slice bounds checks).
 /// Uses shuffle-based AVX2 kernel (no LUT, avoids L1 cache pressure).
 /// # Safety

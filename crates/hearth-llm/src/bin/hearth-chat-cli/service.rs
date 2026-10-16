@@ -278,6 +278,19 @@ impl Service {
         // KV cache allocated at load (bytes). The UI shows this so a model whose
         // context costs gigabytes of RAM is visible before it is chatted with.
         info.set("kv_bytes", Json::num(model.kv_cache_bytes() as f64));
+        // Which kernel each weight format actually runs, plus the CPU class that
+        // chose it. Exposed as data so the UI never has to parse the load banner:
+        // a stale dispatch (a feature gate that silently answers "no") shows up
+        // here instead of only in a 34%-slower tok/s number.
+        let dispatch = model.dispatch();
+        let mut kernels = Json::obj();
+        kernels.set("avx512_full_width", Json::Bool(dispatch.avx512_full_width));
+        kernels.set("cpu_family", Json::str(dispatch.cpu_family.clone()));
+        kernels.set("cpu", Json::str(dispatch.cpu));
+        for (format, kernel) in &dispatch.kernels {
+            kernels.set(format, Json::str(*kernel));
+        }
+        info.set("kernels", kernels);
         info.set(
             "template",
             Json::str(format!("{:?}", model.template_kind())),

@@ -67,12 +67,21 @@ pub struct LlamaModel {
     /// load, so this is the model's real RAM cost beyond its weight file — the
     /// UI shows it so a big-context model can be spotted before chatting.
     kv_cache_bytes: u64,
+    /// Kernel selection for this model's weight formats, captured at load.
+    dispatch: hearth_quant::DispatchReport,
 }
 
 impl LlamaModel {
     pub fn load(path: &str, strategy: LoadStrategy) -> Result<Self, String> {
         let gguf = GgufFile::open(path).map_err(|e| format!("GGUF: {}", e))?;
         let mut config = ModelConfig::from_gguf(&gguf)?;
+
+        // Which kernel each weight format will use, captured before the arch
+        // dispatch below so dense and hybrid models both report it. A stale
+        // dispatch — a feature gate that silently answers "no" — is invisible in
+        // every number a user sees; it cost 34% on PTQ1_0 before this existed.
+        let dispatch = hearth_quant::dispatch_report(gguf.tensors.iter().map(|t| t.dtype));
+        Self::log_dispatch(&dispatch);
 
         // Hybrid linear-attention architectures have their own forward path, state
         // layout and geometry (e.g. d_model not divisible by n_heads); they must
@@ -355,12 +364,26 @@ impl LlamaModel {
             rope_cache,
             hybrid: None,
             kv_cache_bytes: max_seq as u64 * kv_per_token,
+            dispatch,
         })
     }
 
     /// Bytes of f32 KV cache this model allocated at load.
     pub fn kv_cache_bytes(&self) -> u64 {
         self.kv_cache_bytes
+    }
+
+    /// Which kernel each of this model's weight formats will run on, plus the
+    /// CPU class behind that choice. Exposed so the service can hand the UI the
+    /// dispatch as JSON instead of making it parse the load banner.
+    pub fn dispatch(&self) -> &hearth_quant::DispatchReport {
+        &self.dispatch
+    }
+
+    /// Print the load banner for a dispatch report. Called from both the dense
+    /// and hybrid constructors so the two cannot drift apart.
+    fn log_dispatch(report: &hearth_quant::DispatchReport) {
+        eprintln!("{}", report.banner());
     }
 
     /// Wrap a hybrid-architecture core (qwen35) in the LlamaModel shell.
@@ -371,8 +394,10 @@ impl LlamaModel {
         core: qwen35::Qwen35Core,
         _config: ModelConfig,
         tokenizer: Tokenizer,
+        dispatch: hearth_quant::DispatchReport,
     ) -> Self {
         let config = core.config_snapshot();
+        Self::log_dispatch(&dispatch);
         LlamaModel {
             config,
             tokenizer: std::sync::Mutex::new(tokenizer),
@@ -391,6 +416,7 @@ impl LlamaModel {
             rope_cache: ops::RopeCache::new(16, 16, 10000.0, None, None, None),
             kv_cache_bytes: core.kv_cache_bytes(),
             hybrid: Some(core),
+            dispatch,
         }
     }
 
