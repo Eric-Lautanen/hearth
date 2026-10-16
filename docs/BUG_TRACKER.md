@@ -14,6 +14,41 @@ down on Q2_0 models, but an interleaved A/B against a pre-pass binary built
 from an isolated worktree agreed within ~3% on all four disputed models —
 machine drift, not code. Charts stand.
 
+**Independently re-derived (buffy, 2026-10-16), because a gate that only one agent ran is a claim.**
+`cargo clippy -p hearth-llm --all-targets -- -D warnings` exits 0 here too, and then both revisions
+were rebuilt **from scratch** (d571b8a in an isolated worktree, plus HEAD) into separate target dirs
+and interleaved pre/post, 2 reps, one process at a time, on the 6 mandate models.
+
+| model | pre (tok/s) | post (tok/s) | Δ |
+|-------|-------------|--------------|---|
+| Bonsai-1.7B-Q1_0 | 49.16, 50.35 | 48.92, 51.44 | +0.8% |
+| Ternary-Bonsai-1.7B-Q2_0 | 21.36, 20.60 | 20.73, 21.51 | +0.7% |
+| Bonsai-4B | 22.73, 25.65 | 22.40, 24.74 | −2.6% |
+| Ternary-Bonsai-4B-Q2_0 | 9.05, 8.83 | 9.10 (rerun 9.54) | +2..7% |
+| Bonsai-8B | 12.04 (rerun 14.31) | 11.45, 12.47 | −0.7% |
+| Ternary-Bonsai-8B-Q2_0 | 5.05, 5.08 | 5.06, 5.19 | +1.2% |
+
+Two findings worth keeping. (1) The Q2_0 dip is machine state and provably not the code: on the 8B
+Q2_0 **both** arms read ~5.05 against the chart's 6.75, i.e. −25% on pre and post alike — the family
+is down as a family, not on one side of the pass. (2) A single run is worthless here: the *same*
+8B Q1_0 pre binary returned 12.04 and then 14.31 a few minutes later, which is the ±10–15% spread
+pt 6 already documented. Only the alternating pair carries information. One harness trap for the
+record: two runs came back with no summary line purely because my `grep` missed it in the stream —
+raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a crash. And the
+tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
+does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
+
+### hearth-tls slice 1 — SHA-256, HMAC-SHA256 and the RFC 8446 key schedule (buffy, 2026-10-15)
+
+New workspace crate **`crates/hearth-tls`**: **std only, `[dependencies]` empty** (operator rule this
+session: no new dependencies, so no `rustls`). 15 tests, every one against a published vector — FIPS
+180-4 (empty, `abc`, the two-block 448-bit message, the 1 M `a` case), RFC 4231 HMAC 1–7 including
+the 131-byte key, RFC 5869 HKDF 1–3, plus `hkdf_expand_label`/`derive_secret` round-trips. clippy
+`--all-targets -D warnings` and fmt clean, workspace check green. A **lib** crate on purpose: an
+unwired public API in a module would warn as dead code, and nothing consumes it yet. It is the bottom
+of the TLS 1.3 stack for the downloader's `https://` path; verification is to be fatal and never
+downgradeable.
+
 ### Sweep 2026-10-15 — all 14 models, post-Zen4-fix snapshot (SparkOC)
 
 Release build at `50c88bc` (includes the Zen4 per-kernel dispatch fix).

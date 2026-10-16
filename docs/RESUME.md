@@ -9,8 +9,11 @@
 > "hybrid prefill is 2× slower than decode" premise that had been in this file since pt 6 — it was
 > false (27B: prefill 635 ms/token vs decode 722). Started the hand-rolled TLS work the operator asked
 > for: a new **`crates/hearth-tls`** crate (std only, **zero dependencies**) with SHA-256, HMAC-SHA256
-> and the RFC 8446 key schedule, all vector-tested. Everything from this session is committed locally;
-> nothing was pushed. History and numbers: `docs/BUG_TRACKER.md`.
+> and the RFC 8446 key schedule, all vector-tested. **All of it is on `origin/main`** — SparkOC pushed
+> my `mod.rs` slice as `50c88bc` while I was out, finished the remaining sites as `f3c18d4` (CI green),
+> and I then re-derived their benchmark gate from scratch builds: no regression. **Operator rule this
+> session: std Rust only, no new dependencies** — so the TLS stack is hand-rolled end to end, no
+> `rustls`. History and numbers: `docs/BUG_TRACKER.md`.
 
 ## Next session — in this order
 
@@ -31,6 +34,11 @@
    at `d571b8a`) agreed within ~3% on all four disputed models — machine
    drift across the evening, not code. Lesson: single-run charts carry
    ±20% machine noise; interleave before believing a delta.
+   **Independently re-derived 2026-10-16 (buffy), gate closed:** clippy exits 0 here too, and both
+   revisions were rebuilt from scratch (worktree + separate target dirs) and interleaved on all 6
+   mandate models — everything within ±3%. The Q2_0 dip shows in **both** arms (8B Q2_0: 5.05 pre vs
+   5.06 post against the chart's 6.75), which is what proves it is machine state rather than code.
+   Nothing left to do on this item.
 1. **TLS slice 2: AES-128-GCM, then X25519.** `crates/hearth-tls` exists and is in the workspace;
    `sha256.rs` (SHA-256 + HMAC-SHA256) and `hkdf.rs` (`hkdf_extract`/`hkdf_expand`/`hkdf_expand_label`/
    `derive_secret`) are done, 15 tests, all against published vectors (FIPS 180-4, RFC 4231, RFC 5869).
@@ -46,16 +54,24 @@
    - Measured, for calibration: `curl_available()` + the whole downloader is only the *transport*
      question; the primitives are ~600–900 lines of arithmetic, where X.509 chain validation plus
      RSA/ECDSA verification plus a pinned root store is the 2000–3000 line half. Budget accordingly.
-2. **The downloader defect I found, unfixed as of writing.** A full-size `.part` can never complete:
-   with `<name>.gguf.part` holding exactly `size_bytes` and the server answering **416** to
-   `Range: bytes=<size>-`, pressing Download yields `state=error error="HTTP 416" exists=false`, and
-   every retry reproduces it — the file must be deleted by hand while the UI shows 100 % beside an
-   error. Cause: `start()`'s completion shortcut reads `on_disk()` (final name only), and
-   `http::get` treats 416 as fatal while `run_http` retries only on `range_ignored`. Fix is either
-   "416 while resuming = range already satisfied → publish", or checking `part_len()` in `start()`.
-   SparkOC owns this file. **Also unfixed, code-reading only:** `to_socket_addrs().next()` uses just
-   the first address with no fallback across A/AAAA records (curl tries them all) — latent while
-   catalog URLs are `https://` and go through curl, live the moment TLS routes them here.
+   - **Operator rule received 2026-10-15 (closes the open question in the pt-2 notes): std Rust only,
+     no dependencies.** There is therefore no `rustls` escape hatch and no "bundle a vetted verifier"
+     option — the X.509/chain/RSA/ECDSA half is hand-rolled too, which makes the fatal, never-
+     downgradeable verify policy the *entire* safety story rather than a belt-and-braces extra. Build
+     it in the order given above and land it with negative tests (bad signature, expired, unknown
+     root, hostname mismatch) before any URL is allowed to use it. Do not let the downloader take an
+     `https://` path through this code until those tests exist.
+2. **The downloader defect I found: FIXED by SparkOC (`c8782dc`) and re-verified by me end to end —
+   closed.** The dead end was a full-size `.part` plus a **416** to `Range: bytes=<size>-`. Both
+   candidate fixes landed (heal on 416, and `part_len()` awareness). I re-ran my own repro against
+   the fixed binary rather than trusting the diff: the full-size case now goes `partial 100/100` →
+   press → `done`, the file is adopted, no error; and the safety half holds too — a 416 with a
+   *short* partial refuses to claim completion instead of publishing a truncated file. Also landed
+   in the same commit: the redirect now keeps the `Range` header. **The DNS fallback is implemented
+   but only unit-tested** — `to_socket_addrs().next()` (first address only) is gone, yet nobody has
+   checked it against a host with a real A/AAAA pair, which is latent while catalog URLs are
+   `https://` through curl and live the moment TLS routes them here. That is the one loose thread
+   left in this item.
 3. **Size the chunked-prefill win before designing it.** There is still **zero weight reuse** in the
    hybrid prefill: it re-streams every weight row once per prompt token, so prefill's per-token cost
    is ~= decode's (4B: 144 vs 117 ms/token). A chunked forward would amortise the weight *unpacking*
