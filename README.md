@@ -1,8 +1,18 @@
-# Hearth
+<div align="center">
 
-**Pure Rust LLM inference engine — from GGUF file to generated token with zero C dependencies.**
+# 🔥 Hearth
 
-Hearth is a local LLM runtime that loads quantized GGUF models and runs inference entirely on CPU using hand-tuned AVX2 kernels and a custom parallel thread pool. It matches or beats llama.cpp on the same hardware while being a single `cargo build` away.
+**Pure-Rust LLM inference — from GGUF file to generated token, zero C dependencies.**
+
+[![CI](https://github.com/Eric-Lautanen/hearth/actions/workflows/ci.yml/badge.svg)](https://github.com/Eric-Lautanen/hearth/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE-MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE-APACHE)
+[![Platform](https://img.shields.io/badge/platform-Windows_%7C_Linux_%7C_macOS-lightgrey.svg)](#quick-start)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://rustup.rs)
+
+*Local quantized models on CPU with hand-tuned SIMD kernels. One `cargo build` away.*
+
+</div>
 
 ```
 $ hearth-chat-cli model.gguf --temp 0 --max-tokens 100 --prompt "Explain quaternions"
@@ -21,16 +31,15 @@ for rotation representation, avoiding gimbal lock...
 
 ## Performance
 
-All 14 models on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5), single run each at
+14 models on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5), one run each at
 `--temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`, idle machine, warmed
-up first (frequency scaling needs one throwaway run). Hearth uses 8 workers.
-Single runs on this box vary more than the usual ±10–15%: an interleaved
-re-run later the same evening read the Q2_0 family ~25% lower on two
-independent binaries, so treat these as snapshots, not absolutes — only
-alternating same-session pairs carry information.
+up first. 8 workers. Single runs on this box vary: an interleaved re-run later
+the same evening read the Q2_0 family ~25% lower on two independent binaries,
+so treat these as snapshots — only alternating same-session pairs carry
+information.
 
-| Size | Format               | d_model | Layers | tok/s (2026-10-15) |
-| ---- | -------------------- | ------- | ------ | ------------------ |
+| Size | Format               | d_model | Layers | tok/s |
+| ---- | -------------------- | ------- | ------ | ----- |
 | 1.7B | Q1_0 (1-bit, 128-el) | 2048    | 28     | **47.1** |
 | 1.7B | Q2_0 (2-bit ternary) | 2048    | 28     | **24.5** |
 | 4B   | Q1_0 (1-bit, 128-el) | 2560    | 36     | **18.8** |
@@ -46,61 +55,36 @@ alternating same-session pairs carry information.
 | 27B² | PTQ1_0 (1-bit)       | —       | 64     | **1.35** |
 | 27B² | PQ2_0 (2-bit)        | —       | 64     | **1.53** |
 
-² = Ternary Bonsai 2 (PrismML `qwen35` hybrid architecture). The 27B pair runs
-at ~1.4 tok/s — ~35 s for 50 tokens, so raise `--max-tokens` deliberately.
-They are the reason the UI shows live progress and streams reasoning as it is
-produced rather than buffering a reply.
-
-This build includes the Zen4 dispatch fix (per-kernel AVX2 vs AVX-512-VNNI
-gating); Q2_0-family numbers moved up accordingly.
-
-Full benchmarks with raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md)
+² = Ternary Bonsai 2 (`qwen35` hybrid). The 27B pair runs at ~1.4 tok/s, so
+raise `--max-tokens` deliberately — the UI streams progress and reasoning live
+instead of buffering a reply. Raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md).
 
 ## Features
 
-- **Pure Rust stack** — GGUF parser, BPE tokenizer, samplers, quant kernels, KV cache, thread pool. No C, no CMake, no `libllama`.
-- **Hand-tuned AVX2 kernels** — Q1_0, Q2_0, Q8_0 dot products with lookup-table acceleration and FMA accumulation. SSE4.1 + scalar fallbacks for non-AVX2 CPUs.
-- **Custom thread pool** — replaces Rayon with a generation-counter spin-loop pool. Zero syscalls per dispatch, <100ns wake latency. Static work partitioning with L2-sized tile iteration — no work-stealing overhead. Scales 5.93× on 8 cores (OpenMP: 4.38×).
-- **KV cache** — F32 key/value cache sized to the loaded model's own context window (capped by `HEARTH_CTX_CAP`). A Q8_0 backend exists in the cache type but is not wired to a request yet.
-- **Chat with templates** — PrismML Bonsai (Qwen3 architecture) chat templates parsed from GGUF metadata, including the Ternary Bonsai 2 27B hybrid (`qwen35`) architecture. Interactive and single-shot modes.
-- **Model-declared defaults** — each GGUF's `general.sampling.*` (temp, top-k, top-p, min-p) and its `context_length` are read and used, so a model runs the way its author tuned it instead of on one hardcoded profile.
-- **Sampler controls** — temperature, top-k, top-p, min-p, typical-p, repetition penalty, seed; every one is settable from the CLI, the service protocol, and the web UI.
-- **Web chat UI** — `hearth-ui` serves a browser chat over the engine's line-JSON service, with a settings drawer seeded from the loaded model (sampling, context, device/residency), live tok/s while it replies, a **model downloader** (per-model progress, queued 1-by-1, resume), and close-the-tab shuts the server down.
-- **GPU stubs** — `hearth-compute` has skeleton API signatures for fused dequant+matmul, flash attention, RMS norm, and RoPE. All methods return `None`/`false` — not yet implemented.
-- **TLS primitives** — `hearth-tls` is pure-std, zero-dependency SHA-256/HMAC/HKDF with RFC test vectors, the first slice of a hand-rolled TLS transport for the model downloader.
-- **Diffusion (experimental)** — `hearth-diffusion` is an unfinished image model; not part of the LLM path.
+- **Pure Rust, no C** — GGUF parser, BPE tokenizer, sampler, quant kernels, KV cache, thread pool. No CMake, no `libllama`.
+- **Hand-tuned SIMD** — Q1_0/Q2_0/Q8_0 dot products (AVX2 LUT + FMA, AVX-512 VNNI where it wins, per-kernel dispatch), SSE4.1 + scalar fallbacks.
+- **Custom thread pool** — zero syscalls per dispatch, static L2-tiled partitioning, 5.93× scaling on 8 cores.
+- **Model-driven defaults** — each GGUF's `general.sampling.*` and `context_length` are honored; flags override per field.
+- **Web chat UI** — model dropdown, settings seeded from the model, live tok/s, collapsible `<think>` reasoning, **model downloader** (per-model progress, queued 1-by-1, resume), and closing the last tab shuts the server down.
+- **TLS track** — `hearth-tls` is pure-std, zero-dependency crypto (SHA-256 → AES-GCM → X25519 → record layer) for a future hand-rolled download transport.
 
-## Supported Quantization Formats
+## Quantization formats
 
-| Format           | Bits/elem | Block size | Kernel                 |
-| ---------------- | --------- | ---------- | ---------------------- |
-| Q1_0 / Q1_0_G128 | 1         | 128        | AVX2 LUT + FMA         |
-| Q2_0             | 2         | 128        | AVX2 LUT + FMA         |
-| Q2_K             | 2         | 256        | QK block dequant       |
-| Q3_K             | 3         | 256        | QK block dequant       |
-| Q4_0             | 4         | 32         | Portable + Q8_0 fusion |
-| Q4_1             | 4         | 32         | Portable               |
-| Q4_K             | 4         | 256        | QK block dequant       |
-| Q5_0             | 5         | 32         | Portable               |
-| Q5_1             | 5         | 32         | Portable               |
-| Q5_K             | 5         | 256        | QK block dequant       |
-| Q6_K             | 6         | 256        | QK block dequant       |
-| Q8_0             | 8         | 32         | Portable + Q8_0 fusion |
-| F16 / F32        | —         | —          | matrixmultiply sgemm   |
+| Format           | Bits/elem | Block | Kernel              |
+| ---------------- | --------- | ----- | ------------------- |
+| Q1_0 / Q1_0_G128 | 1         | 128   | AVX2 LUT + FMA      |
+| Q2_0             | 2         | 128   | AVX2 LUT / VNNI     |
+| Q4_0 · Q4_1      | 4         | 32    | Portable (+ fusion) |
+| Q5_0 · Q5_1      | 5         | 32    | Portable            |
+| Q2_K · Q3_K · Q4_K · Q5_K · Q6_K | 2–6 | 256 | QK block dequant |
+| Q8_0             | 8         | 32    | Portable + fusion   |
+| F16 / F32        | —         | —     | matrixmultiply sgemm |
 
-Bold = AVX2-optimized. Portable = scalar but still parallelized.
+## Quick start
 
-## Quick Start
-
-### 1. Prerequisites
-
-- **[Rust](https://rustup.rs) 1.88+** (tested on 1.99). If you don't have Rust, install it with `winget install Rustlang.Rustup` on Windows or `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` on Linux/macOS.
-- **A Bonsai GGUF model file** in the project `models/` folder. Easiest path: open the web UI and use the **download button** (top-right) — pick 1.7B to start, each model downloads individually with its own progress bar. Two good first models:
-  - `Bonsai-1.7B-Q1_0.gguf` — 1-bit, fastest, 237 MiB
-  - `Ternary-Bonsai-1.7B-Q2_0.gguf` — 2-bit ternary, higher quality, 442 MiB
-- **x86_64 CPU** with AVX2 recommended (SSE4.1 minimum). Most CPUs from 2015+ have AVX2.
-
-Prefer to fetch manually? Every file lives in a `prism-ml` HuggingFace repo as `<repo>/resolve/main/<file>`:
+**Prerequisites:** [Rust](https://rustup.rs) 1.88+ · x86_64 CPU with AVX2 (most 2015+)
+· a Bonsai GGUF in the project `models/` folder — easiest via the web UI's
+download button (top-right), or manually from HuggingFace (`<repo>/resolve/main/<file>`):
 
 | File | Size | Repo |
 | ---- | ---- | ---- |
@@ -119,158 +103,70 @@ Prefer to fetch manually? Every file lives in a `prism-ml` HuggingFace repo as `
 | `Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5.5 GiB | [Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
 | `Ternary-Bonsai-2-27B-PQ2_0.gguf` | 6.7 GiB | [Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
 
-### 2. Build
-
-Clone the repo and compile. The first build downloads dependencies and takes 2–5 minutes. Subsequent builds are much faster.
+**Build** (first build takes 2–5 min; `target-cpu=native`, `lto=fat`):
 
 ```bash
-git clone https://github.com/yourname/hearth.git
+git clone https://github.com/Eric-Lautanen/hearth.git
 cd hearth
 cargo build --release
 ```
 
-The build config uses `target-cpu=native`, `lto=fat`, `codegen-units=1` for maximum performance — LLVM optimizes specifically for your CPU.
+**Run** — one-shot, interactive, or web UI:
 
-### 3. Run
-
-The binary builds to `target\release\hearth-chat-cli.exe`. Models typically live wherever you saved them — we'll use `C:\Users\you\models\` as an example below. Replace with your actual paths.
-
-**Verify it works** (quick 20-token test, takes ~1 second):
-
-```powershell
-C:\Users\you\hearth\target\release\hearth-chat-cli.exe C:\Users\you\models\Bonsai-1.7B-Q1_0.gguf --temp 0 --max-tokens 20 --prompt "Hello" --prompt-raw
+```bash
+./target/release/hearth-chat-cli models/Bonsai-1.7B-Q1_0.gguf --temp 0 --max-tokens 20 --prompt "Hello" --prompt-raw
+./target/release/hearth-chat-cli models/Ternary-Bonsai-1.7B-Q2_0.gguf --max-tokens 256
+cargo build --release -p hearth-ui && ./target/release/hearth-ui   # http://127.0.0.1:8899
 ```
 
-**One-shot question** (generates a response and exits):
+(`hearth-ui` opens the browser automatically; `--no-browser` and `--port N` available.
+Closing the last tab shuts the server down ~25 s later. Interactive commands:
+`/quit`, `/clear`, `/system <message>`, `/config`.)
 
-```powershell
-C:\Users\you\hearth\target\release\hearth-chat-cli.exe C:\Users\you\models\Bonsai-1.7B-Q1_0.gguf --prompt "Write a haiku about Rust" --max-tokens 100
-```
+**Downloader** (download icon, top-right): tick models, **Download selected** —
+one file at a time, rest queue, each with its own bar, partials resume,
+finished files appear in the dropdown. Custom `.gguf` URL row included.
+Power options: `models/catalog.json` or `HEARTH_MODEL_CATALOG_JSON` overrides
+the catalog; `HEARTH_DL_ALLOW_HTTP=1` permits plain-http mirrors.
 
-**Interactive chat** (back-and-forth conversation, Ctrl+C to exit):
+### Flags & environment
 
-```powershell
-C:\Users\you\hearth\target\release\hearth-chat-cli.exe C:\Users\you\models\Bonsai-1.7B-Q2_0.gguf --max-tokens 256
-```
+Only set what you want to change — the rest follows the model:
 
-Interactive commands: `/quit`, `/clear`, `/system <message>`, `/config` (print every active setting).
+| Flag | Default | What it does |
+| ---- | ------- | ------------ |
+| `<model.gguf>` | required | Model path first, no `--` prefix |
+| `--temp` / `--top-k` / `--top-p` / `--min-p` | model's, else 0.7 / 40 / 0.9 / 0.0 | Sampling controls (`0` temp = deterministic) |
+| `--typical-p` / `--repeat-pen` / `--seed` | 0.0 / 1.1 / random | Typical sampling, repetition penalty, fixed RNG |
+| `--max-tokens` / `--max-context` | 512 / model's length | Reply budget, context window |
+| `--prompt` / `--prompt-raw` | — | One-shot mode / skip the chat template |
+| `--show-think` | off | Show `<think>` reasoning instead of hiding it |
+| `--gpu` / `--gpu-layers N` | cpu | GPU load strategy |
+| `--pin-weights` | off | Mmap vs RAM (leave off for 27B-scale on 16 GB — pinning 5.9 GB died silently) |
+| `--service` / `--dump-info` / `--kv-f32` | — | UI backend mode / print metadata / compat flag |
 
-**Web chat UI:**
-
-```powershell
-cargo build --release -p hearth-ui
-.\target\release\hearth-ui.exe            # opens http://127.0.0.1:8899
-.\target\release\hearth-ui.exe --port 9000 --no-browser
-```
-
-The page lists the GGUF files in your model folder, loads one on demand, and streams the reply  
-(with `<think>` reasoning in a collapsible drawer). The settings drawer shows **the loaded model's  
-sampling values** and has a "reset to model defaults" button; a device/residency select covers  
-CPU, GPU, and layer-split loads. During a reply it shows live progress (`streaming · N tok ·
-m:ss · X tok/s`) — a 27B model runs at ~1 tok/s, so a long reply is slow but visible rather than  
-silent.
-
-**Model downloads** (download icon, top-right): every Bonsai file above is one click away.
-Tick the ones you want and hit **Download selected** — one file transfers at a time, the rest
-queue, each with its own progress bar, and partial files resume. Completed files appear in the
-model dropdown automatically. A custom `.gguf` URL + filename row covers anything off-catalog.
-Power options: `models/catalog.json` (or `HEARTH_MODEL_CATALOG_JSON`) overrides the catalog,
-`HEARTH_DL_ALLOW_HTTP=1` permits plain-http mirrors.
-
-**Lifetime:** closing the last chat tab shuts the server down ~25 s later (heartbeat + goodbye
-beacon; reloads re-register, generations and downloads in flight block shutdown). Set
-`HEARTH_NO_AUTO_SHUTDOWN=1` to keep it up for scripting.
-
-#### What do the flags mean?
-
-Nothing here is hardcoded: every Bonsai GGUF ships its own `general.sampling.*` recommendations and  
-its own `context_length`, and Hearth follows them unless you pass a flag. Pass **only the fields you  
-want to change** — the rest keep the model's values. Run `hearth-chat-cli --help` for the same list.
-
-| Flag                       | Default                  | What it does                                                   |
-| -------------------------- | ------------------------ | -------------------------------------------------------------- |
-| `<model.gguf>`             | required                 | Path to your model file (comes first, no `--` prefix)          |
-| `--temp`                   | model's, else 0.7        | Creativity level. `0` = deterministic, `1.0+` = more random    |
-| `--top-k`                  | model's, else 40         | Only pick from the top K most likely next words                |
-| `--top-p`                  | model's, else 0.9        | Nucleus sampling: pick from words totaling 90% probability     |
-| `--min-p`                  | model's, else 0.0        | Drop tokens below this fraction of the top token's probability |
-| `--typical-p`              | 0.0 (off)                | Typical sampling: keep the most information-typical tokens     |
-| `--repeat-pen`             | 1.1                      | Penalize repeated words (1.0 = no penalty)                     |
-| `--seed`                   | 0 (random)               | Fix the RNG for reproducible replies                           |
-| `--max-tokens`             | 512                      | Max new tokens per reply. Lower = faster                       |
-| `--max-context`            | model's `context_length` | Context window for prompt + reply, in tokens                   |
-| `--prompt`                 | —                        | One-shot mode: ask a question and get one reply, then exit     |
-| `--prompt-raw`             | —                        | Send prompt as-is without wrapping it in a chat template       |
-| `--show-think`             | off                      | Print `<think>` reasoning instead of hiding it                 |
-| `--gpu` / `--gpu-layers N` | cpu                      | Load all layers on GPU, or the first N layers                  |
-| `--pin-weights`            | off                      | Read weights into RAM at load instead of mmap. Caution: on a 16 GB box pinning a 27B (5.9 GB + 1.25 GiB KV) died silently — leave off for large models |
-| `--service`                | —                        | Run as the line-JSON stdio service that `hearth-ui` drives     |
-| `--dump-info`              | —                        | Print the GGUF metadata and layer-0 tensor dtypes, then exit   |
-| `--kv-f32`                 | —                        | Accepted for compatibility; F32 is the only KV backend today   |
-| `-h`, `--help`             | —                        | Usage                                                          |
-
-#### Environment variables
-
-| Variable              | Default                                        | What it does                                                                                       |
-| --------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `HEARTH_MODELS_DIR`   | repo `models/`, else `%APPDATA%\hearth\models` | Model folder used by the UI dropdown and by `.gguf` resolution                                     |
-| `HEARTH_CTX_CAP`      | model's `context_length`                       | Upper bound on the KV cache / context window, in tokens                                            |
-| `HEARTH_THREADS`      | ~3/4 of logical cores                          | Worker count for the 27B `qwen35` path (Bonsai models use n/2)                                     |
-| `HEARTH_PIN_WEIGHTS`  | off                                            | `=1` is the same as `--pin-weights`                                                                |
-| `HEARTH_DUMP_TENSORS` | —                                              | Write layer-0 activations as `<prefix><tensor>.f32` for diffing against a reference implementation |
-| `HEARTH_MODEL_CATALOG_JSON` | built-in catalog                          | JSON array overriding the UI downloader catalog (`{filename, url, ...}` per entry)                   |
-| `HEARTH_DL_ALLOW_HTTP` | off                                           | `=1` permits plain-http custom download URLs (https only by default)                                 |
-| `HEARTH_NO_AUTO_SHUTDOWN` | off                                        | `=1` keeps `hearth-ui` up with no tabs open (default: exits ~25 s after the last tab closes)         |
+| Variable | Default | What it does |
+| -------- | ------- | ------------ |
+| `HEARTH_MODELS_DIR` | repo `models/` | Model folder for UI + CLI resolution |
+| `HEARTH_CTX_CAP` / `HEARTH_THREADS` | model's length / ~3/4 cores | KV cap, worker count |
+| `HEARTH_MODEL_CATALOG_JSON` / `HEARTH_DL_ALLOW_HTTP` / `HEARTH_NO_AUTO_SHUTDOWN` | built-in / off / off | Catalog override, http mirrors, keep UI up |
 
 ## Architecture
 
 ```
-hearth-chat-cli
-  └─ hearth-llm         ← inference engine, forward pass, thread pool
-       ├─ hearth-core    ← shared types (Model, PipelineRequest)
-       ├─ hearth-gguf    ← zero-copy mmap GGUF parser
-       ├─ hearth-quant   ← AVX2 dot-product kernels (Q1/Q2/Q8/...)
-       ├─ hearth-tokenizer ← BPE tokenizer, chat templates
-       ├─ hearth-sampler ← temp, top-k, top-p, min-p, rep-pen
-       └─ hearth-compute ← GPU stubs (type-compat only)
-
-hearth-ui               ← web chat + model downloader (drives hearth-chat-cli --service)
-hearth-tls              ← hand-rolled SHA-256/HMAC/HKDF for the future TLS transport (zero deps)
-hearth-diffusion        ← experimental image model (unfinished)
+hearth-chat-cli ─ hearth-llm (inference engine, forward pass, thread pool)
+                   ├─ hearth-core · hearth-gguf · hearth-quant
+                   ├─ hearth-tokenizer · hearth-sampler · hearth-compute (GPU stubs)
+hearth-ui (web chat + downloader, drives hearth-chat-cli --service)
+hearth-tls (hand-rolled TLS track) · hearth-diffusion (experimental images)
 ```
 
-
-Each crate is self-contained — you can use `hearth-gguf` to parse GGUF files, `hearth-quant` for quantized dot products, or `hearth-tokenizer` for tokenization independently of the full engine.
-
-### How the Thread Pool Works
-
-Hearth replaces Rayon with a custom `ThreadPool` (`crates/hearth-llm/src/pool.rs`):
-
-1. **Startup**: N-1 OS threads are spawned (one core reserved for main thread). Workers spin-wait on a generation counter — zero syscalls per dispatch.
-2. **Dispatch**: Matmul calls write a `WorkParams` struct (8× `usize` + function pointer + `tile_size`) to a pre-allocated shared buffer. Zero allocation per call.
-3. **Signal**: Main thread increments an atomic generation counter. Workers see the change via `Acquire` load and latch the new params.
-4. **Execute**: Each worker processes its static chunk of rows in L2-sized tiles. No work-stealing — matmul rows are perfectly balanced.
-5. **Sync**: Main thread spin-waits on per-worker done flags. Workers spin-loop with occasional `yield_now()` to avoid starving the main thread.
-
-Results: 5.93× parallel scaling on 8 cores vs Rayon's 3.26× and OpenMP's 4.38×.
-
-### AVX2 Kernel Design
-
-The Q1_0 kernel (`hearth-quant/src/q1_0g128.rs`) uses a 2KB lookup table to expand 1-bit weight signs to 8-element `i8` vectors, avoiding branches in the hot path:
-
-```
-For each 128-element block:
-  ┌─ Weight scale (f16)
-  └─ 16 bytes of packed sign bits
-      ├─ LUT lookup: byte → [±1, ±1, ..., ±1] × 8
-      ├─ vpmovsxbw: activation i8 → i16
-      ├─ vpmaddwd: i16 × i16 → i32 (8 lanes)
-      ├─ vcvtdq2ps + vfmadd213ps: f32 accumulate across sub-blocks
-      └─ Single vhaddps chain at end of row
-```
-
-The Q2_0 kernel is similar but uses 2-bit LUT entries (-1, 0, +1, +2). Both kernels accumulate all blocks within a row via `_mm256_fmadd_ps` before a single horizontal sum.
+Each crate builds standalone (`hearth-gguf`, `hearth-quant`, `hearth-tokenizer`
+are reusable on their own). The pool dispatches matmuls with zero syscalls and
+static L2-tiled partitioning (5.93× on 8 cores); the Q1_0 kernel expands 1-bit
+signs through a 2 KB LUT into AVX2 FMA accumulation with a single horizontal
+sum per row. Details: [`docs/`](docs/).
 
 ## License
 
-MIT or Apache-2.0, at your option.
+MIT or Apache-2.0, at your option — see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
