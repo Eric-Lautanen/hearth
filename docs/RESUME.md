@@ -1,38 +1,31 @@
 # Hearth — next session
 
-> **Session 2026-10-16 (pt 3, continued) in one paragraph.** The decision half now exists at the level of
-> its *primitives*: `rsa.rs` gained PKCS#1 v1.5 (`sha256WithRSAEncryption` — the scheme TLS 1.3 removed
-> from the handshake and every CA still signs with), and a new `verify.rs` holds which scheme may verify
-> which key (`Suite`), the errors they fail with (`VerifyError`), and the two dispatches
-> (`verify_certificate_signature`, `verify_handshake_signature`). The asymmetry is enforced by shape, not
-> by comment: the handshake entry accepts only `0x0804` and `0x0403`, the certificate entry additionally
-> accepts PKCS#1 v1.5, and the PKCS#1 `DigestInfo` is checked **structurally** — every byte accounted for
-> by position, nothing after it — because Bleichenbacher's attack needs a verifier that searches for the
-> `DigestInfo` and accepts what surrounds it. That path is now proven on RFC 8448's own CertificateVerify,
-> which verifies through the dispatch under the scheme byte read out of the trace and is refused under
-> `0x0401` with the same key and bytes. **177 checks green on the hardware path and on
-> `HEARTH_TLS_NO_HW=1`** (169 before), clippy `--all-targets -D warnings`, fmt, `cargo doc` (zero
-> warnings) and `cargo check --workspace --all-targets` all clean, `std`-only, empty `[dependencies]`,
-> still unreachable from any `https://` path (`grep` finds the crate name nowhere outside itself). The
-> session's real find was **a fixture that shared a key**: verifying `SELF_SIGNED_PSS` with the root's key
-> returned `Ok(())`, because the generator had built it with `root_key` — so "verified with the wrong
-> identity fails" was not a check the fixture set could make. Each fixture now has its own key. The lesson
-> is the same one the previous slice recorded: an assertion that holds for a reason unrelated to the
-> property it names. History and the full test list: `docs/BUG_TRACKER.md`.
+> **Session 2026-10-16 (pt 4, continued) in one paragraph.** Chain building exists. `chain.rs` takes the
+> four fields a verifier is handed — `certificate_list`, the caller's trust anchors, the validation
+> instant, a `Policy` — and answers whether the path frames, parses, respects its structural rules, is
+> signed by the next certificate's key at every link, and ends at an anchor's key. Structure is checked
+> before links, so a chain of the wrong shape is refused before any public-key operation runs on hostile
+> input, and a **name match alone anchors nothing**: the key must verify. That last claim is provable
+> rather than asserted, because a new fixture (`ROOT_SHADOW`) is a self-signed CA that carries the root's
+> *subject name* with a different key — without it, the path a name-only matcher accepts had no negative
+> test, which is the same pattern as the shared-key defect of slice 9, one level up. `client.rs`'s
+> certificate framing now calls the same entry walk the verifier uses, so the rule exists once. What is
+> still missing is the last check before a `https://` URL can use any of this: **host name matching**,
+> plus the two certificate rules that need their own failure fixtures (`pathLenConstraint`,
+> `keyUsage.keyCertSign`) and the fact that there is **no revocation checking of any kind**. **195
+> checks green on the hardware path and on `HEARTH_TLS_NO_HW=1`** (177 before), clippy
+> `--all-targets -D warnings`, fmt, `cargo doc` (zero warnings) and the workspace check clean, `std`-only,
+> empty `[dependencies]`, still unreachable from any `https://` path. History: `docs/BUG_TRACKER.md`.
 
 ## Next session — in this order
 
-1. **Certificate verification — the *decision*, which is still the only thing standing between this
-   crate and an `https://` URL.** Every ingredient exists, and as of this session so does key-to-scheme
-   matching: a certificate parses (`x509.rs`), every suite verifies (`rsa.rs` for both RSA suites —
-   PKCS#1 v1.5 included, since that is what certificates are signed with — and `ecdsa.rs` for
-   `ecdsa_secp256r1_sha256`, each pinned to vectors from an independent implementation), and `verify.rs`
-   decides *which scheme may verify which key*, for a certificate link and for a `CertificateVerify`.
-   What does not exist is anything that decides whether a chain is *trustworthy*. That decision is the
-   dangerous half and the next session's main line of work. **Note the shape of it as it now stands:**
-   the pieces are wired to nothing — `verify.rs` is reachable only from its own tests and this crate
-   ships no way to call it — so the work is plumbing plus policy rather than new cryptography, in this
-   order: chain building to a pinned root, then hostname matching, then the validity window.
+1. **Certificate verification — one check short of a decision.** A certificate parses (`x509.rs`), every
+   suite verifies (`rsa.rs`, `ecdsa.rs`), `verify.rs` decides which scheme may verify which key, and
+   `chain.rs` builds the path from the wire bytes to a caller-supplied anchor with the structural rules
+   and the validity window. **What is missing is host name matching**, which is now the single check
+   standing between this crate and an `https://` URL — a chain that verifies today may still be for the
+   wrong server. The pieces are also still wired to nothing: nothing in this crate calls `chain.rs`, and
+   `RejectAll` remains the only `CertificateVerifier`.
    - The seam is unchanged and is the only place to plug in: `client::CertificateVerifier`, called with
      `CertificateVerifyInput { server_name, certificate_list, signature_scheme, signature,
      signed_data }`, where `signed_data` is already the RFC 8446 §4.4.3 construction (64 spaces,
@@ -58,16 +51,23 @@
         `verify_handshake_signature` — which accepts only the two schemes RFC 8446 kept, so a peer
         cannot get PKCS#1 v1.5 accepted as a handshake signature. The suite constants are
         `handshake::SIG_RSA_PSS_RSAE_SHA256` and `handshake::SIG_ECDSA_SECP256R1_SHA256`.
-     2. **Chain building to a pinned root**, linking issuers to subjects by the raw DER of the names
-        (never by parsed strings), rejecting anything that is not CA (`basicConstraints`), rejecting
-        a CA used as a leaf, capping chain length, and enforcing a minimum RSA key size — remember
-        `rsa.rs` deliberately accepts a 1024-bit key because RFC 8448's fixture is one, so that policy
-        lives here and not there.
+     2. **Chain building to a pinned root — done, in `chain.rs`.** Links are compared as the raw DER of
+        the names (never as parsed strings), every issuer must be a CA (`basicConstraints`) and the leaf
+        must not be, chain length is capped by `Policy::max_chain_len`, and a minimum RSA key size is
+        enforced on every certificate in the path *and* on the anchor — `rsa.rs` deliberately accepts a
+        1024-bit key because RFC 8448's fixture is one, so that policy lives here and not there. **What
+        is deliberately not in it yet**: `pathLenConstraint` and `keyUsage.keyCertSign`, each of which
+        needs a fixture that can make it fail — a CA with `path_len = 0` that has another CA below it,
+        and a CA whose `keyUsage` lacks `keyCertSign` (both need a child certificate to test the link,
+        so two fixtures each). Also absent: revocation of any kind, and `extendedKeyUsage` on issuers.
      3. **Hostname matching** — exact or case-insensitive `dNSName` match against `server_name`, no
         wildcard surprises (if wildcards ship at all, one leading label only, and the prefix must not
         be empty or match a public suffix).
-     4. **The validity window** against the `UnixTime` from `ClientConfig`, and `keyUsage` /
-        `extendedKeyUsage` sanity (`serverAuth`).
+     4. **The validity window — done, in `chain.rs`**, and checked on every certificate in the path and
+        on the anchor, inclusively at both ends, against the `UnixTime` the handshake already carries.
+        Still to do: `keyUsage` / `extendedKeyUsage` sanity on the *leaf* (`serverAuth`), plus the two
+        revert-check-less call sites named above (the anchor's window and its key size have no negative
+        test because no fixture anchor can fail them while the chain is valid).
    - **The root store is a decision to make explicitly, not to drift into.** `std` has no way to read
      the OS trust store on all three platforms, so the choice is a small pinned set in-tree with
      fingerprints and a documented update path, versus a per-platform reader. Pick the pinned set, say

@@ -21,6 +21,13 @@ fails" was not a check the fixture set could make — it passed for the wrong re
 Seeds are allocated one per identity for that reason; do not alias one key into two
 certificates.
 
+**`ROOT_SHADOW` exists to make one specific check possible.** It is a self-signed
+CA with the *same subject name* as `ROOT` and a different key, which is the only
+way to test that a chain builder anchors on a key rather than on a name: a chain
+whose top certificate was signed by `ROOT` must be refused when `ROOT_SHADOW` is
+the only anchor, because the name matches and the signature does not. Without it,
+that path — the one a name-only matcher would accept — has no negative test.
+
 Every field the test asserts is read out of the certificate, so a regenerated file
 is equivalent, not just similar: regenerating and swapping the file in was measured
 to keep all twelve fixture tests green, including the ECDSA one whose `der_len`
@@ -170,6 +177,10 @@ def main():
     # self-signed certificate sharing another fixture's key makes the
     # "right scheme, wrong identity" check untestable.
     pss_key = rsa_key(20261020)
+    # A second CA with the *same subject name* as the root and its own key: see the
+    # note in the module docstring. Nothing is issued by it, which is the point —
+    # it exists to be an anchor whose name matches and whose key does not.
+    shadow_root_key = rsa_key(20261021)
 
     def name(common):
         return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common)])
@@ -289,6 +300,34 @@ def main():
         .sign(intermediate_key, hashes.SHA256())
     )
 
+    # The same subject name as the root, a different key, and self-signed: an
+    # anchor that matches the root by name and not by key.
+    root_shadow = (
+        x509.CertificateBuilder()
+        .subject_name(root.subject)
+        .issuer_name(root.subject)
+        .public_key(shadow_root_key.public_key())
+        .serial_number(0x07)
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=1), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(shadow_root_key, hashes.SHA256())
+    )
+
     # A self-signed RSA certificate whose *signature* is RSASSA-PSS, so the
     # `AlgorithmIdentifier` carries hash, MGF and salt parameters rather than
     # being an OID with no parameters at all.
@@ -351,6 +390,7 @@ def main():
         ("SELF_SIGNED_PSS", self_signed_pss),
         ("SELF_SIGNED_EC", self_signed_ec),
         ("LEAF_UNKNOWN_CRITICAL", leaf_unknown_critical),
+        ("ROOT_SHADOW", root_shadow),
     ]
 
     # `//` rather than `//!`: this file is pulled in with `include!`, so an inner

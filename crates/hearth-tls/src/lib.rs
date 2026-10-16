@@ -117,6 +117,7 @@ pub(crate) fn hardware_disabled() -> bool {
 }
 
 pub mod aes;
+pub mod chain;
 pub mod client;
 pub mod der;
 pub mod ecdsa;
@@ -140,6 +141,7 @@ pub(crate) mod aesni;
 pub(crate) mod ghash_x86;
 
 pub use aes::Aes128;
+pub use chain::{verify_certificate_list, verify_chain, ChainError, Policy, Position};
 pub use client::{
     CertificateVerifier, CertificateVerifyInput, ClientConfig, ClientError, ClientHandshake, Out,
     RejectAll, UnixTime,

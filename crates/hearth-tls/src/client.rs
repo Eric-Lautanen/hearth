@@ -1143,28 +1143,22 @@ fn parse_certificate(body: &[u8]) -> Result<Vec<u8>, ClientError> {
         return Err(ClientError::EmptyCertificateChain);
     }
     // Every entry is `opaque certificate<1..2^24-1>`, so a lone three-byte
-    // header with no DER behind it is not an entry.
-    let mut rest = list;
-    let mut entries = 0usize;
-    while !rest.is_empty() {
-        if rest.len() < 3 {
-            return Err(ClientError::Malformed(
-                "certificate_list ends inside an entry's length",
-            ));
-        }
-        let entry_len = u32::from_be_bytes([0, rest[0], rest[1], rest[2]]) as usize;
-        if rest.len() < 3 + entry_len || entry_len == 0 {
-            return Err(ClientError::Malformed(
-                "certificate_list entry is malformed",
-            ));
-        }
-        rest = &rest[3 + entry_len..];
-        entries += 1;
+    // header with no DER behind it is not an entry. The walk is `chain.rs`'s,
+    // because the verifier applies the same rule to the same bytes and two copies
+    // of a framing rule are two chances to disagree.
+    match crate::chain::split_entries(list) {
+        Ok(_) => Ok(list.to_vec()),
+        Err(crate::chain::ListError::Empty) => Err(ClientError::EmptyCertificateChain),
+        Err(crate::chain::ListError::EndsInsideLength { .. }) => Err(ClientError::Malformed(
+            "certificate_list ends inside an entry's length",
+        )),
+        Err(crate::chain::ListError::ZeroLengthEntry { .. }) => Err(ClientError::Malformed(
+            "certificate_list entry is malformed",
+        )),
+        Err(crate::chain::ListError::TruncatedEntry { .. }) => Err(ClientError::Malformed(
+            "certificate_list entry is malformed",
+        )),
     }
-    if entries == 0 {
-        return Err(ClientError::EmptyCertificateChain);
-    }
-    Ok(list.to_vec())
 }
 
 #[cfg(test)]

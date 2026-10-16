@@ -23,9 +23,19 @@
 //!   octet and positive in two);
 //! - `basicConstraints` with a path length and without, and a certificate with no
 //!   extensions at all.
+//!
+//! The same certificates are the paths the chain tests at the end of this file
+//! build: a real root, a real intermediate and two real leaves. They cover all
+//! three signature suites *as links*, both validity bounds exactly, and every
+//! structural rule with its own negative, which is why the chain suite lives here
+//! rather than in a file of its own — a second test binary would have to redefine
+//! the `Expectation` type the generated table is written in.
 
 use hearth_tls::ecdsa::{verify_ecdsa_secp256r1_sha256, EcdsaError};
-use hearth_tls::{verify_certificate_signature, Suite, VerifyError};
+use hearth_tls::{
+    verify_certificate_list, verify_certificate_signature, verify_chain, ChainError, Policy,
+    Position, Suite, UnixTime, VerifyError,
+};
 use hearth_tls::{
     Certificate, Der, GeneralName, KeyUsage, PublicKey, SignatureAlgorithm, Tag, X509Error,
 };
@@ -91,6 +101,7 @@ fn der_hex(label: &str) -> &'static str {
         "SELF_SIGNED_PSS" => SELF_SIGNED_PSS_DER_HEX,
         "SELF_SIGNED_EC" => SELF_SIGNED_EC_DER_HEX,
         "LEAF_UNKNOWN_CRITICAL" => LEAF_UNKNOWN_CRITICAL_DER_HEX,
+        "ROOT_SHADOW" => ROOT_SHADOW_DER_HEX,
         other => panic!("no fixture named {other}"),
     }
 }
@@ -466,7 +477,7 @@ fn every_fixtures_signature_verifies_with_the_key_of_its_issuer() {
     // The chain, link by link, checked in the only way that means anything: the
     // signature on each certificate verified with the public key of the
     // certificate that issued it — over the `tbsCertificate` bytes that were read,
-    // with the suite the certificate names. Six fixtures and three suites: five
+    // with the suite the certificate names. Seven fixtures and three suites: six
     // PKCS#1 v1.5 (the scheme TLS 1.3 removed from the handshake and which every
     // certificate still uses), one RSA-PSS, one ECDSA.
     //
@@ -480,9 +491,12 @@ fn every_fixtures_signature_verifies_with_the_key_of_its_issuer() {
         "LEAF_EC",
         "SELF_SIGNED_PSS",
         "SELF_SIGNED_EC",
+        "ROOT_SHADOW",
     ];
-    // Which fixture issued which, by index into `labels`.
-    let issued_by = [(0, 0), (1, 0), (2, 1), (3, 1), (4, 4), (5, 5)];
+    // Which fixture issued which, by index into `labels`. `ROOT_SHADOW` is
+    // self-signed like the root, and carries the root's subject name with a key of
+    // its own — that is what makes "a name match is not trust" testable.
+    let issued_by = [(0, 0), (1, 0), (2, 1), (3, 1), (4, 4), (5, 5), (6, 6)];
     let ders: Vec<Vec<u8>> = labels.iter().map(|label| hex(der_hex(label))).collect();
     let certificates = certificates_of(&ders);
 
@@ -604,4 +618,423 @@ fn a_scheme_and_a_key_that_cannot_go_together_are_refused() {
         Suite::from_certificate_algorithm(pss.signature_algorithm()),
         Ok(Suite::RsaPssSha256)
     );
+}
+
+/// The DER of one fixture, by label.
+fn fixture(label: &str) -> Vec<u8> {
+    hex(der_hex(label))
+}
+
+/// Frames DERs as a `certificate_list`, the way a `Certificate` message carries
+/// them: three bytes of length, then exactly that much DER, for each entry.
+fn certificate_list(ders: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for der in ders {
+        out.extend_from_slice(&(der.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(der);
+    }
+    out
+}
+
+/// The instant `delta` seconds after `secs`, for the boundary cases.
+fn plus(secs: i64, delta: i64) -> UnixTime {
+    UnixTime::from_secs(secs + delta)
+}
+
+/// The DER buffers of the named fixtures, as an owned `Vec` a caller binds so
+/// that `certificates_of` can hand back certificates that borrow it.
+fn ders_for(labels: &[&str]) -> Vec<Vec<u8>> {
+    labels.iter().map(|label| fixture(label)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Chain building, over the same certificates
+//
+// Two call sites in `chain.rs` have no negative test here, and that is a fixture
+// limitation rather than a decision: the *anchor's* validity window and the
+// *anchor's* key size are checked by the same two functions the chain elements
+// use (both negatively tested below), but every fixture anchor is inside its
+// window and at least 2048 bits at any instant the presented chain is still
+// valid, so nothing can reach the anchor check with either failing. The fixtures
+// that would make them reachable — an anchor whose window ends before the leaf's
+// begins, and a 1024-bit anchor — are named in `docs/RESUME.md`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_fixture_chain_verifies_from_the_leaf_to_the_root() {
+    let chain_ders = [fixture("LEAF_RSA"), fixture("INTERMEDIATE")];
+    let anchor_ders = [fixture("ROOT")];
+    let chain = certificates_of(&chain_ders);
+    let anchors = certificates_of(&anchor_ders);
+    // The leaf's own lower bound is inside the intermediate's window and the
+    // root's as well, which the assertions below require by verifying the whole
+    // path at that instant rather than at a transcribed date.
+    let time = chain[0].not_before();
+
+    assert_eq!(
+        verify_chain(&chain, &anchors, time, &Policy::default()),
+        Ok(()),
+        "leaf -> intermediate -> root"
+    );
+
+    // The same path with the root included in the presented chain: a server may
+    // send it, and the anchor is then the last certificate rather than the one
+    // outside it.
+    let with_root_ders = [
+        fixture("LEAF_RSA"),
+        fixture("INTERMEDIATE"),
+        fixture("ROOT"),
+    ];
+    let with_root = certificates_of(&with_root_ders);
+    assert_eq!(
+        verify_chain(&with_root, &anchors, time, &Policy::default()),
+        Ok(())
+    );
+
+    // And an anchor need not be a root: pinning the intermediate is a legitimate
+    // thing for a caller to do, and the path is then one certificate long.
+    let leaf_only_ders = [fixture("LEAF_RSA")];
+    let leaf_only = certificates_of(&leaf_only_ders);
+    let intermediate_ders = ders_for(&["INTERMEDIATE"]);
+    let intermediate = certificates_of(&intermediate_ders);
+    assert_eq!(
+        verify_chain(&leaf_only, &intermediate, time, &Policy::default()),
+        Ok(())
+    );
+}
+
+#[test]
+fn every_suite_verifies_as_a_chain_link() {
+    // The three suites this crate implements, each as a *link* rather than as a
+    // bare signature. PKCS#1 v1.5 is what `sha256WithRSAEncryption` gives, and it
+    // is what both links of the chain above are signed with; RSA-PSS and ECDSA are
+    // the two self-signed fixtures, which pin themselves as their own anchors. A
+    // chain builder that handled only one suite would fail the others here.
+    for label in ["SELF_SIGNED_PSS", "SELF_SIGNED_EC"] {
+        let ders = [fixture(label)];
+        let certificate = certificates_of(&ders);
+        let time = certificate[0].not_before();
+        assert_eq!(
+            verify_chain(&certificate, &certificate, time, &Policy::default()),
+            Ok(()),
+            "{label} pinned as its own anchor, verified with its own key"
+        );
+    }
+}
+
+#[test]
+fn the_validity_window_is_inclusive_at_both_ends() {
+    let chain_ders = [fixture("LEAF_RSA"), fixture("INTERMEDIATE")];
+    let anchor_ders = [fixture("ROOT")];
+    let chain = certificates_of(&chain_ders);
+    let anchors = certificates_of(&anchor_ders);
+    let policy = Policy::default();
+    let (not_before, not_after) = (chain[0].not_before().secs, chain[0].not_after().secs);
+    assert!(not_before < not_after, "the fixture has a window at all");
+
+    // Both bounds are inside the window, inclusively — RFC 5280's rule, and the
+    // difference between accepting and refusing a certificate at its own boundary.
+    for secs in [not_before, not_after] {
+        assert_eq!(
+            verify_chain(&chain, &anchors, UnixTime::from_secs(secs), &policy),
+            Ok(()),
+            "{secs} is inside the leaf's window"
+        );
+    }
+    // One second either side is not, and the error says which end was crossed.
+    assert_eq!(
+        verify_chain(&chain, &anchors, plus(not_before, -1), &policy),
+        Err(ChainError::NotYetValid(Position::Chain(0)))
+    );
+    assert_eq!(
+        verify_chain(&chain, &anchors, plus(not_after, 1), &policy),
+        Err(ChainError::Expired(Position::Chain(0)))
+    );
+}
+
+#[test]
+fn an_issuers_expired_window_is_fatal_even_when_the_leaf_is_valid() {
+    // The EC leaf is valid from 2050, ten years after the intermediate that signed
+    // it stopped being valid, so the two windows do not overlap at all. That makes
+    // one property checkable that no single certificate can show: an issuer's own
+    // window is enforced, and the refusal names the issuer rather than the leaf.
+    let chain_ders = [fixture("LEAF_EC"), fixture("INTERMEDIATE")];
+    let anchor_ders = [fixture("ROOT")];
+    let chain = certificates_of(&chain_ders);
+    let anchors = certificates_of(&anchor_ders);
+    let leaf_start = chain[0].not_before();
+    assert!(
+        leaf_start > chain[1].not_after(),
+        "the fixture's overlap is empty, which is the case being asserted"
+    );
+
+    assert_eq!(
+        verify_chain(&chain, &anchors, leaf_start, &Policy::default()),
+        Err(ChainError::Expired(Position::Chain(1))),
+        "the leaf is valid at this instant and its issuer is not"
+    );
+}
+
+#[test]
+fn a_leaf_that_claims_to_be_a_ca_is_refused() {
+    // `INTERMEDIATE` is a CA certificate, so presenting it as the server's own is
+    // exactly the confusion this refuses. Nothing else about it is wrong: it is
+    // valid, its key is the right size, and it anchors in the root.
+    let chain_ders = [fixture("INTERMEDIATE")];
+    let anchor_ders = [fixture("ROOT")];
+    let chain = certificates_of(&chain_ders);
+    let anchors = certificates_of(&anchor_ders);
+
+    assert_eq!(
+        verify_chain(&chain, &anchors, chain[0].not_before(), &Policy::default()),
+        Err(ChainError::CaUsedAsLeaf)
+    );
+}
+
+#[test]
+fn an_issuer_that_is_not_a_ca_is_refused() {
+    // A leaf certificate has no business signing another certificate, whatever its
+    // name says. `LEAF_EC` is not a CA, so a chain that puts it in an issuer
+    // position is refused for that, before any name is compared.
+    let chain_ders = [fixture("LEAF_RSA"), fixture("LEAF_EC")];
+    let chain = certificates_of(&chain_ders);
+    let anchor_ders = ders_for(&["ROOT"]);
+    let anchors = certificates_of(&anchor_ders);
+
+    assert_eq!(
+        verify_chain(&chain, &anchors, chain[0].not_before(), &Policy::default()),
+        Err(ChainError::NotACa(Position::Chain(1)))
+    );
+}
+
+#[test]
+fn a_chain_that_omits_its_intermediate_is_broken() {
+    // The common server mistake: send the leaf and the root and leave out the
+    // intermediate. The root is a CA, so the only thing wrong is the link, and the
+    // refusal says which one.
+    let chain_ders = [fixture("LEAF_RSA"), fixture("ROOT")];
+    let chain = certificates_of(&chain_ders);
+    let anchor_ders = ders_for(&["ROOT"]);
+    let anchors = certificates_of(&anchor_ders);
+
+    assert_eq!(
+        verify_chain(&chain, &anchors, chain[0].not_before(), &Policy::default()),
+        Err(ChainError::BrokenLink { index: 0 })
+    );
+}
+
+#[test]
+fn a_path_that_reaches_no_anchor_is_refused() {
+    // Everything about this path is fine except that its top certificate was
+    // signed by a root the caller does not trust. The refusal carries the DER of
+    // the name that could not be resolved, so a diagnostic can say which anchor is
+    // missing.
+    let chain_ders = [fixture("LEAF_RSA"), fixture("INTERMEDIATE")];
+    let anchor_ders = [fixture("SELF_SIGNED_EC")];
+    let chain = certificates_of(&chain_ders);
+    let anchors = certificates_of(&anchor_ders);
+    let root_ders = ders_for(&["ROOT"]);
+    let root = certificates_of(&root_ders);
+
+    assert_eq!(
+        verify_chain(&chain, &anchors, chain[0].not_before(), &Policy::default()),
+        Err(ChainError::Unanchored {
+            issuer: root[0].subject().as_der().to_vec()
+        })
+    );
+}
+
+#[test]
+fn the_policy_caps_the_length_and_the_key_size() {
+    let chain_ders = [fixture("LEAF_RSA"), fixture("INTERMEDIATE")];
+    let anchor_ders = [fixture("ROOT")];
+    let chain = certificates_of(&chain_ders);
+    let anchors = certificates_of(&anchor_ders);
+    let time = chain[0].not_before();
+
+    // A cap of one certificate refuses a two-certificate chain, and says both
+    // numbers.
+    let capped = Policy {
+        max_chain_len: 1,
+        ..Policy::default()
+    };
+    assert_eq!(
+        verify_chain(&chain, &anchors, time, &capped),
+        Err(ChainError::ChainTooLong { len: 2, max: 1 })
+    );
+
+    // The key-size floor applies to the *leaf's* key, not only to issuers': a leaf
+    // whose key is weaker than the policy allows is refused even though its own
+    // signature is fine.
+    let strict = Policy {
+        min_rsa_bits: 4096,
+        ..Policy::default()
+    };
+    let leaf_only_ders = ders_for(&["LEAF_RSA"]);
+    let leaf_only = certificates_of(&leaf_only_ders);
+    let intermediate_ders = ders_for(&["INTERMEDIATE"]);
+    let intermediate = certificates_of(&intermediate_ders);
+    assert_eq!(
+        verify_chain(&leaf_only, &intermediate, time, &strict),
+        Err(ChainError::KeyTooSmall {
+            at: Position::Chain(0),
+            bits: 2048,
+            min_bits: 4096,
+        })
+    );
+    // The default policy is inside every fixture's key size, which is what lets
+    // the tests above run at all.
+    assert_eq!(
+        verify_chain(&chain, &anchors, time, &Policy::default()),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_certificate_that_does_not_parse_stops_the_chain() {
+    // Through the whole wire path: framing, then parsing, then the chain. The
+    // fixture is the one with an unknown **critical** extension, which RFC 5280
+    // §4.2 requires a reader to treat as fatal, and it fails before any structure
+    // is considered.
+    let list = certificate_list(&[fixture("LEAF_UNKNOWN_CRITICAL")]);
+    let anchor_ders = ders_for(&["ROOT"]);
+    let anchors = certificates_of(&anchor_ders);
+
+    match verify_certificate_list(&list, &anchors, UnixTime::from_secs(0), &Policy::default()) {
+        Err(ChainError::Certificate { index, error }) => {
+            assert_eq!(index, 0);
+            assert!(
+                matches!(error, X509Error::UnsupportedCriticalExtension(..)),
+                "the fixture's defect is the critical extension, got {error:?}"
+            );
+        }
+        other => panic!("expected a parse failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_name_match_alone_does_not_anchor_a_chain() {
+    // `ROOT_SHADOW` is a self-signed CA carrying the *root's subject name* with a
+    // key of its own, which is the only way to make this checkable. The chain's top
+    // certificate was signed by the root, so an anchor matched by name alone would
+    // accept it; the key check is what refuses it. This is the case the module docs
+    // call out, and the one a name-only matcher would have got wrong.
+    let chain_ders = [fixture("LEAF_RSA"), fixture("INTERMEDIATE")];
+    let shadow_ders = [fixture("ROOT_SHADOW")];
+    let chain = certificates_of(&chain_ders);
+    let shadow = certificates_of(&shadow_ders);
+    let root_ders = ders_for(&["ROOT"]);
+    let root = certificates_of(&root_ders);
+
+    // The names really are the same and the keys really are not, so the refusal
+    // below cannot be about the name.
+    assert_eq!(shadow[0].subject().as_der(), root[0].subject().as_der());
+    assert_ne!(shadow[0].public_key(), root[0].public_key());
+
+    let time = chain[0].not_before();
+    let refused = verify_chain(&chain, &shadow, time, &Policy::default());
+    assert!(
+        matches!(
+            refused,
+            Err(ChainError::Signature {
+                certificate: Position::Chain(1),
+                ..
+            })
+        ),
+        "the anchor's name matches and its key does not: {refused:?}"
+    );
+
+    // A candidate that fails does not end the search: with both anchors present the
+    // real one is found, in the order they were given.
+    let both_ders = ders_for(&["ROOT_SHADOW", "ROOT"]);
+    let both = certificates_of(&both_ders);
+    assert_eq!(
+        verify_chain(&chain, &both, time, &Policy::default()),
+        Ok(())
+    );
+}
+
+#[test]
+fn the_wire_path_frames_before_it_verifies_anything() {
+    let leaf = fixture("LEAF_RSA");
+    let intermediate = fixture("INTERMEDIATE");
+    let (leaf_len, intermediate_len) = (leaf.len(), intermediate.len());
+    let anchor_ders = [fixture("ROOT")];
+    let anchors = certificates_of(&anchor_ders);
+    let leaf_ders = [leaf.clone()];
+    let time = certificates_of(&leaf_ders)[0].not_before();
+    let policy = Policy::default();
+
+    // A list that frames correctly verifies, so the negatives below are about the
+    // framing rather than about a chain that was wrong anyway.
+    let good_list = certificate_list(&[leaf.clone(), intermediate]);
+    assert_eq!(
+        verify_certificate_list(&good_list, &anchors, time, &policy),
+        Ok(())
+    );
+
+    // Nothing at all is not a chain.
+    assert_eq!(
+        verify_certificate_list(&[], &anchors, time, &policy),
+        Err(ChainError::EmptyList)
+    );
+    // Dropping the list's final byte truncates the *last entry's body* — the
+    // prefix is intact and still claims the full length — so the refusal names
+    // that entry's offset rather than the tail.
+    let short_body = &good_list[..good_list.len() - 1];
+    assert_eq!(
+        verify_certificate_list(short_body, &anchors, time, &policy),
+        Err(ChainError::TruncatedEntry {
+            offset: 3 + leaf_len,
+            declared: intermediate_len,
+            remaining: intermediate_len - 1,
+        })
+    );
+    // Cutting two bytes past the first entry leaves too little for the second
+    // entry's length prefix, which is the other failure: the list ends *inside* a
+    // length.
+    let inside_prefix = &good_list[..3 + leaf_len + 2];
+    assert_eq!(
+        verify_certificate_list(inside_prefix, &anchors, time, &policy),
+        Err(ChainError::EndsInsideLength { remaining: 2 })
+    );
+    // An entry that declares more bytes than are there, as the single entry of a
+    // one-certificate list.
+    let one_leaf = std::slice::from_ref(&leaf);
+    let mut truncated_entry = certificate_list(one_leaf);
+    truncated_entry.pop();
+    assert_eq!(
+        verify_certificate_list(&truncated_entry, &anchors, time, &policy),
+        Err(ChainError::TruncatedEntry {
+            offset: 0,
+            declared: leaf_len,
+            remaining: leaf_len - 1,
+        })
+    );
+    // An entry that declares a length of zero, which RFC 8446's
+    // `certificate<1..2^24-1>` does not allow.
+    let zero_length = [0x00, 0x00, 0x00];
+    assert_eq!(
+        verify_certificate_list(&zero_length, &anchors, time, &policy),
+        Err(ChainError::ZeroLengthEntry { offset: 0 })
+    );
+    // One good entry followed by a bad one, so the offset in the refusal is not
+    // the zero that a bug could report for everything.
+    let mut second_bad = certificate_list(one_leaf);
+    second_bad.extend_from_slice(&[0x00, 0x00, 0x09, 0x01]);
+    assert_eq!(
+        verify_certificate_list(&second_bad, &anchors, time, &policy),
+        Err(ChainError::TruncatedEntry {
+            offset: leaf_len + 3,
+            declared: 9,
+            remaining: 1,
+        })
+    );
+    // And a list whose entry frames but is not a certificate at all: the parse is
+    // what refuses it.
+    let not_a_certificate = certificate_list(&[vec![0x30, 0x03, 0x01, 0x01, 0x00]]);
+    assert!(matches!(
+        verify_certificate_list(&not_a_certificate, &anchors, time, &policy),
+        Err(ChainError::Certificate { index: 0, .. })
+    ));
 }

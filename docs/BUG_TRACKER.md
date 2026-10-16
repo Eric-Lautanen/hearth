@@ -38,6 +38,43 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 10 — chain building, and the fixture a name-only matcher needs (buffy, 2026-10-16)
+
+`chain.rs`: framing, structure, links and anchoring, over the scheme dispatch in `verify.rs`. The
+entry point is `verify_certificate_list(certificate_list, anchors, time, policy)` — exactly the four
+fields a verifier is handed, so a `CertificateVerifier` impl is now a call rather than a project.
+
+- **Structure first, then links, then the anchor**, so a chain of the wrong shape is refused before any
+  public-key operation runs on hostile input.
+- **A name match is not trust, and it is now provable rather than asserted.** `ROOT_SHADOW` is a
+  self-signed CA carrying the root's *subject name* with a different key, so anchoring the fixture chain
+  on it fails with `Signature { certificate: Chain(1) }` — and with both anchors present the real one is
+  found, so a failed candidate does not end the search. That path, the one a name-only matcher would
+  accept, had no negative test until the fixture existed: the same pattern as the shared-key defect in
+  slice 9, one level up.
+- **One framing rule, two callers.** `client.rs`'s `parse_certificate` now calls `chain::split_entries`
+  instead of keeping its own copy of the entry walk, because the verifier applies the same rule to the
+  same bytes and two copies are two chances to disagree. Its existing tests were the check that the
+  extraction changed nothing.
+- **A test expectation that was wrong, kept in the file as a comment**: dropping a list's final byte
+  truncates an *entry body*, so the refusal names that entry's offset — it does not leave a partial
+  length prefix, which needs the list cut one or two bytes past an entry. Both cases are asserted, with
+  offsets derived from the fixture lengths rather than transcribed.
+- Every instant in the chain tests is derived from the certificate under test (`not_before`,
+  `not_after`), so both validity bounds are checked inclusively and exactly, and a regeneration cannot
+  silently move them.
+
+**Deliberately not here:** revocation of any kind (no CRL, OCSP or stapling), host name matching,
+`pathLenConstraint`, `keyUsage.keyCertSign`, and any name-constraint or policy processing. Revocation
+and name matching are the downloader's remaining blockers; the two extension rules need fixtures that
+can make them *fail* and are named in `RESUME.md`. Two call sites in the anchor loop — the anchor's own
+validity window and its key size — have no negative test, because every fixture anchor satisfies both
+whenever the chain is still valid; the functions they call are negatively tested on chain elements.
+
+195 checks green on the hardware path and on `HEARTH_TLS_NO_HW=1` (177 before), fmt, clippy
+`--all-targets -D warnings`, `cargo doc` with zero warnings and `cargo check --workspace --all-targets`
+all clean. Still `std`-only, still `[dependencies]`-empty, still unreachable from any `https://` path.
+
 ### hearth-tls slice 9 — PKCS#1 v1.5, the scheme/key decision, and a fixture that shared a key (buffy, 2026-10-16)
 
 `rsa.rs` gained `sha256WithRSAEncryption` — the one RSA suite this crate lacked and the one nearly
