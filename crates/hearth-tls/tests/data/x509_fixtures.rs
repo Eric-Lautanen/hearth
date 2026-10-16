@@ -337,26 +337,26 @@ const SELF_SIGNED_PSS_DER_HEX: &str = "\
     a00f300d060960864801650304020105 \
     00a11c301a06092a864886f70d010108 \
     300d06096086480165030402010500a2 \
-    0302012003820101002f165349d04600 \
-    f71b3865bb98d1fd3b406f2470f648e2 \
-    ec71966a259be20b0cc1101b942636ab \
-    70b7eb0304db3ab1a5f85e6c6d991169 \
-    1fb26a9eff7431ba300572c96d0148eb \
-    8292e48d630b60083c32b43414660d13 \
-    e54c82abf14efd83bafc2d8d9313b7a1 \
-    cde4966df3b97f8b1ded9c6fde03ac0a \
-    218ee8ea3fa7a41389b2c5dd261ffd6b \
-    5c366861d88a5b41f45460394a1dfef8 \
-    5c459b021ee3a949cbd5331800a74630 \
-    d2f58e7d09a96ced175fb1593f456d4e \
-    1cac99163bf143188b15f40e2b779d27 \
-    9d807e3f3c4ec437584302c753a66bdd \
-    cf5297818adeb57b02ad6ad58e51dd01 \
-    7a08e4224c6a6ba88081ea576723b3a8 \
-    06b684a6b75ce35685";
+    0302012003820101002e7eb8c8abdfbb \
+    0e996bb21921c152d34e09b5b67eae9f \
+    933b97ae2e7f513ea3620f80cc40d0fb \
+    94ab20fe56535d5c6f3c97ad16685c27 \
+    5a5d641c0c9894be6665429658f339e6 \
+    4de9fba53d47751ccee7b19690156505 \
+    41e6e86b8090f35be1c5e5e0ccc6e407 \
+    3dc3bcddab64b84b5681160da7612ff8 \
+    30ea9042d8a5f33360a0bd9661659bb6 \
+    d47d9da79d3136c06dd7850043e60f2b \
+    4c42e8fce0ea275c53c06b45f1921e44 \
+    083e70c17f7529abdaf227994f02c583 \
+    b50a0720d1bd3bd167823ef4260396b2 \
+    3f0ab56b4578ddabf4fcfaacb20db73e \
+    89ffc83db286c25ecbe2a4c5fcd3ad26 \
+    59c4ed4238be7b3ac5b706fbc34c0926 \
+    47df088e55ea16ff38";
 
 const SELF_SIGNED_EC_DER_HEX: &str = "\
-    3082012b3081d3a00302010202010530 \
+    3082012c3081d3a00302010202010530 \
     0a06082a8648ce3d0403023020311e30 \
     1c06035504030c154865617274682054 \
     657374204543205369676e6572301e17 \
@@ -370,11 +370,11 @@ const SELF_SIGNED_EC_DER_HEX: &str = "\
     27fd8842b82a3c83ecdc4bdf6a127b19 \
     a1e45d97156f12892b872beb322d51ae \
     6b74f42964944f0641a3300a06082a86 \
-    48ce3d0403020347003044022100fd69 \
-    caa5bd6104285a0f15c2b8d68343f7ef \
-    4109f6b2df9efe3e8040a27a8aad021f \
-    6aff99bb36f799487a417e4f3492fbd9 \
-    0e597ac9dfa85efb232c861a89fde8";
+    48ce3d0403020348003045022100dbfb \
+    2c776f929923db0b578a2d026ec088da \
+    850e560a81c33d7ba57a56d3d61b0220 \
+    0baaa739770ee6a2ab4ee3458b60ae67 \
+    383c5cdb46083b071ebd03f3eaf14a26";
 
 const LEAF_UNKNOWN_CRITICAL_DER_HEX: &str = "\
     30820300308201e8a003020102020106 \
@@ -870,12 +870,191 @@ const LEAF_SUB_STRICT_DER_HEX: &str = "\
     1545257a58c74df0cb1d8ad75e8b1fea \
     9300eddd63fbb015a95ea8b8cd";
 
+const EXPIRED_ANCHOR_DER_HEX: &str = "\
+    308202eb308201d3a003020102020120 \
+    300d06092a864886f70d01010b050030 \
+    253123302106035504030c1a48656172 \
+    74682054657374204578706972656420 \
+    416e63686f72301e170d313530313031 \
+    3030303030305a170d32303031303130 \
+    30303030305a30253123302106035504 \
+    030c1a48656172746820546573742045 \
+    78706972656420416e63686f72308201 \
+    22300d06092a864886f70d0101010500 \
+    0382010f003082010a0282010100a41b \
+    3b8e5699066a15a1c0f84e44952cb2b8 \
+    4cb2a7c0cd67c0aca9c25f6f22bf9353 \
+    d4924939b8be11ae1bf0b19af486599d \
+    ccada770b503e92d154d3b7301d63914 \
+    fcfce0074630da7592e6cb0a7d954eca \
+    26c1778ffbef44b175d524831884f90f \
+    76fb011fd540327fd787ef4298f1f2a5 \
+    4100594c358cffb849c4a14df9b57d85 \
+    b87c94469ab4ffa7ffd783b1e76768bd \
+    f9a3ad960818d8a21e7d1db84cc24589 \
+    b6ad8d568a266eaece81c27346aae68f \
+    63399f4c04e8140f8cf7401517e22d23 \
+    9e7c4aa745d0fd7b0e82cc6a9c9d85ba \
+    0d81cd69ce4f5422391a1e9355dce868 \
+    4a5ed30ba9151065500c349113fcb7b5 \
+    d7739704737779273bdf0e7bab610203 \
+    010001a326302430120603551d130101 \
+    ff040830060101ff020100300e060355 \
+    1d0f0101ff040403020106300d06092a \
+    864886f70d01010b050003820101000a \
+    f277c2f1cf9087dc04be28b4ad4c1748 \
+    9c9a5421359bdfe13a1d02e3614bc277 \
+    facdbf4ed1b350f537b8faaab778383d \
+    3ad8dd17bdfd288cf69c1179ee4fc847 \
+    0eb5b6520240f005b642e32e98371f37 \
+    621296d8df4003d888f7190037d05996 \
+    4c2faceef81f50a5633b80302742918a \
+    f00bda25d72e8f87282da0b365cb01b6 \
+    8f6f09873a5574358f6c97d06fa03671 \
+    831c0d6de435a69ad142f36eeebb9fb8 \
+    9594cb045f5ecdfcf6ecf9e9e6519434 \
+    bc3c4029cb4773818ab1808cc72b3a4d \
+    5ff365dc9280ca6a61dbc2cb2cc64f08 \
+    5ff486e60f4988770e5f977746ea341b \
+    0b0bba081d41a7d761113dc6d7ee171c \
+    8ddde9c7fb1155f82df7a4f54b0cf1";
+
+const LEAF_OF_EXPIRED_ANCHOR_DER_HEX: &str = "\
+    3082031930820201a003020102020121 \
+    300d06092a864886f70d01010b050030 \
+    253123302106035504030c1a48656172 \
+    74682054657374204578706972656420 \
+    416e63686f72301e170d323630313031 \
+    3030303030305a170d32373031303130 \
+    30303030305a3021311f301d06035504 \
+    030c16657870697265642d616e63686f \
+    722e6578616d706c6530820122300d06 \
+    092a864886f70d01010105000382010f \
+    003082010a0282010100b43ae8170f6a \
+    948f7aa928fb6ad12a4375fab844566b \
+    646924ac401384519d5a0dbd56173854 \
+    9e085beb39222c8302a483bb713b9747 \
+    258754a9cf4fca9fe855c81269414e09 \
+    6ad0e7bd6bb761222124c10a41f3340e \
+    aa688b10e2a590e059c5f8c2a7961235 \
+    d6034e4ae53d65c6857ce5c501163b3d \
+    9e6542d237e5f8157a61cf07889953f5 \
+    c50e26fb10e7ee86dd676406f0f53757 \
+    e84a4f69823f38af4cfadb900dd4503c \
+    5331f44f0fa962c0cd0035fca6c06b72 \
+    095d5a32c77251878cded775968664d4 \
+    d1bee61c83b493354a5af147ac8dcaf6 \
+    24cd177d9d2d941cd0fb022b9600c493 \
+    50db467229ea2bbcd6bb0d688285990a \
+    0b1b1e1d453062172c6f0203010001a3 \
+    583056300c0603551d130101ff040230 \
+    00300e0603551d0f0101ff0404030207 \
+    8030130603551d25040c300a06082b06 \
+    01050507030130210603551d11041a30 \
+    188216657870697265642d616e63686f \
+    722e6578616d706c65300d06092a8648 \
+    86f70d01010b050003820101006bc87f \
+    bcac9ebb66950a0bde3122fc128553b1 \
+    3889b2f0b639438890a0075c538b7e69 \
+    74778c1beff1d063c77d2815fb53be82 \
+    5c1466e5a5f82f309424bb7be86d5cd6 \
+    ee4ea35b3414f3b2bbeae35b76b8c639 \
+    d67596dd3a813a0c470de1844d2efcb2 \
+    40453cc8253ae197331513f698db0521 \
+    c4a1c83891698a4c93a30ef28aa13735 \
+    2b485fc7ad199aa91a77596fa9c4580a \
+    ae39a8d9ae8c0ee802e00ef4517613b8 \
+    07b16cbd6e54a132a25e9e1591c39290 \
+    5dcda028c49d77db1dbbd60121252e59 \
+    1c4a32d78e1f80ee45716514ade75f3d \
+    a976e8a278ba847f16130f9c08a33d26 \
+    dd74322ed7a3a75b8126b25c40082cc8 \
+    10798c3e8336e521f5ca1e9b34";
+
+const WEAK_ANCHOR_DER_HEX: &str = "\
+    308201e030820149a003020102020122 \
+    300d06092a864886f70d01010b050030 \
+    223120301e06035504030c1748656172 \
+    74682054657374205765616b20416e63 \
+    686f72301e170d323030313031303030 \
+    3030305a170d34303031303130303030 \
+    30305a30223120301e06035504030c17 \
+    4865617274682054657374205765616b \
+    20416e63686f7230819f300d06092a86 \
+    4886f70d010101050003818d00308189 \
+    028181008e279428e2e148690ad8551e \
+    b2341e5cf9b838d54e8a0c4f2f0a6209 \
+    8042af0833c11c1f698ad7b541a5f8fb \
+    a33ab5a9793f57410047802e1848a5d9 \
+    12e1dff1d9a142039b97ebb5d179b046 \
+    9dc88e715039a96f1b36d4bbee17b390 \
+    51cf7a672c126b6d932d69374e824074 \
+    7aaaa78322c41954e6f3f67a86a50c22 \
+    04cf96cb0203010001a3263024301206 \
+    03551d130101ff040830060101ff0201 \
+    00300e0603551d0f0101ff0404030201 \
+    06300d06092a864886f70d01010b0500 \
+    038181002dc20ed57d38b3292edd3498 \
+    a4ac597df524358da8be788d4dc37352 \
+    f7a252059c40af0456eebb9d7e432387 \
+    d38f8af125fcfe93756a5cf221030063 \
+    f8cf5682389697890259d0f728bfd7f4 \
+    556d7202ac23cae0542500a6e6a91595 \
+    e5b280d97168501c403121f712f53791 \
+    689ccbbc0fafee8c693aa6cb58efb5e0 \
+    5f4ebd1c";
+
+const LEAF_OF_WEAK_ANCHOR_DER_HEX: &str = "\
+    3082028f308201f8a003020102020123 \
+    300d06092a864886f70d01010b050030 \
+    223120301e06035504030c1748656172 \
+    74682054657374205765616b20416e63 \
+    686f72301e170d323630313031303030 \
+    3030305a170d32373031303130303030 \
+    30305a301e311c301a06035504030c13 \
+    7765616b2d616e63686f722e6578616d \
+    706c6530820122300d06092a864886f7 \
+    0d01010105000382010f003082010a02 \
+    82010100b37207e074b60b6cb22313ee \
+    fb8d0851295be2d2485447623580fbae \
+    4d9efacb0a32e924f820c53670f2cf30 \
+    0f272ea031efe07e6c69e671fc08b7d3 \
+    99828e1dca3a5839be34bd35e0ec7dc3 \
+    3b0969143ffc7022a98f044cb0ffb2d7 \
+    77bdf9d1d0b29506decd7cd8f4f63772 \
+    07e83b722168549e0b262561d34a6d4d \
+    2972685790c9950317afd2800ac65f74 \
+    11d7374992581f2e993e4bce0aa37549 \
+    c8e53985da59ead64b145db040cd89f3 \
+    14b75ee67bb1572e4ca9dac43290f230 \
+    67dbe90d761eb7d9c97603ce80bb9c54 \
+    f68a16b8376fa8c61335b64f9131423e \
+    88f74811e273e038ce2ba18c58025565 \
+    9163965d1b14d78fd80f9381eb3e0429 \
+    9e819f6b0203010001a3553053300c06 \
+    03551d130101ff04023000300e060355 \
+    1d0f0101ff0404030207803013060355 \
+    1d25040c300a06082b06010505070301 \
+    301e0603551d11041730158213776561 \
+    6b2d616e63686f722e6578616d706c65 \
+    300d06092a864886f70d01010b050003 \
+    8181003b72ae574ba74f07503a63a3dc \
+    5aaafcd765c2512093f517712d20775e \
+    fd3a774abada678a6a2993551b8460f0 \
+    d8f5b78e35299e19efdd2cb462b4810d \
+    8f63554f88ca359f3994846bef1d4f26 \
+    b9fa11d3f7969e21028682888e693edb \
+    79657b52090bb70bbf5b39b9520cc1ba \
+    c36e09ec83c1fb269029ea0263c53d5a \
+    e05ff5";
+
 /// What OpenSSL's parser says about each fixture above.
 const EXPECTATIONS: &[(&str, Expectation)] = &[
     (
         "ROOT",
         Expectation {
             der_len: 737,
+            signature_len: 256,
             version: 3,
             subject_cn: "Hearth Test Root CA",
             issuer_cn: "Hearth Test Root CA",
@@ -894,6 +1073,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "INTERMEDIATE",
         Expectation {
             der_len: 745,
+            signature_len: 256,
             version: 3,
             subject_cn: "Hearth Test Intermediate CA",
             issuer_cn: "Hearth Test Root CA",
@@ -912,6 +1092,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "LEAF_RSA",
         Expectation {
             der_len: 867,
+            signature_len: 256,
             version: 3,
             subject_cn: "models.example",
             issuer_cn: "Hearth Test Intermediate CA",
@@ -930,6 +1111,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "LEAF_EC",
         Expectation {
             der_len: 514,
+            signature_len: 256,
             version: 3,
             subject_cn: "ec.example",
             issuer_cn: "Hearth Test Intermediate CA",
@@ -948,6 +1130,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "LEAF_CLIENT_AUTH",
         Expectation {
             der_len: 782,
+            signature_len: 256,
             version: 3,
             subject_cn: "client.example",
             issuer_cn: "Hearth Test Intermediate CA",
@@ -966,6 +1149,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "LEAF_NO_DIGITAL_SIGNATURE",
         Expectation {
             der_len: 784,
+            signature_len: 256,
             version: 3,
             subject_cn: "no-sign.example",
             issuer_cn: "Hearth Test Intermediate CA",
@@ -984,6 +1168,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "SELF_SIGNED_PSS",
         Expectation {
             der_len: 825,
+            signature_len: 256,
             version: 3,
             subject_cn: "Hearth Test PSS Signer",
             issuer_cn: "Hearth Test PSS Signer",
@@ -1001,7 +1186,8 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
     (
         "SELF_SIGNED_EC",
         Expectation {
-            der_len: 303,
+            der_len: 304,
+            signature_len: 71,
             version: 3,
             subject_cn: "Hearth Test EC Signer",
             issuer_cn: "Hearth Test EC Signer",
@@ -1020,6 +1206,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "LEAF_UNKNOWN_CRITICAL",
         Expectation {
             der_len: 772,
+            signature_len: 256,
             version: 3,
             subject_cn: "critical.example",
             issuer_cn: "Hearth Test Intermediate CA",
@@ -1038,6 +1225,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "ROOT_SHADOW",
         Expectation {
             der_len: 737,
+            signature_len: 256,
             version: 3,
             subject_cn: "Hearth Test Root CA",
             issuer_cn: "Hearth Test Root CA",
@@ -1056,6 +1244,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "TOP_CA",
         Expectation {
             der_len: 736,
+            signature_len: 256,
             version: 3,
             subject_cn: "Hearth Test Top CA",
             issuer_cn: "Hearth Test Root CA",
@@ -1074,6 +1263,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "TOP_CA_STRICT",
         Expectation {
             der_len: 735,
+            signature_len: 256,
             version: 3,
             subject_cn: "Hearth Test Top CA",
             issuer_cn: "Hearth Test Top CA",
@@ -1092,6 +1282,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "SUB_CA",
         Expectation {
             der_len: 735,
+            signature_len: 256,
             version: 3,
             subject_cn: "Hearth Test Sub CA",
             issuer_cn: "Hearth Test Top CA",
@@ -1110,6 +1301,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "LEAF_SUB",
         Expectation {
             der_len: 767,
+            signature_len: 256,
             version: 3,
             subject_cn: "sub.example",
             issuer_cn: "Hearth Test Sub CA",
@@ -1128,6 +1320,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "CA_NO_KEY_CERT_SIGN",
         Expectation {
             der_len: 740,
+            signature_len: 256,
             version: 3,
             subject_cn: "Hearth Test No-Sign CA",
             issuer_cn: "Hearth Test Root CA",
@@ -1146,6 +1339,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "LEAF_OF_NO_SIGN_CA",
         Expectation {
             der_len: 785,
+            signature_len: 256,
             version: 3,
             subject_cn: "no-sign-ca.example",
             issuer_cn: "Hearth Test No-Sign CA",
@@ -1164,6 +1358,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "SUB_CA_STRICT",
         Expectation {
             der_len: 735,
+            signature_len: 256,
             version: 3,
             subject_cn: "Hearth Test Sub CA",
             issuer_cn: "Hearth Test Top CA",
@@ -1182,6 +1377,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
         "LEAF_SUB_STRICT",
         Expectation {
             der_len: 781,
+            signature_len: 256,
             version: 3,
             subject_cn: "sub-strict.example",
             issuer_cn: "Hearth Test Sub CA",
@@ -1194,6 +1390,82 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             san_dns: &["sub-strict.example"],
             signature_algorithm: "1.2.840.113549.1.1.11",
             key: Key::Rsa { modulus: "b8c147951499c4c2ae99a525282a10d6e67406866884940d73d020d4d46cea0be442b95b58f4816b4feabb645c9421f7520a833ba4d96106a42ac382e0487530eb14cc9a6b40fa96108782d73d8f0266340545a78e4382af0cb25a19f5afa533394137e64be7c9cb931e58ac71cd3eeda6012b71fb078bdd163df15579c1631a1da0ebe94682e2ce3058ad0acf23ff5b5970aacc47381b25785f97255c51f19a814665421615c8ef57cae9ec72d83c2a525ecabe829f70c51fe701fb4235f7e20d324af37fbb05784642d93087c12c241705c92e71316d5126e172147d40ccf7a708c8b8e471923ae54e5230fc04da89e8cdbce5c698092ab0574f05383cd85f", exponent: 65537 },
+        },
+    ),
+    (
+        "EXPIRED_ANCHOR",
+        Expectation {
+            der_len: 751,
+            signature_len: 256,
+            version: 3,
+            subject_cn: "Hearth Test Expired Anchor",
+            issuer_cn: "Hearth Test Expired Anchor",
+            serial_hex: "20",
+            not_before: 1420070400,
+            not_after: 1577836800,
+            is_ca: true,
+            path_len: Some(0),
+            key_usage: Some(0x060),
+            san_dns: &[],
+            signature_algorithm: "1.2.840.113549.1.1.11",
+            key: Key::Rsa { modulus: "a41b3b8e5699066a15a1c0f84e44952cb2b84cb2a7c0cd67c0aca9c25f6f22bf9353d4924939b8be11ae1bf0b19af486599dccada770b503e92d154d3b7301d63914fcfce0074630da7592e6cb0a7d954eca26c1778ffbef44b175d524831884f90f76fb011fd540327fd787ef4298f1f2a54100594c358cffb849c4a14df9b57d85b87c94469ab4ffa7ffd783b1e76768bdf9a3ad960818d8a21e7d1db84cc24589b6ad8d568a266eaece81c27346aae68f63399f4c04e8140f8cf7401517e22d239e7c4aa745d0fd7b0e82cc6a9c9d85ba0d81cd69ce4f5422391a1e9355dce8684a5ed30ba9151065500c349113fcb7b5d7739704737779273bdf0e7bab61", exponent: 65537 },
+        },
+    ),
+    (
+        "LEAF_OF_EXPIRED_ANCHOR",
+        Expectation {
+            der_len: 797,
+            signature_len: 256,
+            version: 3,
+            subject_cn: "expired-anchor.example",
+            issuer_cn: "Hearth Test Expired Anchor",
+            serial_hex: "21",
+            not_before: 1767225600,
+            not_after: 1798761600,
+            is_ca: false,
+            path_len: None,
+            key_usage: Some(0x001),
+            san_dns: &["expired-anchor.example"],
+            signature_algorithm: "1.2.840.113549.1.1.11",
+            key: Key::Rsa { modulus: "b43ae8170f6a948f7aa928fb6ad12a4375fab844566b646924ac401384519d5a0dbd561738549e085beb39222c8302a483bb713b9747258754a9cf4fca9fe855c81269414e096ad0e7bd6bb761222124c10a41f3340eaa688b10e2a590e059c5f8c2a7961235d6034e4ae53d65c6857ce5c501163b3d9e6542d237e5f8157a61cf07889953f5c50e26fb10e7ee86dd676406f0f53757e84a4f69823f38af4cfadb900dd4503c5331f44f0fa962c0cd0035fca6c06b72095d5a32c77251878cded775968664d4d1bee61c83b493354a5af147ac8dcaf624cd177d9d2d941cd0fb022b9600c49350db467229ea2bbcd6bb0d688285990a0b1b1e1d453062172c6f", exponent: 65537 },
+        },
+    ),
+    (
+        "WEAK_ANCHOR",
+        Expectation {
+            der_len: 484,
+            signature_len: 128,
+            version: 3,
+            subject_cn: "Hearth Test Weak Anchor",
+            issuer_cn: "Hearth Test Weak Anchor",
+            serial_hex: "22",
+            not_before: 1577836800,
+            not_after: 2208988800,
+            is_ca: true,
+            path_len: Some(0),
+            key_usage: Some(0x060),
+            san_dns: &[],
+            signature_algorithm: "1.2.840.113549.1.1.11",
+            key: Key::Rsa { modulus: "8e279428e2e148690ad8551eb2341e5cf9b838d54e8a0c4f2f0a62098042af0833c11c1f698ad7b541a5f8fba33ab5a9793f57410047802e1848a5d912e1dff1d9a142039b97ebb5d179b0469dc88e715039a96f1b36d4bbee17b39051cf7a672c126b6d932d69374e8240747aaaa78322c41954e6f3f67a86a50c2204cf96cb", exponent: 65537 },
+        },
+    ),
+    (
+        "LEAF_OF_WEAK_ANCHOR",
+        Expectation {
+            der_len: 659,
+            signature_len: 128,
+            version: 3,
+            subject_cn: "weak-anchor.example",
+            issuer_cn: "Hearth Test Weak Anchor",
+            serial_hex: "23",
+            not_before: 1767225600,
+            not_after: 1798761600,
+            is_ca: false,
+            path_len: None,
+            key_usage: Some(0x001),
+            san_dns: &["weak-anchor.example"],
+            signature_algorithm: "1.2.840.113549.1.1.11",
+            key: Key::Rsa { modulus: "b37207e074b60b6cb22313eefb8d0851295be2d2485447623580fbae4d9efacb0a32e924f820c53670f2cf300f272ea031efe07e6c69e671fc08b7d399828e1dca3a5839be34bd35e0ec7dc33b0969143ffc7022a98f044cb0ffb2d777bdf9d1d0b29506decd7cd8f4f6377207e83b722168549e0b262561d34a6d4d2972685790c9950317afd2800ac65f7411d7374992581f2e993e4bce0aa37549c8e53985da59ead64b145db040cd89f314b75ee67bb1572e4ca9dac43290f23067dbe90d761eb7d9c97603ce80bb9c54f68a16b8376fa8c61335b64f9131423e88f74811e273e038ce2ba18c580255659163965d1b14d78fd80f9381eb3e04299e819f6b", exponent: 65537 },
         },
     ),
 ];

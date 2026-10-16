@@ -38,6 +38,34 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 13 — the anchor's own window and key size, and two tests that had assumed a 2048-bit world (buffy, 2026-10-16)
+
+`chain.rs` was covered everywhere except two call sites, and they were the same shape: the *anchor's* own
+validity window and the *anchor's* own key size only run when the rest of the path is sound, so no fixture
+anchor could reach either.
+
+- **Four new certificates (22 total).** `EXPIRED_ANCHOR` stopped being valid in 2020 and `LEAF_OF_EXPIRED_ANCHOR`
+  is valid from 2026, so at the instant of the check the leaf is inside its own window and its issuer is not;
+  `WEAK_ANCHOR` is an ordinary CA holding a real 1024-bit key, below `Policy::min_rsa_bits`. Each has a leaf it
+  really did sign — the test asserts that signature — so the anchor check is the only thing that can refuse
+  the path.
+- **Reachability in two passes, because the test stops at its first assertion.** Deleting both anchor checks
+  turns the expired path `Ok(())`; deleting only the key check then turns the weak-anchor path `Ok(())`. Both
+  restored, and the restore was verified by an **empty `git diff`** on `chain.rs` rather than by eye — which is
+  worth doing, because my first restore spliced a brace and only the diff caught it.
+- **The 1024-bit fixture broke two older tests, and they were wrong, not the fixture.** One hard-coded "an
+  RSA signature is 256 bytes" (a signature is the *issuer's* modulus length) and the generated modulus hex was
+  padded to a fixed 256 bytes. The generator now emits `signature_len`, read out of each fixture's own DER with
+  a small TLV walker, and the modulus at its real width — so both assertions compare against OpenSSL's numbers
+  instead of an assumption that every anchor in the set is 2048 bits. That new field also pins the `BIT STRING`
+  reading: treating the unused-bits octet as part of the value would leave every signature one byte too long.
+- **Call sites with no negative test: none.** For the first time in this file, every rule has one, on every
+  site it is checked at.
+- **212 checks green** on the hardware path and with `HEARTH_TLS_NO_HW=1` (211 before), clippy
+  `-p hearth-tls --all-targets -D warnings` exit 0, `cargo fmt --check` clean, `cargo doc` zero warnings,
+  `cargo check --workspace --all-targets` exit 0. No inference code touched, so the benchmark mandate did not
+  apply.
+
 ### hearth-tls slice 12 — `pathLenConstraint` and `keyUsage.keyCertSign`, each proven by removing it (buffy, 2026-10-16)
 
 `chain.rs`: the last two structural rules, and the first slice where the *test* for each rule was made to

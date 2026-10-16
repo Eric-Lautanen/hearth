@@ -1,21 +1,21 @@
 # Hearth — next session
 
-> **Session 2026-10-16 (pt 6) in one paragraph.** The last two chain rules land: **`pathLenConstraint`**
-> (counted over the non-self-issued CAs *below* the CA that stated it, so the leaf never counts and a CA
-> present in the chain does not count against itself as its own anchor) and **`keyUsage.keyCertSign`**
-> (RFC 5280 §4.2.1.9: a CA that states `keyUsage` without the bit may not sign certificates, whatever
-> `basicConstraints` says). Each has fixtures that make it fail *and* a check that removing the rule turns
-> its test red: for the limit, two mirrored sub-hierarchies share both subject names and both key usages
-> and differ only in one CA's limit, so the refused path verifies `Ok(())` with the check removed; for the
-> key usage, `CA_NO_KEY_CERT_SIGN` is refused both as an issuer and as a pinned anchor *before* the
-> signature it would otherwise pass. Six new certificates (18 total), and the fixture harness is now
-> self-maintaining: the generator records each fixture's `issuer_cn`, so the signature test runs over every
-> fixture and *finds* each issuer by name plus signature instead of a hand-written table a new fixture can
-> be left out of. **211 checks green on the hardware path and on `HEARTH_TLS_NO_HW=1`** (209 before),
-> clippy `--all-targets -D warnings`, fmt, `cargo doc` (zero warnings) and the workspace check clean,
-> `std`-only, empty `[dependencies]`, and still nothing in the crate calls any of it: `RejectAll` is the
-> only `CertificateVerifier`, and there is **no revocation checking of any kind**. History:
-> `docs/BUG_TRACKER.md`.
+> **Session 2026-10-16 (pt 7) in one paragraph.** **Every rule in `chain.rs` now has a negative test on
+> every call site it has**, which closes the last coverage gap: the *anchor's* own validity window and the
+> *anchor's* own key size were the two checks no fixture could reach, because they only run when the rest
+> of the path is sound. Four new certificates (22 total) fix that — an anchor that stopped being valid in
+> 2020 with a leaf it signed that is valid from 2026, and a real CA with a real 1024-bit key, each with a
+> leaf it really did sign, so the anchor check is the only thing that can refuse the path. Reachability was
+> again *run*: deleting the anchor's window and key checks turns the expired path `Ok(())`, and deleting
+> only the key check turns the weak-anchor path `Ok(())` (the two were done in separate passes because the
+> test stops at its first assertion). The 1024-bit fixture also broke two older tests that had assumed it —
+> an RSA signature is the *issuer's* modulus length and the modulus hex was padded to 256 bytes — so the
+> generator now records `signature_len` read out of each fixture's own DER and the modulus at its real
+> width, rather than the tests assuming a uniform 2048-bit anchor set. **212 checks green on the hardware
+> path and on `HEARTH_TLS_NO_HW=1`** (211 before), clippy `--all-targets -D warnings`, fmt, `cargo doc`
+> (zero warnings) and the workspace check clean, `std`-only, empty `[dependencies]`, and still nothing in
+> the crate calls any of it: `RejectAll` is the only `CertificateVerifier`, and there is **no revocation
+> checking of any kind**. History: `docs/BUG_TRACKER.md`.
 
 ## Next session — in this order
 
@@ -72,10 +72,9 @@
         `serverAuth` when present, and `keyUsage` including `digitalSignature` when present, each with a
         fixture that makes it fail. `pathLenConstraint` and `keyUsage.keyCertSign` are done too, on both
         sides — a CA inside the chain and the anchor outside it — and the anchor-side limit is proven
-        with the anchor excluded from its own count. Still untested: the anchor's own window and key size
-        (no fixture anchor can fail either while the chain is still valid, which is the *only* remaining
-        gap of this kind: two fixtures would close it, an anchor whose window ends before the leaf's
-        begins and a 1024-bit anchor).
+        with the anchor excluded from its own count. The anchor's own window and key size are tested too
+        (`EXPIRED_ANCHOR`, `WEAK_ANCHOR`), so **no call site in `chain.rs` is without a negative test any
+        more** — the first time that has been true of this file.
    - **The root store is the caller's decision, and the crate is built that way.** `client.rs` already
      says this crate has no root store and no business having one: [`chain::verify_chain`] takes the
      anchors as an argument. So the question moves to the downloader — a pinned set in `hearth-ui` with
@@ -85,11 +84,11 @@
    - The negative set is now complete: the chain-level **bad signature, malformed encoding, expired,
      not-yet-valid, unknown root, name mismatch, CA used as a leaf, non-CA issuer, broken link, chain too
      long, RSA key too small, scheme that does not match the key type, framing failures, a purpose the
-     leaf is not allowed, `pathLenConstraint` on both sides, and a CA that does not claim
-     `keyCertSign`** all have tests. The one rule with no negative test left is the anchor's own window
-     and key size (see item 4). What the crate still has none of is **revocation checking of any kind**
-     — that is now the only *absent check*, as opposed to an untested one, and it must stay a decision
-     rather than an oversight before the downloader takes an `https://` path through this code.
+     leaf is not allowed, `pathLenConstraint` on both sides, a CA that does not claim `keyCertSign`, and
+     the anchor's own window and key size** all have tests. What the crate still has none of is
+     **revocation checking of any kind** — that is now the only *absent check*, as opposed to an untested
+     one, and it must stay a decision rather than an oversight before the downloader takes an `https://`
+     path through this code.
    - `Transport` in `hearth-ui/src/http.rs` is the seam and the `https://` branch of
      `downloads.rs::run_transfer` is what gets rewired afterwards. **Do not touch `http.rs` without
      asking — it is SparkOC's file.** Loose thread to close at the same time: the downloader's DNS

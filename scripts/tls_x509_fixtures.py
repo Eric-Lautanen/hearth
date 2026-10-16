@@ -94,6 +94,39 @@ def der_hex(data, indent="    "):
     return "\\\n" + "".join("%s%s \\\n" % (indent, line) for line in lines[:-1]) + indent + lines[-1]
 
 
+def read_tlv(buf, index):
+    """`(tag, body_start, body_len, next_index)` for the TLV at `index`."""
+    tag = buf[index]
+    index += 1
+    first = buf[index]
+    if first < 0x80:
+        size = first
+        index += 1
+    else:
+        count = first & 0x7F
+        size = int.from_bytes(buf[index + 1 : index + 1 + count], "big")
+        index += 1 + count
+    return tag, index, size, index + size
+
+
+def signature_length(der):
+    """The byte length of the certificate's `signatureValue`, read from the DER.
+
+    This is not a number the test could derive from the fixture set: an RSA signature
+    is the *issuer's* modulus length, and one fixture here is signed by a 1024-bit key,
+    so "256" would be an assumption about the set rather than about the format. The
+    one octet of a `BIT STRING` that names its unused bits is not part of the value.
+    """
+    tag, start, size, _ = read_tlv(der, 0)
+    assert tag == 0x30, "a certificate is a SEQUENCE"
+    body = der[start : start + size]
+    _, _, _, after_tbs = read_tlv(body, 0)
+    _, _, _, after_algorithm = read_tlv(body, after_tbs)
+    tag, _, size, _ = read_tlv(body, after_algorithm)
+    assert tag == 0x03, "the signature is a BIT STRING"
+    return size - 1
+
+
 def key_usage_mask(usage):
     """The DER bit numbers: 0 digitalSignature .. 8 decipherOnly, bit 0 first."""
     names = [
@@ -124,7 +157,10 @@ def expectations(cert):
     public = cert.public_key()
     if isinstance(public, rsa.RSAPublicKey):
         numbers = public.public_numbers()
-        width = 256
+        # The key's own byte length, not a fixed 256: one fixture's anchor holds a
+        # 1024-bit key on purpose, and padding its modulus to 2048 bits would compare
+        # it against bytes that are not in the certificate.
+        width = (numbers.n.bit_length() + 7) // 8
         key = "Key::Rsa { modulus: \"%s\", exponent: %d }" % (
             numbers.n.to_bytes(width, "big").hex(),
             numbers.e,
@@ -193,6 +229,10 @@ def main():
     leaf_sub_key = rsa_key(20261027)
     no_key_cert_sign_key = rsa_key(20261028)
     leaf_of_no_sign_key = rsa_key(20261029)
+    expired_anchor_key = rsa_key(20261101)
+    weak_anchor_key = rsa_key(20261102, bits=1024)
+    leaf_of_expired_key = rsa_key(20261103)
+    leaf_of_weak_key = rsa_key(20261104)
 
     def usage(**flags):
         """A `KeyUsage` with only the named bits set."""
@@ -595,6 +635,79 @@ def main():
         .sign(no_key_cert_sign_key, hashes.SHA256())
     )
 
+    # Two anchors whose *own* properties are the only thing wrong with the path, each
+    # with a leaf it really did sign — the anchor's window and its key size are the last
+    # two call sites no other fixture can reach.
+    #
+    # The first stopped being valid in 2020 while the leaf it signed is valid from 2026,
+    # so the leaf is inside its own window at the instant of the check and the issuer is
+    # not. The second is a real CA with a real 1024-bit key: nothing about it is
+    # malformed, it is simply below the policy's floor, which is the case `rsa.rs`
+    # deliberately accepts and `Policy::min_rsa_bits` refuses.
+    expired_anchor = (
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test Expired Anchor"))
+        .issuer_name(name("Hearth Test Expired Anchor"))
+        .public_key(expired_anchor_key.public_key())
+        .serial_number(0x20)
+        .not_valid_before(datetime.datetime(2015, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2020, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(key_cert_sign=True, crl_sign=True), critical=True)
+        .sign(expired_anchor_key, hashes.SHA256())
+    )
+
+    leaf_of_expired_anchor = (
+        x509.CertificateBuilder()
+        .subject_name(name("expired-anchor.example"))
+        .issuer_name(expired_anchor.subject)
+        .public_key(leaf_of_expired_key.public_key())
+        .serial_number(0x21)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("expired-anchor.example")]), critical=False
+        )
+        .sign(expired_anchor_key, hashes.SHA256())
+    )
+
+    weak_anchor = (
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test Weak Anchor"))
+        .issuer_name(name("Hearth Test Weak Anchor"))
+        .public_key(weak_anchor_key.public_key())
+        .serial_number(0x22)
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(key_cert_sign=True, crl_sign=True), critical=True)
+        .sign(weak_anchor_key, hashes.SHA256())
+    )
+
+    leaf_of_weak_anchor = (
+        x509.CertificateBuilder()
+        .subject_name(name("weak-anchor.example"))
+        .issuer_name(weak_anchor.subject)
+        .public_key(leaf_of_weak_key.public_key())
+        .serial_number(0x23)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("weak-anchor.example")]), critical=False
+        )
+        .sign(weak_anchor_key, hashes.SHA256())
+    )
+
     # A leaf whose unknown extension is marked **critical**. RFC 5280 requires a
     # reader that does not understand a critical extension to reject the
     # certificate, so this one must not parse.
@@ -636,6 +749,10 @@ def main():
         ("LEAF_OF_NO_SIGN_CA", leaf_of_no_sign),
         ("SUB_CA_STRICT", sub_ca_strict),
         ("LEAF_SUB_STRICT", leaf_sub_strict),
+        ("EXPIRED_ANCHOR", expired_anchor),
+        ("LEAF_OF_EXPIRED_ANCHOR", leaf_of_expired_anchor),
+        ("WEAK_ANCHOR", weak_anchor),
+        ("LEAF_OF_WEAK_ANCHOR", leaf_of_weak_anchor),
     ]
 
     # `//` rather than `//!`: this file is pulled in with `include!`, so an inner
@@ -665,6 +782,7 @@ def main():
         out.append('        "%s",' % label)
         out.append("        Expectation {")
         out.append("            der_len: %d," % len(der))
+        out.append("            signature_len: %d," % signature_length(der))
         out.append("            version: %d," % (cert.version.value + 1))
         out.append('            subject_cn: "%s",' % want["subject_cn"])
         out.append('            issuer_cn: "%s",' % want["issuer_cn"])
