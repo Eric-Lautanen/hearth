@@ -168,6 +168,9 @@
     margin-top: 2px;
   }
   .row.user .avatar { background: #232d40; border: 1px solid #324060; }
+  .row.user .avatar { color: var(--muted); }
+  .row.ai .avatar { color: #fff; }
+  .avatar svg { display: block; }
   .row.ai .avatar { background: linear-gradient(135deg, var(--accent), var(--accent2)); box-shadow: 0 2px 10px rgba(255, 106, 61, 0.3); }
   .bubble {
     max-width: 76%;
@@ -461,6 +464,61 @@
   .field.hidden { display: none; }
   .drawer-note { font-size: 12px; color: var(--faint); margin-top: 10px; }
 
+  /* ---------- Downloads ---------- */
+  .dl-row {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin: 10px 0;
+    background: var(--panel2);
+  }
+  .dl-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dl-check { accent-color: var(--accent); width: 15px; height: 15px; flex: 0 0 auto; }
+  .dl-name { font-size: 13.5px; font-weight: 600; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dl-size { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .dl-blurb { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .dl-bar {
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border2);
+    margin-top: 8px;
+    overflow: hidden;
+  }
+  .dl-bar > div {
+    height: 100%;
+    width: 0%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    transition: width .3s;
+  }
+  .dl-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .dl-state { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+  .dl-state.on { color: var(--ok); }
+  .dl-state.busy { color: var(--accent); }
+  .dl-state.err { color: var(--err); }
+  .dl-btn {
+    background: var(--panel);
+    border: 1px solid var(--border2);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 5px 12px;
+    font-size: 12.5px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .dl-btn:hover:not(:disabled) { border-color: var(--accent); }
+  .dl-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
   /* ---------- Toast ---------- */
   #toast {
     position: fixed;
@@ -497,7 +555,7 @@
 <body>
 
 <header>
-  <div class="brand"><div class="flame">🔥</div><span>Hearth</span></div>
+  <div class="brand"><div class="flame" style="color:#fff"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c1 4-2.5 5.5-2.5 9a2.5 2.5 0 0 0 5 .5C15.5 9 14 7.5 14 7.5c2.5 1.5 4.5 4.2 4.5 7.7A6.5 6.5 0 0 1 12 21.7a6.5 6.5 0 0 1-6.5-6.5C5.5 9.5 10 6 12 2Z"/></svg></div><span>Hearth</span></div>
   <div class="model-zone">
     <div class="select-wrap">
       <select id="modelSelect" disabled>
@@ -511,7 +569,10 @@
   <div class="status-pill" id="statusPill" title="">
     <span class="dot" id="statusDot"></span><span class="label" id="statusText">Starting…</span>
   </div>
-  <button class="icon-btn" id="settingsBtn" title="Settings">⚙</button>
+  <button class="icon-btn" id="settingsBtn" title="Settings" aria-label="Settings">⚙</button>
+  <button class="icon-btn" id="dlBtn" title="Download models" aria-label="Download models">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
+  </button>
 </header>
 
 <main id="scroller">
@@ -527,7 +588,7 @@
   </div>
   <div class="composer-foot">
     <div class="foot-left">
-      <button class="link-btn danger" id="clearBtn" title="Clear messages and model context" disabled>🧹 Clear chat</button>
+      <button class="link-btn danger" id="clearBtn" title="Clear messages and model context" disabled>Clear chat</button>
     </div>
     <div id="stats"></div>
   </div>
@@ -613,6 +674,29 @@
   </div>
 </div>
 
+<!-- Downloads drawer -->
+<div class="drawer" id="dlDrawer">
+  <div class="drawer-head">
+    <span>Model downloads</span>
+    <button class="icon-btn" id="closeDl" title="Close">✕</button>
+  </div>
+  <div class="drawer-body">
+    <div class="drawer-note" id="dlDir">Fetching list…</div>
+    <div style="display:flex;gap:8px;margin:12px 0 4px">
+      <button class="dl-btn" id="dlSelected">Download selected</button>
+      <button class="dl-btn" id="dlRefresh" title="Refresh download states">Refresh</button>
+    </div>
+    <div id="dlList"></div>
+    <div class="field">
+      <label>Custom link (.gguf URL)</label>
+      <input id="dlUrl" class="mini" placeholder="https://huggingface.co/…/resolve/main/….gguf" style="margin-bottom:8px">
+      <input id="dlFile" class="mini" placeholder="Filename, e.g. My-Model-Q4_0.gguf" style="margin-bottom:8px">
+      <button class="dl-btn" id="dlAdd">Add &amp; download</button>
+    </div>
+    <div class="drawer-note">One file downloads at a time; the rest queue. Files land in the project <span style="font-family:var(--mono)">models/</span> folder and appear in the model dropdown automatically. Partial files resume.</div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -664,11 +748,11 @@ function toast(msg, kind) {
   toastTimer = setTimeout(() => { t.className = ""; }, 3500);
 }
 
-function fmtBytes(n) {
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + " GB";
-  if (n >= 1e6) return (n / 1e6).toFixed(0) + " MB";
-  return (n / 1e3).toFixed(0) + " KB";
-}
+// (fmtBytes is defined once, next to loadPayload)
+
+// Crisp inline brand mark (no emoji): used for the hero and AI avatars.
+const FLAME_SVG = '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c1 4-2.5 5.5-2.5 9a2.5 2.5 0 0 0 5 .5C15.5 9 14 7.5 14 7.5c2.5 1.5 4.5 4.2 4.5 7.7A6.5 6.5 0 0 1 12 21.7a6.5 6.5 0 0 1-6.5-6.5C5.5 9.5 10 6 12 2Z"/></svg>';
+const USER_SVG = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg>';
 
 // Clamp the context slider to the loaded model's real KV-cache limit so the
 // control never promises more than the engine will allocate.
@@ -717,7 +801,22 @@ function applyModelDefaults(m) {
   $("modelNote").textContent =
     m.name + " — " + m.arch + ", " + m.n_layers + " layers, d=" + m.d_model +
     ", ctx " + m.max_seq_len + ", vocab " + m.vocab_size + " (" + (m.template || "?") + ")" +
-    (m.sampling_from_model ? " · sampling: model defaults" : " · sampling: built-in defaults") + kv;
+    (m.sampling_from_model ? " · sampling: model defaults" : " · sampling: built-in defaults") + kv +
+    (m.kernels ? " · kernels: " + kernelSummary(m.kernels) : "");
+}
+
+// Per-format kernel dispatch as reported by the engine
+// (`event.model.kernels`); avx512_full_width is informational only —
+// false is healthy on Zen 4 (double-pumped 256-bit), where PQ2_0 still runs
+// its faster VNNI kernel. Never alarm on that boolean.
+function kernelSummary(k) {
+  if (!k || typeof k !== "object") return "?";
+  const parts = [];
+  for (const f of ["ptq1_0", "pq2_0", "q2_0", "q1_0", "q1_0_g128"]) {
+    if (k[f]) parts.push(f + "=" + k[f]);
+  }
+  if (k.cpu) parts.push("cpu " + k.cpu);
+  return parts.join(" · ") || "?";
 }
 
 function fmtBytes(n) {
@@ -800,13 +899,14 @@ function heroEl() {
   div.className = "hero";
   const noModels = S.models.length === 0;
   div.innerHTML =
-    '<div class="big"><span class="flame-big">🔥</span> Hearth Chat</div>' +
+    '<div class="big"><span class="flame-big">' + FLAME_SVG + '</span> Hearth Chat</div>' +
     '<div class="sub">' + (noModels
       ? "Pick a model from the dropdown above to start chatting."
       : "Pick a model from the dropdown above — it loads automatically.") + '</div>' +
     (noModels
       ? '<div class="warn">No .gguf models found' +
-        (S.modelsDir ? ' in <span class="dir">' + esc(S.modelsDir) + '</span>' : "") + '.</div>'
+        (S.modelsDir ? ' in <span class="dir">' + esc(S.modelsDir) + '</span>' : "") + '.</div>' +
+        '<div><button class="chip" id="heroDl">Open model downloads</button></div>'
       : "") +
     (S.models.length
       ? '<div class="chips">' + S.models.map(m =>
@@ -819,6 +919,8 @@ function heroEl() {
       onModelSelected();
     });
   });
+  const heroDl = div.querySelector("#heroDl");
+  if (heroDl) heroDl.addEventListener("click", () => dlOpen(true));
   return div;
 }
 
@@ -860,7 +962,7 @@ function renderChat() {
     row.className = "row " + (m.role === "user" ? "user" : "ai");
     const av = document.createElement("div");
     av.className = "avatar";
-    av.textContent = m.role === "user" ? "🧑" : "🔥";
+    av.innerHTML = m.role === "user" ? USER_SVG : FLAME_SVG;
     const bub = document.createElement("div");
     bub.className = "bubble";
     if (m.role === "assistant" && m.think) {
@@ -883,7 +985,7 @@ function renderChat() {
     const row = document.createElement("div");
     row.className = "row ai";
     const av = document.createElement("div");
-    av.className = "avatar"; av.textContent = "🔥";
+    av.className = "avatar"; av.innerHTML = FLAME_SVG;
     const bub = document.createElement("div");
     bub.className = "bubble";
     if (S.streamingReason.length > 0) {
@@ -982,6 +1084,7 @@ async function loadModel(path, auto) {
     // Re-seed the whole generation panel from this model's own metadata.
     applyModelDefaults(S.loaded);
     setStatus(S.loaded.name + " · " + S.loaded.arch, "on");
+    if (S.loaded.kernels) statusPill.title = "kernels: " + kernelSummary(S.loaded.kernels);
     toast("Model loaded: " + S.loaded.name, "info");
     input.focus();
   } catch (e) {
@@ -1014,8 +1117,214 @@ async function unloadModel() {
 }
 
 // ---------------------------------------------------------------------------
+// Model downloads (HuggingFace -> project-root models/)
+// ---------------------------------------------------------------------------
+
+S.dl = { items: [], dir: "", pollTimer: null, checked: {} };
+
+const dlDrawer = $("dlDrawer"), dlBtn = $("dlBtn");
+
+function dlOpen(open) {
+  dlDrawer.classList.toggle("open", open);
+  if (open) {
+    drawer.classList.remove("open");
+    refreshDownloads();
+  }
+}
+
+function dlPct(it) {
+  if (it.state === "done") return 100;
+  if (it.size_bytes > 0 && it.downloaded_bytes > 0) {
+    return Math.min(99, Math.floor(it.downloaded_bytes / it.size_bytes * 100));
+  }
+  return it.state === "active" ? 1 : 0;
+}
+
+function dlStateText(it) {
+  switch (it.state) {
+    case "done": return "On disk";
+    case "active": return it.size_bytes > 0
+      ? fmtBytes(it.downloaded_bytes) + " / " + fmtBytes(it.size_bytes) + " · " + dlPct(it) + "%"
+      : fmtBytes(it.downloaded_bytes) + " downloaded…";
+    case "queued": return "Queued";
+    case "partial": return "Partial (" + fmtBytes(it.downloaded_bytes) + ") — resumes";
+    case "error": return "Failed" + (it.error ? ": " + it.error : "");
+    case "cancelled": return "Cancelled";
+    default: return it.size_bytes > 0 ? fmtBytes(it.size_bytes) : "";
+  }
+}
+
+function renderDl() {
+  const list = $("dlList");
+  list.innerHTML = "";
+  $("dlDir").textContent = S.dl.dir ? "Target: " + S.dl.dir : "";
+  for (const it of S.dl.items) {
+    const row = document.createElement("div");
+    row.className = "dl-row";
+    const pct = dlPct(it);
+    const busy = it.state === "active" || it.state === "queued";
+    const isDone = it.state === "done";
+    // Remember the user's ticks across live re-renders (progress refreshes Often).
+    if (!(it.id in S.dl.checked)) S.dl.checked[it.id] = !isDone;
+    const action = it.state === "done"
+      ? '<button class="dl-btn" disabled>On disk</button>'
+      : busy
+        ? '<button class="dl-btn" data-act="cancel">Cancel</button>'
+        : '<button class="dl-btn" data-act="start">Download</button>';
+    const stateCls = it.state === "done" ? "on" : busy ? "busy" : it.state === "error" ? "err" : "";
+    row.innerHTML =
+      '<div class="dl-top">' +
+        '<input type="checkbox" class="dl-check" data-id="' + esc(it.id) + '"' +
+          (isDone ? " disabled" : S.dl.checked[it.id] ? " checked" : "") + ">" +
+        '<div class="dl-name" title="' + esc(it.filename) + '">' + esc(it.label) + "</div>" +
+        '<div class="dl-size">' + (it.size_bytes > 0 ? fmtBytes(it.size_bytes) : "") + "</div>" +
+      "</div>" +
+      (it.blurb ? '<div class="dl-blurb">' + esc(it.blurb) + "</div>" : "") +
+      '<div class="dl-bar"><div style="width:' + pct + '%"></div></div>' +
+      '<div class="dl-foot"><span class="dl-state ' + stateCls + '">' + esc(dlStateText(it)) + "</span>" + action + "</div>";
+    const btn = row.querySelector("[data-act]");
+    if (btn) {
+      const act = btn.dataset.act;
+      btn.addEventListener("click", () => {
+        if (act === "start") startDl(it.id);
+        else cancelDl(it.id);
+      });
+    }
+    const box = row.querySelector(".dl-check");
+    if (box) {
+      box.addEventListener("change", () => { S.dl.checked[it.id] = box.checked; });
+    }
+    list.appendChild(row);
+  }
+  // Keep polling while anything is moving; refresh the chat dropdown when done.
+  const moving = S.dl.items.some((it) => it.state === "active" || it.state === "queued");
+  if (moving && !S.dl.pollTimer) {
+    S.dl.pollTimer = setInterval(refreshDownloads, 1000);
+  } else if (!moving && S.dl.pollTimer) {
+    clearInterval(S.dl.pollTimer);
+    S.dl.pollTimer = null;
+    refreshModels();
+  }
+  updateDlBtn();
+}
+
+function updateDlBtn() {
+  const n = S.dl.items.filter((it) => it.state === "active" || it.state === "queued").length;
+  dlBtn.style.borderColor = n > 0 ? "var(--accent)" : "";
+}
+
+async function refreshDownloads() {
+  try {
+    const r = await fetch("/api/downloads");
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || "failed");
+    S.dl.items = j.models || [];
+    S.dl.dir = j.dir || "";
+    if (j.curl === false) toast("curl not found — downloads need curl on PATH", "err");
+    renderDl();
+  } catch (e) {
+    $("dlDir").textContent = "Could not load download list: " + e.message;
+  }
+}
+
+async function startDl(id) {
+  try {
+    const r = await fetch("/api/downloads/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || "start failed");
+    await refreshDownloads();
+  } catch (e) {
+    toast("Download failed to start: " + e.message, "err");
+  }
+}
+
+async function cancelDl(id) {
+  try {
+    await fetch("/api/downloads/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    await refreshDownloads();
+  } catch (e) {
+    toast("Cancel failed: " + e.message, "err");
+  }
+}
+
+async function downloadSelected() {
+  const ids = [...document.querySelectorAll("#dlList .dl-check:checked")].map((c) => c.dataset.id);
+  if (ids.length === 0) { toast("Tick at least one model first", "err"); return; }
+  for (const id of ids) {
+    try {
+      const r = await fetch("/api/downloads/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error((j.error || "start failed") + " (" + id + ")");
+    } catch (e) {
+      toast(e.message, "err");
+      break;
+    }
+  }
+  await refreshDownloads();
+}
+
+async function addCustomDl() {
+  const url = $("dlUrl").value.trim();
+  const filename = $("dlFile").value.trim();
+  if (!url || !filename) { toast("Paste a URL and a filename first", "err"); return; }
+  try {
+    const r = await fetch("/api/downloads/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, filename }),
+    });
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || "start failed");
+    $("dlUrl").value = "";
+    $("dlFile").value = "";
+    toast("Custom download queued", "info");
+    await refreshDownloads();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Chat flow
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Tab presence: the server shuts down when no chat tab is open anymore.
+// Each tab says hello, heartbeats every 15 s, and sends a goodbye beacon
+// when it is closed (or reloaded — reloads re-register within seconds).
+// ---------------------------------------------------------------------------
+
+const TAB_ID = (window.crypto && crypto.randomUUID)
+  ? crypto.randomUUID()
+  : "tab-" + Date.now() + "-" + Math.floor(Math.random() * 1e9);
+
+function tabPost(path) {
+  try {
+    fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tab: TAB_ID }),
+    }).catch(() => {});
+  } catch { /* server may already be gone */ }
+}
+
+window.addEventListener("pagehide", () => {
+  try {
+    navigator.sendBeacon("/api/bye", JSON.stringify({ tab: TAB_ID }));
+  } catch { /* ignore */ }
+});
 
 function connectEvents() {
   if (S.evtSource) S.evtSource.close();
@@ -1055,6 +1364,11 @@ function connectEvents() {
       setStatus("Service exited", "err");
       toast(ev.message || "The engine service exited", "err");
       renderChat();
+    } else if (ev.type === "download") {
+      // A transfer changed state; refresh the panel if it is open, and
+      // always refresh the model dropdown on completion.
+      if (dlDrawer.classList.contains("open")) refreshDownloads();
+      if (ev.state === "done") refreshModels();
     }
   };
   es.onerror = () => {
@@ -1249,16 +1563,27 @@ reloadBtn.addEventListener("click", () => {
   if (path) loadModel(path, false);
 });
 ejectBtn.addEventListener("click", unloadModel);
+dlBtn.addEventListener("click", () => dlOpen(!dlDrawer.classList.contains("open")));
+$("closeDl").addEventListener("click", () => dlOpen(false));
+$("dlRefresh").addEventListener("click", refreshDownloads);
+$("dlSelected").addEventListener("click", downloadSelected);
+$("dlAdd").addEventListener("click", addCustomDl);
 
-// Settings drawer
+// Settings + downloads drawers
 const drawer = $("drawer");
-$("settingsBtn").addEventListener("click", () => drawer.classList.toggle("open"));
+$("settingsBtn").addEventListener("click", () => {
+  const open = !drawer.classList.contains("open");
+  drawer.classList.toggle("open", open);
+  if (open) dlDrawer.classList.remove("open");
+});
 $("closeDrawer").addEventListener("click", () => drawer.classList.remove("open"));
 document.addEventListener("click", (e) => {
-  if (drawer.classList.contains("open") &&
-      !drawer.contains(e.target) && e.target !== $("settingsBtn") &&
-      !$("settingsBtn").contains(e.target)) {
-    drawer.classList.remove("open");
+  for (const [panel, btn] of [[drawer, $("settingsBtn")], [dlDrawer, dlBtn]]) {
+    if (panel.classList.contains("open") &&
+        !panel.contains(e.target) && e.target !== btn &&
+        !btn.contains(e.target)) {
+      panel.classList.remove("open");
+    }
   }
 });
 for (const [sl, out, fmt] of [
@@ -1298,6 +1623,8 @@ $("resetDefaults").addEventListener("click", () => {
 
 (async function boot() {
   connectEvents();
+  tabPost("/api/hello");
+  setInterval(() => tabPost("/api/ping"), 15000);
   setStatus("Connecting…", "busy");
   try {
     const r = await fetch("/api/status");
@@ -1316,6 +1643,7 @@ $("resetDefaults").addEventListener("click", () => {
   renderChat();
   updateButtons();
   input.focus();
+  if (location.hash === "#downloads") dlOpen(true);
 })();
 </script>
 </body>

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use hearth_core::json::{self, Json};
 
+mod downloads;
 mod web;
 
 // ---------------------------------------------------------------------------
@@ -165,6 +166,14 @@ struct AppCtx {
     /// True while a generation is in flight (UI-level guard).
     generating: AtomicBool,
     next_id: AtomicI64,
+    /// Model-file downloader (HuggingFace -> project-root models/).
+    dl: Arc<downloads::Manager>,
+    /// Open chat tabs by id with their last heartbeat. When the map stays
+    /// empty, nobody is watching anymore and the server exits (so closing
+    /// the chat closes the server too).
+    tabs: Mutex<HashMap<String, Instant>>,
+    /// Set once the first tab ever says hello (boot grace).
+    ever_seen_tab: AtomicBool,
 }
 
 impl AppCtx {
@@ -942,6 +951,142 @@ fn handle_generate(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
     json_response(stream, &v);
 }
 
+// ---------------------------------------------------------------------------
+// Model downloads (HuggingFace -> project-root models/)
+// ---------------------------------------------------------------------------
+
+fn handle_downloads(ctx: &Arc<AppCtx>, stream: &mut TcpStream) {
+    json_response(stream, &ctx.dl.snapshot());
+}
+
+fn handle_dl_start(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
+    let body = json_body(req);
+    let id = body
+        .get("id")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let url = body
+        .get("url")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let filename = body
+        .get("filename")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    match ctx.dl.start(id, url, filename) {
+        Ok((id, state)) => {
+            let mut v = Json::obj();
+            v.set("ok", Json::Bool(true));
+            v.set("id", Json::str(id));
+            v.set("state", Json::str(state));
+            json_response(stream, &v);
+        }
+        Err(e) => error_response(stream, &e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tab presence: the server exits when no chat tab is watching anymore.
+// ---------------------------------------------------------------------------
+
+fn tab_id(req: &Request) -> String {
+    json_body(req)
+        .get("tab")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn handle_hello(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
+    let id = tab_id(req);
+    if !id.is_empty() {
+        ctx.tabs.lock().unwrap().insert(id, Instant::now());
+        ctx.ever_seen_tab.store(true, Ordering::Relaxed);
+    }
+    let mut v = Json::obj();
+    v.set("ok", Json::Bool(true));
+    json_response(stream, &v);
+}
+
+fn handle_ping(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
+    let id = tab_id(req);
+    if !id.is_empty() {
+        ctx.tabs.lock().unwrap().insert(id, Instant::now());
+    }
+    let mut v = Json::obj();
+    v.set("ok", Json::Bool(true));
+    json_response(stream, &v);
+}
+
+fn handle_bye(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
+    let id = tab_id(req);
+    if !id.is_empty() {
+        ctx.tabs.lock().unwrap().remove(&id);
+    }
+    let mut v = Json::obj();
+    v.set("ok", Json::Bool(true));
+    json_response(stream, &v);
+}
+
+/// Background reaper: when no tab has been seen for a while (and nothing is
+/// generating or downloading), the chat is closed — exit so the server does
+/// not linger. Reloads re-register within seconds, well inside the grace.
+fn spawn_tab_reaper(ctx: Arc<AppCtx>) {
+    // Testing escape hatch (screenshots, endpoint probes): set
+    // HEARTH_NO_AUTO_SHUTDOWN=1 to keep the server up with no tabs open.
+    // Default (unset) is close-chat-closes-server.
+    if std::env::var("HEARTH_NO_AUTO_SHUTDOWN").map(|v| v == "1").unwrap_or(false) {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("hearth-ui-reaper".into())
+        .spawn(move || {
+            let grace = Duration::from_secs(20);
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                if !ctx.ever_seen_tab.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // Drop heartbeats older than the grace window; live tabs ping
+                // every 15 s, reloads re-register within a couple of seconds.
+                let now = Instant::now();
+                let mut tabs = ctx.tabs.lock().unwrap();
+                tabs.retain(|_, seen| now.duration_since(*seen) < grace);
+                let empty = tabs.is_empty();
+                drop(tabs);
+                if empty && !ctx.generating.load(Ordering::Relaxed) && !ctx.dl.has_active() {
+                    // Confirm the quiet held across one more check (reload race).
+                    std::thread::sleep(Duration::from_secs(5));
+                    if ctx.tabs.lock().unwrap().is_empty()
+                        && !ctx.generating.load(Ordering::Relaxed)
+                        && !ctx.dl.has_active()
+                    {
+                        eprintln!("[hearth-ui] no open tabs — shutting down");
+                        std::process::exit(0);
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+fn handle_dl_cancel(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
+    let body = json_body(req);
+    let id = get_str(&body, "id");
+    if id.trim().is_empty() {
+        error_response(stream, "cancel: missing id");
+        return;
+    }
+    if ctx.dl.cancel(&id) {
+        let mut v = Json::obj();
+        v.set("ok", Json::Bool(true));
+        v.set("id", Json::str(id));
+        json_response(stream, &v);
+    } else {
+        error_response(stream, "nothing to cancel for that id");
+    }
+}
+
 fn handle_stop(_ctx: &Arc<AppCtx>, stream: &mut TcpStream) {
     let mut cmd = Json::obj();
     cmd.set("id", Json::Num(0.0));
@@ -1035,6 +1180,12 @@ fn handle_client(ctx: Arc<AppCtx>, stream: TcpStream) {
                 );
             }
             ("GET", "/api/models") => handle_models(&ctx, &mut stream),
+            ("GET", "/api/downloads") => handle_downloads(&ctx, &mut stream),
+            ("POST", "/api/downloads/start") => handle_dl_start(&ctx, &req, &mut stream),
+            ("POST", "/api/downloads/cancel") => handle_dl_cancel(&ctx, &req, &mut stream),
+            ("POST", "/api/hello") => handle_hello(&ctx, &req, &mut stream),
+            ("POST", "/api/ping") => handle_ping(&ctx, &req, &mut stream),
+            ("POST", "/api/bye") => handle_bye(&ctx, &req, &mut stream),
             ("POST", "/api/load") => {
                 let body = json_body(&req);
                 handle_load(&ctx, &mut stream, &body);
@@ -1106,13 +1257,23 @@ fn main() {
         }
     };
 
+    let dl = downloads::Manager::new();
     let ctx = Arc::new(AppCtx {
         events: Mutex::new(EventHub::default()),
         slots: Mutex::new(HashMap::new()),
         progress: Mutex::new(GenProgress::new()),
         generating: AtomicBool::new(false),
         next_id: AtomicI64::new(0),
+        dl: dl.clone(),
+        tabs: Mutex::new(HashMap::new()),
+        ever_seen_tab: AtomicBool::new(false),
     });
+    // Download progress/completion fans out to every open tab over SSE.
+    {
+        let ctx_ev = ctx.clone();
+        dl.set_sink(Arc::new(move |ev: Json| ctx_ev.push_event(ev)));
+    }
+    spawn_tab_reaper(ctx.clone());
 
     if let Err(e) = spawn_service(ctx.clone()) {
         eprintln!("[hearth-ui] fatal: {}", e);

@@ -13,6 +13,12 @@ i² = j² = k² = ijk = -1. They're used extensively in 3D computer graphics
 for rotation representation, avoiding gimbal lock...
 ```
 
+## Screenshots
+
+![Hearth web chat](docs/screenshots/hearth-chat.png)
+
+![Model downloader with per-model progress](docs/screenshots/hearth-downloads.png)
+
 ## Performance
 
 All 6 Bonsai models (Qwen3, head_dim=128, vocab=151669, YaRN rope) on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5). Benchmarked at 50 generated tokens, `--temp 0`, one-word prompt, warm average over 10 runs. Hearth uses 8 workers (n/2). Ref uses llama.cpp-prism 16 threads.
@@ -42,7 +48,7 @@ Full benchmarks with raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md)
 - **Chat with templates** — PrismML Bonsai (Qwen3 architecture) chat templates parsed from GGUF metadata, including the Ternary Bonsai 2 27B hybrid (`qwen35`) architecture. Interactive and single-shot modes.
 - **Model-declared defaults** — each GGUF's `general.sampling.*` (temp, top-k, top-p, min-p) and its `context_length` are read and used, so a model runs the way its author tuned it instead of on one hardcoded profile.
 - **Sampler controls** — temperature, top-k, top-p, min-p, typical-p, repetition penalty, seed; every one is settable from the CLI, the service protocol, and the web UI.
-- **Web chat UI** — `hearth-ui` serves a browser chat over the engine's line-JSON service, with a settings drawer seeded from the loaded model (sampling, context, device/residency) and live tok/s while it replies.
+- **Web chat UI** — `hearth-ui` serves a browser chat over the engine's line-JSON service, with a settings drawer seeded from the loaded model (sampling, context, device/residency), live tok/s while it replies, a **model downloader** (per-model progress, queued 1-by-1, resume), and close-the-tab shuts the server down.
 - **GPU stubs** — `hearth-compute` has skeleton API signatures for fused dequant+matmul, flash attention, RMS norm, and RoPE. All methods return `None`/`false` — not yet implemented.
 
 ## Supported Quantization Formats
@@ -70,12 +76,29 @@ Bold = AVX2-optimized. Portable = scalar but still parallelized.
 ### 1. Prerequisites
 
 - **[Rust](https://rustup.rs) 1.85+** (tested on 1.95). If you don't have Rust, install it with `winget install Rustlang.Rustup` on Windows or `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` on Linux/macOS.
-- **A Bonsai GGUF model file** placed in a folder you can reference. Two tested models:
-  - `Bonsai-1.7B-Q1_0.gguf` — 1-bit, fastest, ~350MB
-  - `Ternary-Bonsai-1.7B-Q2_0.gguf` — 2-bit ternary, higher quality, ~630MB
+- **A Bonsai GGUF model file** in the project `models/` folder. Easiest path: open the web UI and use the **download button** (top-right) — pick 1.7B to start, each model downloads individually with its own progress bar. Two good first models:
+  - `Bonsai-1.7B-Q1_0.gguf` — 1-bit, fastest, 237 MiB
+  - `Ternary-Bonsai-1.7B-Q2_0.gguf` — 2-bit ternary, higher quality, 442 MiB
 - **x86_64 CPU** with AVX2 recommended (SSE4.1 minimum). Most CPUs from 2015+ have AVX2.
 
-Download models from the [PrismML Bonsai releases](https://huggingface.co/prism-ml).
+Prefer to fetch manually? Every file lives in a `prism-ml` HuggingFace repo as `<repo>/resolve/main/<file>`:
+
+| File | Size | Repo |
+| ---- | ---- | ---- |
+| `Bonsai-1.7B-Q1_0.gguf` | 237 MiB | [Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) |
+| `Ternary-Bonsai-1.7B-Q2_0.gguf` | 442 MiB | [Ternary-Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf) |
+| `Bonsai-4B-Q1_0.gguf` | 546 MiB | [Bonsai-4B-gguf](https://huggingface.co/prism-ml/Bonsai-4B-gguf) |
+| `Ternary-Bonsai-4B-Q2_0.gguf` | 1.0 GiB | [Ternary-Bonsai-4B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-4B-gguf) |
+| `Bonsai-8B-Q1_0.gguf` | 1.1 GiB | [Bonsai-8B-gguf](https://huggingface.co/prism-ml/Bonsai-8B-gguf) |
+| `Ternary-Bonsai-8B-Q2_0.gguf` | 2.0 GiB | [Ternary-Bonsai-8B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-8B-gguf) |
+| `Ternary-Bonsai-2-2B-PTQ1_0.gguf` | 409 MiB | [Ternary-Bonsai-2-2B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf) |
+| `Ternary-Bonsai-2-2B-PQ2_0.gguf` | 493 MiB | [Ternary-Bonsai-2-2B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf) |
+| `Ternary-Bonsai-2-4B-PTQ1_0.gguf` | 906 MiB | [Ternary-Bonsai-2-4B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf) |
+| `Ternary-Bonsai-2-4B-PQ2_0.gguf` | 1.1 GiB | [Ternary-Bonsai-2-4B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf) |
+| `Ternary-Bonsai-2-9B-PTQ1_0.gguf` | 1.9 GiB | [Ternary-Bonsai-2-9B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf) |
+| `Ternary-Bonsai-2-9B-PQ2_0.gguf` | 2.3 GiB | [Ternary-Bonsai-2-9B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf) |
+| `Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5.5 GiB | [Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
+| `Ternary-Bonsai-2-27B-PQ2_0.gguf` | 6.7 GiB | [Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
 
 ### 2. Build
 
@@ -127,6 +150,17 @@ sampling values** and has a "reset to model defaults" button; a device/residency
 CPU, GPU, and layer-split loads. During a reply it shows live progress (`streaming · N tok ·
 m:ss · X tok/s`) — a 27B model runs at ~1 tok/s, so a long reply is slow but visible rather than  
 silent.
+
+**Model downloads** (download icon, top-right): every Bonsai file above is one click away.
+Tick the ones you want and hit **Download selected** — one file transfers at a time, the rest
+queue, each with its own progress bar, and partial files resume. Completed files appear in the
+model dropdown automatically. A custom `.gguf` URL + filename row covers anything off-catalog.
+Power options: `models/catalog.json` (or `HEARTH_MODEL_CATALOG_JSON`) overrides the catalog,
+`HEARTH_DL_ALLOW_HTTP=1` permits plain-http mirrors.
+
+**Lifetime:** closing the last chat tab shuts the server down ~25 s later (heartbeat + goodbye
+beacon; reloads re-register, generations and downloads in flight block shutdown). Set
+`HEARTH_NO_AUTO_SHUTDOWN=1` to keep it up for scripting.
 
 #### What do the flags mean?
 
