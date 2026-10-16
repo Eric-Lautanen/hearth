@@ -6,9 +6,11 @@
 //! own progress so the frontend can render per-model bars and let the user
 //! pick which models to fetch.
 //!
-//! The transfer itself runs in the system `curl` subprocess (present on
-//! Windows 10+, macOS and most Linux distros), which gives us resume,
-//! redirect handling and TLS without adding dependencies to this crate.
+//! Plain-`http://` transfers use the hand-rolled client in `http.rs` (no
+//! subprocess); `https://` still runs in the system `curl` subprocess until
+//! the hand-rolled TLS transport lands, so users without curl are covered as
+//! soon as it does. Either way: resume, redirect handling, and no new
+//! dependencies for this crate.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
