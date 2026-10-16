@@ -12,9 +12,11 @@
 //! Nothing here touches a socket, a clock or a filesystem. The caller feeds raw
 //! bytes in ([`ClientHandshake::feed`]) and writes the bytes it hands back
 //! ([`Out::Send`]). That is what keeps the state machine testable against
-//! RFC 8448's recorded flights, and it is why the transport and the CSPRNG live
-//! outside this crate: the caller supplies the randomness, so there is no
-//! entropy source here to be silently broken.
+//! RFC 8448's recorded flights, and it is why the transport, the CSPRNG and the
+//! clock live outside this crate: the caller supplies the randomness and the
+//! time ([`ClientConfig::validation_time`]), so there is no entropy source here
+//! to be silently broken and no `SystemTime::now()` to make a validity check
+//! depend on the day the test suite runs.
 //!
 //! # Certificate verification cannot be skipped
 //!
@@ -61,7 +63,7 @@
 //! into a failed state: `feed` returns [`ClientError::Failed`] from then on and
 //! no keys are installed. In particular a Finished MAC mismatch ends the
 //! connection — there is no branch that continues with unauthenticated bytes,
-//! and [`verify_finished`](crate::keyschedule::verify_finished) compares in
+//! and [`verify_finished`] compares in
 //! constant time.
 //!
 //! # What is not here
@@ -72,6 +74,8 @@
 //! in both directions. Extensions in `EncryptedExtensions` other than the empty
 //! `server_name` acknowledgment are refused, as RFC 8446 §4.3.1 requires of a
 //! client that did not offer them.
+
+use std::time::SystemTime;
 
 use crate::handshake::{
     self, HandshakeError, HandshakeReader, Message, ServerHello, Transcript,
@@ -241,6 +245,15 @@ impl From<x25519::SharedSecretError> for ClientError {
 /// the `Certificate` message — so a verifier never has to reimplement that and
 /// cannot get it subtly wrong.
 pub struct CertificateVerifyInput<'a> {
+    /// The instant this connection is considered to begin, verbatim from
+    /// [`ClientConfig::validation_time`].
+    ///
+    /// It is carried here rather than read by the verifier so that a validity
+    /// check is a pure function of its inputs: a verifier that called
+    /// `SystemTime::now()` itself could not be given an expired or
+    /// not-yet-valid chain in a test without those tests expiring with the
+    /// fixtures they use.
+    pub validation_time: UnixTime,
     /// The `certificate_list` from the `Certificate` message: the concatenation
     /// of `opaque certificate<1..2^24-1>` entries, so each certificate is a
     /// three-byte big-endian length followed by DER. Verified to frame exactly
@@ -253,10 +266,11 @@ pub struct CertificateVerifyInput<'a> {
     pub signature: &'a [u8],
     /// Exactly the bytes the signature must cover.
     pub signed_data: &'a [u8],
-    /// The SNI name the ClientHello asked for, if any. This is the one input a
-    /// verifier cannot derive from the messages it is handed, so it is carried
-    /// here rather than expected to be captured in the verifier: the client
-    /// already knows it, and a name that is checked against a captured copy is a
+    /// The SNI name the ClientHello asked for, if any. This is one of the two
+    /// inputs a verifier cannot derive from the messages it is handed — it is in
+    /// the ClientHello *we* sent, not in anything the server says — so it is
+    /// carried here rather than expected to be captured in the verifier: the
+    /// client already knows it, and a name checked against a captured copy is a
     /// name that can silently drift from the one on the wire.
     pub server_name: Option<&'a [u8]>,
 }
@@ -278,9 +292,79 @@ pub trait CertificateVerifier {
     /// `input.signature` over `input.signed_data`.
     ///
     /// The chain, the leaf's name for the server (`input.server_name`), the
-    /// expiry, and the signature itself are all the verifier's to check.
-    /// Returning `Ok(())` claims all of them hold.
+    /// validity window against `input.validation_time`, and the signature itself
+    /// are all the verifier's to check. Every one of those inputs is supplied by
+    /// the handshake rather than captured by the verifier, so returning `Ok(())`
+    /// claims exactly what the verifier was handed and nothing about state it
+    /// kept on the side.
     fn verify_certificate(&self, input: &CertificateVerifyInput<'_>) -> Result<(), String>;
+}
+
+/// An instant on the wall clock, as whole seconds since the Unix epoch.
+///
+/// This is the currency of X.509 validity: `notBefore` and `notAfter` are
+/// second-resolution times, so a verifier compares against seconds rather than
+/// against a [`SystemTime`], whose conversion to seconds is fallible and whose
+/// resolution is not what the comparison is defined in terms of.
+///
+/// Reading the clock is the caller's business, not this crate's: a
+/// [`UnixTime`] reaches the state machine through
+/// [`ClientConfig::validation_time`], so a test can ask for any instant in
+/// either direction from now and expect the same answer forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnixTime {
+    /// Seconds since 1970-01-01T00:00:00Z. Negative before the epoch, which the
+    /// sign is kept for so that a subtraction against a validity bound cannot
+    /// wrap.
+    pub secs: i64,
+}
+
+impl UnixTime {
+    /// An instant `secs` seconds after the epoch.
+    pub const fn from_secs(secs: i64) -> Self {
+        Self { secs }
+    }
+
+    /// 1970-01-01T00:00:00Z.
+    pub const fn epoch() -> Self {
+        Self { secs: 0 }
+    }
+
+    /// The instant a [`SystemTime`] denotes, saturating rather than wrapping on
+    /// a clock set absurdly far from the epoch.
+    pub fn from_system_time(time: SystemTime) -> Self {
+        match time.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(since) => Self {
+                secs: i64::try_from(since.as_secs()).unwrap_or(i64::MAX),
+            },
+            Err(before) => Self {
+                secs: i64::try_from(before.duration().as_secs())
+                    .map_or(i64::MIN, |seconds| -seconds),
+            },
+        }
+    }
+
+    /// Whether `self` falls outside the inclusive `[not_before, not_after]`
+    /// window, which is the check every X.509 verifier makes. `None` for
+    /// `not_before` means "no lower bound".
+    ///
+    /// It lives here, next to the type, so that the one comparison the whole
+    /// certificate slice turns on is written once and can be tested directly.
+    pub fn outside(self, not_before: Option<Self>, not_after: Self) -> bool {
+        not_before.is_some_and(|start| self < start) || self > not_after
+    }
+}
+
+impl From<SystemTime> for UnixTime {
+    fn from(time: SystemTime) -> Self {
+        Self::from_system_time(time)
+    }
+}
+
+impl std::fmt::Display for UnixTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}s since the Unix epoch", self.secs)
+    }
 }
 
 /// The only verifier this crate provides, and it can only refuse.
@@ -297,10 +381,21 @@ impl CertificateVerifier for RejectAll {
     }
 }
 
-/// The inputs the caller owns: randomness, and the name to ask for.
+/// The inputs the caller owns: randomness, time, and the name to ask for.
 pub struct ClientConfig<'a> {
     /// The SNI host name. `None` sends no `server_name` extension.
     pub server_name: Option<&'a str>,
+    /// The instant this connection is considered to begin, which is the "now"
+    /// a [`CertificateVerifier`] checks the chain's validity window against. It
+    /// reaches the verifier as [`CertificateVerifyInput::validation_time`].
+    ///
+    /// Reading the clock is the caller's job — `SystemTime::now().into()` at the
+    /// point the connection is opened — and that keeps the state machine free of
+    /// a clock exactly as it is free of a socket and a CSPRNG. A connection that
+    /// takes a week or a year would want a fresher reading, but a TLS handshake
+    /// is seconds; the same instant is what the transcript and the keys are
+    /// bound to.
+    pub validation_time: UnixTime,
     /// 32 bytes from a CSPRNG, the `Random` in the ClientHello.
     pub random: [u8; 32],
     /// The legacy session id. A non-empty value puts us in middlebox
@@ -370,6 +465,8 @@ impl Phase {
 /// `feed` until [`Out::Connected`], then `write`/`feed`.
 pub struct ClientHandshake<V> {
     server_name: Option<String>,
+    /// The caller's clock reading, handed to the verifier untouched.
+    validation_time: UnixTime,
     session_id: Vec<u8>,
     private_key: [u8; 32],
     random: [u8; 32],
@@ -422,6 +519,7 @@ impl<V: CertificateVerifier> ClientHandshake<V> {
         }
         Ok(Self {
             server_name: config.server_name.map(str::to_string),
+            validation_time: config.validation_time,
             session_id: config.session_id,
             private_key: config.private_key,
             random: config.random,
@@ -824,6 +922,7 @@ impl<V: CertificateVerifier> ClientHandshake<V> {
             signature_scheme: scheme,
             signature,
             signed_data: &signed_data,
+            validation_time: self.validation_time,
             server_name: self.server_name.as_deref().map(str::as_bytes),
         };
         self.verifier
@@ -1076,12 +1175,18 @@ mod tests {
         TYPE_NEW_SESSION_TICKET,
     };
     use crate::sha256::{hmac_sha256, Sha256};
+    use std::sync::{Arc, Mutex};
 
     const CLIENT_PRIV: [u8; 32] = [0x11; 32];
     const SERVER_PRIV: [u8; 32] = [0x22; 32];
     const SERVER_RANDOM: [u8; 32] = [0x33; 32];
     const SESSION_ID: [u8; 32] = [0x5a; 32];
     const SNI: &str = "models.example";
+    /// The instant every handshake in these tests claims to begin. It is a
+    /// constant, and deliberately *not* `SystemTime::now()`: the certificate
+    /// slice's expired/not-yet-valid tests must give the same answer in 2036 as
+    /// they do today.
+    const VALIDATION_TIME: UnixTime = UnixTime::from_secs(1_700_000_000);
     /// A stand-in for a DER certificate: this slice only has to *carry* a chain,
     /// never read one.
     const FAKE_CERTIFICATE: [u8; 40] = [0xca; 40];
@@ -1111,6 +1216,7 @@ mod tests {
     struct ExpectingChain {
         through_certificate: [u8; 32],
         chain: Vec<u8>,
+        validation_time: UnixTime,
     }
 
     impl CertificateVerifier for ExpectingChain {
@@ -1134,6 +1240,10 @@ mod tests {
                 "the name the ClientHello asked for reaches the verifier, so it never has to capture it"
             );
             assert_eq!(
+                input.validation_time, self.validation_time,
+                "the caller's clock reading reaches the verifier untouched"
+            );
+            assert_eq!(
                 input.certificate_list,
                 &self.chain[..],
                 "the chain from Certificate"
@@ -1147,6 +1257,56 @@ mod tests {
         }
     }
 
+    /// A verifier that records every instant it is shown through a shared
+    /// handle, so a test can read them after the verifier has moved into the
+    /// client.
+    #[derive(Clone)]
+    struct RecordingTime(Arc<Mutex<Vec<UnixTime>>>);
+
+    impl CertificateVerifier for RecordingTime {
+        fn verify_certificate(&self, input: &CertificateVerifyInput<'_>) -> Result<(), String> {
+            self.0
+                .lock()
+                .expect("the recording handle is not poisoned")
+                .push(input.validation_time);
+            Ok(())
+        }
+    }
+
+    /// Runs an honest handshake whose configuration claims to begin at `time`,
+    /// and returns every instant the verifier was shown.
+    fn instants_seen(time: UnixTime) -> Vec<UnixTime> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (_, from_waiting) = waiting_client(Some(SNI));
+        let flight = honest_flight(&from_waiting);
+
+        let mut client = ClientHandshake::new(
+            ClientConfig {
+                server_name: Some(SNI),
+                validation_time: time,
+                random: [0x44; 32],
+                session_id: SESSION_ID.to_vec(),
+                private_key: CLIENT_PRIV,
+            },
+            RecordingTime(Arc::clone(&seen)),
+        )
+        .expect("valid configuration");
+        let again = client.start().expect("we build our own ClientHello");
+        assert_eq!(
+            from_waiting, again,
+            "a fixed configuration builds one ClientHello"
+        );
+
+        let events = client.feed(&flight.bytes).expect("an honest flight");
+        assert!(
+            events.contains(&Out::Connected),
+            "the handshake completed: {events:?}"
+        );
+        let seen = seen.lock().expect("the recording handle is not poisoned");
+        assert_eq!(seen.len(), 1, "one CertificateVerify, one decision");
+        seen.clone()
+    }
+
     fn client<V: CertificateVerifier>(
         verifier: V,
         session_id: Vec<u8>,
@@ -1155,6 +1315,7 @@ mod tests {
         let mut client = ClientHandshake::new(
             ClientConfig {
                 server_name,
+                validation_time: VALIDATION_TIME,
                 random: [0x44; 32],
                 session_id,
                 private_key: CLIENT_PRIV,
@@ -1616,6 +1777,7 @@ mod tests {
             ExpectingChain {
                 through_certificate: flight.through_certificate,
                 chain: flight.chain.clone(),
+                validation_time: VALIDATION_TIME,
             },
             SESSION_ID.to_vec(),
             Some(SNI),
@@ -1707,6 +1869,7 @@ mod tests {
         let mut client = ClientHandshake::new(
             ClientConfig {
                 server_name: Some(SNI),
+                validation_time: VALIDATION_TIME,
                 random: [0x44; 32],
                 session_id: SESSION_ID.to_vec(),
                 private_key: CLIENT_PRIV,
@@ -1725,6 +1888,34 @@ mod tests {
             "{error:?}"
         );
         assert!(!client.is_connected());
+    }
+
+    /// The instant the verifier is shown is the one the caller put in the
+    /// configuration, never the time of day.
+    ///
+    /// Every instant here is one that a clock would not report: 1970, the second
+    /// before it, and the year 2100. If the state machine read a clock this test
+    /// would fail today, and — the part that matters — it would still fail the
+    /// same way in 2040, because none of these values is "now" at any date.
+    /// That is what makes the certificate slice's expired and not-yet-valid tests
+    /// writable at all: they need an answer that does not age with the fixture.
+    #[test]
+    fn the_verifier_is_given_the_callers_instant_and_not_the_clock() {
+        for time in [
+            UnixTime::from_secs(-1),
+            UnixTime::epoch(),
+            UnixTime::from_secs(1_700_000_000),
+            UnixTime::from_secs(4_102_444_800), // 2100-01-01T00:00:00Z
+        ] {
+            assert_eq!(instants_seen(time), vec![time], "{time}");
+        }
+
+        // Two configurations are two instants, so the value is threaded through
+        // rather than defaulted to a constant.
+        assert_ne!(
+            instants_seen(UnixTime::epoch()),
+            instants_seen(UnixTime::from_secs(1))
+        );
     }
 
     #[test]
@@ -2091,6 +2282,7 @@ mod tests {
         let mut client = ClientHandshake::new(
             ClientConfig {
                 server_name: None,
+                validation_time: VALIDATION_TIME,
                 random: [0x44; 32],
                 session_id: Vec::new(),
                 private_key: CLIENT_PRIV,
@@ -2107,6 +2299,7 @@ mod tests {
     fn a_bad_configuration_is_refused() {
         let config = |session_id: Vec<u8>, name: Option<&'static str>| ClientConfig {
             server_name: name,
+            validation_time: VALIDATION_TIME,
             random: [0x44; 32],
             session_id,
             private_key: CLIENT_PRIV,
@@ -2114,5 +2307,64 @@ mod tests {
         assert!(ClientHandshake::new(config(vec![0u8; 33], None), RejectAll).is_err());
         assert!(ClientHandshake::new(config(Vec::new(), Some("")), RejectAll).is_err());
         assert!(ClientHandshake::new(config(Vec::new(), None), RejectAll).is_ok());
+    }
+
+    /// The time arithmetic, which is pure, is tested exactly rather than only
+    /// through a handshake.
+    mod unix_time {
+        use super::*;
+        use std::time::Duration;
+
+        #[test]
+        fn a_system_time_converts_at_second_resolution_in_both_directions() {
+            let epoch = SystemTime::UNIX_EPOCH;
+            assert_eq!(UnixTime::from_system_time(epoch), UnixTime::epoch());
+            assert_eq!(UnixTime::from(epoch), UnixTime::epoch());
+            assert_eq!(
+                UnixTime::from_system_time(epoch + Duration::from_secs(1_700_000_000)),
+                UnixTime::from_secs(1_700_000_000)
+            );
+            // A clock set before 1970 must not panic or wrap.
+            assert_eq!(
+                UnixTime::from_system_time(epoch - Duration::from_secs(5)),
+                UnixTime::from_secs(-5)
+            );
+            // Sub-second precision is truncated, not rounded: X.509 bounds are
+            // second-resolution, so a bound of `T` is valid through the whole of
+            // second `T` rather than only its first instants.
+            assert_eq!(
+                UnixTime::from_system_time(epoch + Duration::from_millis(1500)),
+                UnixTime::from_secs(1)
+            );
+            assert_eq!(
+                UnixTime::from_system_time(epoch + Duration::from_micros(999_999)),
+                UnixTime::epoch()
+            );
+        }
+
+        #[test]
+        fn the_validity_window_is_inclusive_at_both_ends() {
+            let not_before = UnixTime::from_secs(1_000);
+            let not_after = UnixTime::from_secs(2_000);
+            assert!(!UnixTime::from_secs(1_500).outside(Some(not_before), not_after));
+            assert!(
+                !not_before.outside(Some(not_before), not_after),
+                "inclusive"
+            );
+            assert!(!not_after.outside(Some(not_before), not_after), "inclusive");
+            assert!(UnixTime::from_secs(999).outside(Some(not_before), not_after));
+            assert!(UnixTime::from_secs(2_001).outside(Some(not_before), not_after));
+            // A missing lower bound leaves only the upper one in force.
+            assert!(!UnixTime::epoch().outside(None, not_after));
+            assert!(UnixTime::from_secs(2_001).outside(None, not_after));
+        }
+
+        #[test]
+        fn display_names_the_unit_so_an_error_cannot_be_misread() {
+            assert_eq!(
+                UnixTime::from_secs(1_700_000_000).to_string(),
+                "1700000000s since the Unix epoch"
+            );
+        }
     }
 }

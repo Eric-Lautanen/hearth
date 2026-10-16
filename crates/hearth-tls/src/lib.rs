@@ -32,7 +32,7 @@
 //!   transcribed
 //! - [`gcm`] — AES-128-GCM, the mandatory TLS 1.3 record cipher, with a
 //!   branchless and table-free GHASH and a constant-time tag compare
-//! - [`x25519`] — X25519 key exchange, with the small-order-point check that
+//! - [`mod@x25519`] — X25519 key exchange, with the small-order-point check that
 //!   RFC 7748 §6.1 requires, made unskippable by having no unchecked API for
 //!   protocol code to reach for
 //!
@@ -57,14 +57,48 @@
 //!   the fatal Finished MAC check, our own Finished, `KeyUpdate` in both
 //!   directions and `close_notify`. It takes bytes in and hands bytes back, so
 //!   it drives a transport the caller owns, and it cannot be built without a
-//!   [`CertificateVerifier`].
+//!   [`CertificateVerifier`]. The verifier is handed every input it needs — the
+//!   chain, the signed data, the name we asked for and the caller's clock
+//!   reading ([`UnixTime`]) — so a verification decision is a function of its
+//!   arguments rather than of a clock the verifier reads itself, and the
+//!   certificate slice's expiry tests cannot rot as the fixtures age.
+//! - [`rsa`] — RSA signature verification: `rsa_pss_rsae_sha256` with MGF1-SHA-256
+//!   and a 32-byte salt, over the same `signed_data` the state machine already
+//!   rebuilds. Nothing calls it yet (the public key still has to come out of a
+//!   certificate), which is why the only verifier the crate ships remains
+//!   [`RejectAll`].
+//! - [`der`] — reading DER (X.690) strictly: definite lengths only, minimal
+//!   encodings only, no trailing bytes, no high-tag-number form. Every point where
+//!   two readers could disagree about what a certificate says is a refusal here,
+//!   and each refusal has a test.
+//! - [`x509`] — a certificate's fields, read over [`der`]: the bytes a signature
+//!   covers, both names as their own DER for chain linkage, the validity window as
+//!   [`UnixTime`]s, the public key, and the extensions that constrain it. A
+//!   critical extension it does not understand is a rejection, as RFC 5280 §4.2
+//!   requires, and the `signatureAlgorithm` inside the signed part must be
+//!   byte-identical to the one outside it.
+//!
+//! - [`p256`] — the P-256 curve: the field, the group, and the two scalar
+//!   multiplications ECDSA needs. The constants come from OpenSSL's explicit
+//!   parameters and are checked in-tree (`n * G` is the identity, the generator is
+//!   on the curve), so a wrong constant fails the suite rather than a handshake.
+//! - [`ecdsa`] — `ecdsa_secp256r1_sha256`, over [`der`] for the signature's
+//!   encoding and [`p256`] for the equation. Like the RSA module it is a
+//!   primitive that nothing calls yet.
 //!
 //! Still to come:
-//! 1. **Certificate verification** — the largest and most dangerous piece:
-//!    X.509 chain building, ECDSA/RSA signature checks and a pinned root
-//!    store. Until it exists the only verifier here is
-//!    [`RejectAll`], which can only refuse, so no `https://` path may be
-//!    enabled on this crate's account.
+//! 1. **The certificate *decision*.** Both halves of signature verification now
+//!    exist — RSA-PSS and ECDSA, each pinned to vectors from an independent
+//!    implementation — and a certificate parses, so every ingredient is present.
+//!    What does not exist is the code that *decides*: chain building to a pinned
+//!    root, name matching, the validity window check against [`UnixTime`], a
+//!    minimum key size, and the key-to-scheme matching that stops a P-256 key
+//!    being verified with an RSA scheme. Its inputs are settled: the chain, the
+//!    signature and the signed data come from the handshake
+//!    ([`CertificateVerifyInput`]), the name from our own ClientHello, the instant
+//!    from [`ClientConfig`], and the fields from [`x509`]. Until that exists the
+//!    only verifier here is [`RejectAll`], which can only refuse, so no `https://`
+//!    path may be enabled on this crate's account.
 //! 2. **The transport** — sockets, and the read/write loop that drives it. That
 //!    belongs in the downloader rather than here, where it would drag I/O into
 //!    code that is provable in isolation.
@@ -84,13 +118,19 @@ pub(crate) fn hardware_disabled() -> bool {
 
 pub mod aes;
 pub mod client;
+pub mod der;
+pub mod ecdsa;
 pub mod gcm;
 pub mod handshake;
 pub mod hkdf;
 pub mod keyschedule;
+pub mod p256;
 pub mod record;
+pub mod rsa;
 pub mod sha256;
+pub mod verify;
 pub mod x25519;
+pub mod x509;
 
 pub(crate) mod util;
 
@@ -102,8 +142,9 @@ pub(crate) mod ghash_x86;
 pub use aes::Aes128;
 pub use client::{
     CertificateVerifier, CertificateVerifyInput, ClientConfig, ClientError, ClientHandshake, Out,
-    RejectAll,
+    RejectAll, UnixTime,
 };
+pub use der::{oid_from_dotted, Class, Der, DerError, Element, Oid, Tag};
 pub use gcm::{Aes128Gcm, GcmError, NONCE_LEN, TAG_LEN};
 pub use handshake::{
     build_client_hello, parse_server_hello, ClientHelloParams, HandshakeError, HandshakeReader,
@@ -112,5 +153,10 @@ pub use handshake::{
 pub use hkdf::{derive_secret, derive_secret32, hkdf_expand, hkdf_expand_label, hkdf_extract};
 pub use keyschedule::{finished_key, finished_verify_data, verify_finished, TrafficSecrets};
 pub use record::{Record, RecordError, RecordLayer, TrafficKeys};
+pub use rsa::{RsaError, RsaPublicKey};
 pub use sha256::{hmac_sha256, hmac_sha256_parts, Sha256};
+pub use verify::{verify_certificate_signature, verify_handshake_signature, Suite, VerifyError};
 pub use x25519::{diffie_hellman, public_key, x25519, SharedSecretError, BASEPOINT};
+pub use x509::{
+    Certificate, GeneralName, KeyUsage, Name, PublicKey, SignatureAlgorithm, X509Error,
+};

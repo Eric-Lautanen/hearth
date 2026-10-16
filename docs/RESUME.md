@@ -1,58 +1,85 @@
 # Hearth — next session
 
-> **Session 2026-10-16 (pt 2) in one paragraph.** Finished the hand-rolled TLS handshake. `crates/hearth-tls`
-> gained `util.rs` (one shared constant-time compare), `keyschedule.rs`, `handshake.rs` (framing,
-> ClientHello, strict ServerHello, transcript), `client.rs` (the 1-RTT state machine: the encrypted
-> server flight, fatal Finished check, our own Finished, `KeyUpdate` both ways, `close_notify`) and
-> `tests/rfc8448_flight.rs`. **101 tests green on both the hardware and the forced-software path**,
-> clippy `-D warnings` and `cargo fmt --check` clean, `std`-only, empty `[dependencies]`. The fixture is
-> RFC 8448's real 679-octet encrypted server flight, which the AEAD tag and the published Finished MAC
-> pin byte for byte, and the client's own Finished record re-seals to the trace's 58 bytes. Two things
-> found by deriving rather than reading: a `researcher-web` transcription of the client Finished had
-> **three wrong bytes** (29 of 32 matched, which is what gave it away; the RFC's text agrees with the
-> derivation) and RFC 8448's `Certificate` message is internally inconsistent by two bytes (asserted,
-> documented, not "fixed"). **Certificate verification is the remaining piece and it is the dangerous
-> one**: until it exists the crate must not be wired to any `https://` path. All work is on
-> `origin/main`. History, the anomaly and the full test list: `docs/BUG_TRACKER.md`.
+> **Session 2026-10-16 (pt 3, continued) in one paragraph.** The decision half now exists at the level of
+> its *primitives*: `rsa.rs` gained PKCS#1 v1.5 (`sha256WithRSAEncryption` — the scheme TLS 1.3 removed
+> from the handshake and every CA still signs with), and a new `verify.rs` holds which scheme may verify
+> which key (`Suite`), the errors they fail with (`VerifyError`), and the two dispatches
+> (`verify_certificate_signature`, `verify_handshake_signature`). The asymmetry is enforced by shape, not
+> by comment: the handshake entry accepts only `0x0804` and `0x0403`, the certificate entry additionally
+> accepts PKCS#1 v1.5, and the PKCS#1 `DigestInfo` is checked **structurally** — every byte accounted for
+> by position, nothing after it — because Bleichenbacher's attack needs a verifier that searches for the
+> `DigestInfo` and accepts what surrounds it. That path is now proven on RFC 8448's own CertificateVerify,
+> which verifies through the dispatch under the scheme byte read out of the trace and is refused under
+> `0x0401` with the same key and bytes. **177 checks green on the hardware path and on
+> `HEARTH_TLS_NO_HW=1`** (169 before), clippy `--all-targets -D warnings`, fmt, `cargo doc` (zero
+> warnings) and `cargo check --workspace --all-targets` all clean, `std`-only, empty `[dependencies]`,
+> still unreachable from any `https://` path (`grep` finds the crate name nowhere outside itself). The
+> session's real find was **a fixture that shared a key**: verifying `SELF_SIGNED_PSS` with the root's key
+> returned `Ok(())`, because the generator had built it with `root_key` — so "verified with the wrong
+> identity fails" was not a check the fixture set could make. Each fixture now has its own key. The lesson
+> is the same one the previous slice recorded: an assertion that holds for a reason unrelated to the
+> property it names. History and the full test list: `docs/BUG_TRACKER.md`.
 
 ## Next session — in this order
 
-1. **Certificate verification — the last piece before the downloader can use any of this.**
-   The seam already exists and is the only place to plug in:
-   `client::CertificateVerifier`, called with `CertificateVerifyInput { certificate_list,
-   signature_scheme, signature, signed_data }`, where `signed_data` is already the RFC 8446 §4.4.3
-   construction (64 spaces, `"TLS 1.3, server CertificateVerify"`, a zero byte, then the transcript
-   hash through `Certificate`). A `ClientHandshake` cannot be built without a verifier and the crate
-   ships exactly one, `RejectAll`, which can only refuse — **keep it that way**: no accept-all type, no
-   flag, no environment variable, nothing a URL can reach that weakens verification. A failed chain, a
-   wrong signature, an expired certificate or a hostname mismatch must abort the connection.
+1. **Certificate verification — the *decision*, which is still the only thing standing between this
+   crate and an `https://` URL.** Every ingredient exists, and as of this session so does key-to-scheme
+   matching: a certificate parses (`x509.rs`), every suite verifies (`rsa.rs` for both RSA suites —
+   PKCS#1 v1.5 included, since that is what certificates are signed with — and `ecdsa.rs` for
+   `ecdsa_secp256r1_sha256`, each pinned to vectors from an independent implementation), and `verify.rs`
+   decides *which scheme may verify which key*, for a certificate link and for a `CertificateVerify`.
+   What does not exist is anything that decides whether a chain is *trustworthy*. That decision is the
+   dangerous half and the next session's main line of work. **Note the shape of it as it now stands:**
+   the pieces are wired to nothing — `verify.rs` is reachable only from its own tests and this crate
+   ships no way to call it — so the work is plumbing plus policy rather than new cryptography, in this
+   order: chain building to a pinned root, then hostname matching, then the validity window.
+   - The seam is unchanged and is the only place to plug in: `client::CertificateVerifier`, called with
+     `CertificateVerifyInput { server_name, certificate_list, signature_scheme, signature,
+     signed_data }`, where `signed_data` is already the RFC 8446 §4.4.3 construction (64 spaces,
+     `"TLS 1.3, server CertificateVerify"`, a zero byte, then the transcript hash through
+     `Certificate`). A `ClientHandshake` cannot be built without a verifier and the crate ships exactly
+     one, `RejectAll`, which can only refuse — **keep it that way**: no accept-all type, no flag, no
+     environment variable, nothing a URL can reach that weakens verification.
    - **The verifier interface is settled and enforced — do not widen it.** `CertificateVerifier` is
      deliberately **not** implemented for closures (a `compile_fail` doctest in `client.rs` requires
-     `|_| Ok(())` to be rejected), so every verifier is a named type, and `CertificateVerifyInput`
-     carries `server_name` beside the chain, the scheme, the signature and the 130-byte `signed_data`.
-     This came out of SparkOC's review: the blanket `Fn` impl had made an accept-all a one-liner, and
-     the tests were using it. Keep `RejectAll` the only verifier in the crate.
-   - Build it in the order that can be *proven* first. Start with **signature verification**, because
-     RFC 8448 gives a vector for it: the trace's `CertificateVerify` is `rsa_pss_rsae_sha256` over the
-     130-byte `signed_data` we already reconstruct byte-for-byte, with a 128-byte signature (the trace's
-     test key is **RSA-1024** — its DER modulus is 128 bytes). The trace also publishes that key's
-     *private* parts, so signing can be checked too. Then `ecdsa_secp256r1_sha256`, which is the other
-     suite we advertise (P-256 needs its own field arithmetic; the x25519 limb approach ports, the
-     curve does not). Generate extra vectors locally with OpenSSL/`cryptography` and pin them the same
-     way slices 2-5 did, with the values re-derived here before being embedded.
-   - Then the X.509 side: DER parsing (SEQUENCE/INTEGER/BIT STRING/OID), the fields that matter for a
-     downloader (basicConstraints CA, keyUsage, validity, subjectAltName dNSName, the signature
-     algorithm and the issuer/subject linkage), chain building to a pinned root, and hostname matching
-     that is an exact/case-insensitive dNSName match with no wildcard surprises.
+     `|_| Ok(())` to be rejected), so every verifier is a named type. This came out of SparkOC's
+     review: the blanket `Fn` impl had made an accept-all a one-liner, and the tests were using it.
+   - Build the checks in the order each one can be *proven*:
+     1. **Key-to-scheme matching — done, in `verify.rs`.** `Suite::from_certificate_algorithm` maps a
+        certificate's own `AlgorithmIdentifier` to a suite (refusing a PSS salt length that is not the
+        hash length) and `Suite::from_handshake_scheme` maps a wire code point the same way, so `0x0804`
+        (`rsa_pss_rsae_sha256`) is only ever verified with an RSA key and `0x0403`
+        (`ecdsa_secp256r1_sha256`) only with a P-256 one; a mismatch is
+        `VerifyError::SchemeKeyMismatch`, naming both. Cross-checking a scheme against a key of the
+        wrong type is the classic way a verifier is walked into an RSA key being read as an EC point or
+        a curve being substituted, so it is checked before any arithmetic. **What is left is the
+        calling:** each chain link's `AlgorithmIdentifier` and its issuer's key go to
+        `verify_certificate_signature`, and `CertificateVerify`'s scheme with the leaf's key goes to
+        `verify_handshake_signature` — which accepts only the two schemes RFC 8446 kept, so a peer
+        cannot get PKCS#1 v1.5 accepted as a handshake signature. The suite constants are
+        `handshake::SIG_RSA_PSS_RSAE_SHA256` and `handshake::SIG_ECDSA_SECP256R1_SHA256`.
+     2. **Chain building to a pinned root**, linking issuers to subjects by the raw DER of the names
+        (never by parsed strings), rejecting anything that is not CA (`basicConstraints`), rejecting
+        a CA used as a leaf, capping chain length, and enforcing a minimum RSA key size — remember
+        `rsa.rs` deliberately accepts a 1024-bit key because RFC 8448's fixture is one, so that policy
+        lives here and not there.
+     3. **Hostname matching** — exact or case-insensitive `dNSName` match against `server_name`, no
+        wildcard surprises (if wildcards ship at all, one leading label only, and the prefix must not
+        be empty or match a public suffix).
+     4. **The validity window** against the `UnixTime` from `ClientConfig`, and `keyUsage` /
+        `extendedKeyUsage` sanity (`serverAuth`).
    - **The root store is a decision to make explicitly, not to drift into.** `std` has no way to read
      the OS trust store on all three platforms, so the choice is a small pinned set in-tree with
      fingerprints and a documented update path, versus a per-platform reader. Pick the pinned set, say
      so in the module docs, and make its contents reviewable in one screen.
-   - Land it with the negative tests before any URL can use it: **bad signature, expired, not-yet-valid,
-     unknown root, hostname mismatch, a CA used as a leaf (basicConstraints), a chain that is too long,
-     and an RSA key that is too small**. Do not let the downloader take an `https://` path through this
-     code until those exist. Measured calibration from the last session still stands: the primitives
-     were ~600-900 lines, and this half is the 2000-3000 line one.
+   - Land it with the negative tests before any URL can use it: **expired, not-yet-valid, unknown
+     root, hostname mismatch, a CA used as a leaf (basicConstraints), a chain that is too long, an RSA
+     key that is too small, and a scheme that does not match the key type**. The "bad signature" and
+     "malformed encoding" cases now exist at the primitive level (`tests/ecdsa_vectors.rs`,
+     `tests/rsa_vectors.rs`), so what is left is the chain-level set. Do not let the downloader take an
+     `https://` path through this code until those exist. Calibration from the three slices: RSA was
+     ~600 lines, the X.509 reading half ~1000, and P-256 + ECDSA ~1000 including their vectors — so the
+     decision half is plausibly another 600–900, most of it policy and tests rather than arithmetic.
    - `Transport` in `hearth-ui/src/http.rs` is the seam and the `https://` branch of
      `downloads.rs::run_transfer` is what gets rewired afterwards. **Do not touch `http.rs` without
      asking — it is SparkOC's file.** Loose thread to close at the same time: the downloader's DNS
@@ -109,8 +136,27 @@
    (`bench_results/run_cpu_bench.bat`). (c) `cargo check -p hearth-diffusion` warns that
    `FluxTransformer::gpu_f32_bufs` (`transformer.rs:46`) is never read — pre-existing, in SparkOC's
    area, deliberately left alone.
+10. **P-256 verification is 345.6 µs, and the levers are known.** Measured in release with the
+   `--ignored` timing test in `tests/ecdsa_vectors.rs`. That is several times slower than OpenSSL and
+   the reasons are not mysterious, in descending order of payoff: (a) the fixed-base multiply has no
+   precomputed table and no windowing, so `u1 * G` costs the same as `u2 * Q` even though `G` is
+   constant — a small comb or window table for the base is the single biggest win; (b) the scalar
+   multiplication is plain left-to-right double-and-add rather than a signed-digit or sliding-window
+   form; (c) the multiplication is the coarse "multiply then reduce" Montgomery product from `rsa.rs`
+   rather than an interleaved CIOS one; (d) the scalar inverse (and the field inverse per point) uses
+   Fermat, ~384 multiplications, where a binary extended Euclidean inverse is a few dozen. **Do not do
+   any of this before measuring**, and note that (a) and (b) make the *code* harder to audit in the one
+   place where an error is a security bug — this is a 350 µs cost paid once per connection, against a
+   download measured in seconds. Profile first, and treat anything that makes `p256.rs` less obviously
+   correct as a bad trade unless a connection setup is actually on a critical path.
 
 ## Standings and hazards
+
+- **`p256.rs` is verification-only, and variable time by design.** Scalar multiplication branches on
+  the scalar's bits, which is safe because every scalar this crate multiplies by comes from a signature
+  or a hash. It is therefore *unfit for signing or ECDH as written*: either would need a ladder with
+  conditional swaps and its own tests. TLS 1.3 here uses X25519 and this crate never signs, so keep it
+  that way — and if that ever changes, do not reuse `mul` as it stands.
 
 - **Do not re-derive the prefill/decode asymmetry.** It was answered and the premise was wrong: with
   `HEARTH_Q35_TIMERS=1`, the 27B PTQ1_0 is 635 ms/token prefill against 722 decode (prefill is
@@ -136,14 +182,47 @@
   `cargo fmt -p <crate>`. Same for clippy with `-D warnings`.
 - `target/release/hearth-chat-cli.exe` is often locked by a running UI: build to a spare
   `CARGO_TARGET_DIR` instead of killing a process you do not own.
+- **A constant copied from memory is not a vector.** The X.509 slice's ten `UnixTime` expectations were
+  written by hand and every one was wrong; the code was right. Re-derive from an *independent*
+  implementation (CPython's `datetime` beside the `days_from_civil` algorithm, or OpenSSL beside the
+  RFC's text) and let the two of them agree before embedding anything. A published vector is only as
+  good as the copying — the handshake slice's client Finished arrived from a web research pass with
+  three wrong bytes, and only the derivation caught it.
+- **A test whose two sides run the same code proves nothing, however many assertions it has.** The
+  P-256 slice's doubling formula was correct only when `Z == 1`, and it passed every comparison in the
+  suite because the comparisons were between the ladder and the group law *invoked with the same
+  operand sequence*: `assert_eq!(g.double().double(), ladder(4))` is `assert_eq!(x, x)`. It surfaced as
+  arithmetic instead — 7G came back off the curve — and the repair was to pin values from an
+  independent implementation (2G…7G x coordinates from the Python in `scripts/tls_p256_params.py`).
+  Before writing an agreement test, ask what each side computes.
+- **A control that passes is a control that was never tested.** The fixture slice's "a certificate
+  verified with the wrong identity fails" check returned `Ok(())`, and the cause was the *fixture*, not
+  the verifier: the generator had built `SELF_SIGNED_PSS` with `root_key`, so that certificate really was
+  signed by the key it was being checked against. Two habits follow. When a negative case passes, suspect
+  the fixture before the code — **two fixtures that share a key cannot tell verification from a key
+  lookup**, and every identity gets its own seed for that reason. And do not pin *which* rule fires when
+  the input is garbage: a wrong key's RSA operation produces an effectively random block, so the refusal
+  can come from any of four checks, and pinning one pins an accident of that key.
+- **When a bug cancels against another bug, the test that should have caught it can pass harder.** Two
+  Montgomery-domain mistakes in the same file (`ONE` as the limbs `1`, and an inverse returning a plain
+  value into a world where every value is Montgomery) made `inverse * value == ONE` hold while the
+  curve arithmetic was wrong. Assert the *domain* directly — `ONE` has to read back as the bytes `1`,
+  and a value has to survive a round trip through its Montgomery form — because no test that multiplies
+  an inverse back can see which domain it is in.
+- **A claim in a doc comment is a claim, and gets checked the same way.** The same slice's paragraph
+  here said the fixtures "regenerate byte-identically"; two of the six do not, because RSA-PSS salts
+  randomly and ECDSA nonces randomly. Nothing in the test suite could catch that — the tests passed
+  either way — and only regenerating to a scratch path and diffing exposed it. Before writing that a
+  file reproduces, a check passes, or a property holds, run it once and look.
 - **Suspect your own harness before reporting someone else's data as broken.** Three times now a
   "finding" was my own bug: a helper that wrote CRLF made curl report HTTP 000 on 14 valid URLs, a
   Python `allow_reuse_address` server silently answered a later test on the same port on Windows, and
   in the handshake slice a ClientHello slice that still carried its 4-byte handshake header shifted my
-  session-id offsets by four bytes.
-- **A published vector is only as good as the copying.** Every constant in `hearth-tls` is either
-  re-derived locally from an independent implementation (OpenSSL via Python's `cryptography`) or
-  asserted against a second published value that covers it. The handshake slice's client Finished
-  arrived with three wrong bytes; only the derivation caught it.
+  session-id offsets by four bytes. In the X.509 slice the same reflex caught three more: an assumed
+  TBS offset of zero, an assumed signature length following the subject's key instead of the issuer's,
+  and a `keyUsage` bit order read from bit 0 instead of the high bit.
 - Test fixtures must be *correct*, not just the right length: a 50-byte prefix of `b"\x00"` is not a
   prefix of `bytes(range(100))`, and that mistake made a valid resume look like a content mismatch.
+  Prefer *generated* fixtures (``scripts/tls_x509_fixtures.py`` writes the Rust array from seeded
+  keys) over transcribed ones, and parse the expectations back out of the artifact instead of typing
+  them.

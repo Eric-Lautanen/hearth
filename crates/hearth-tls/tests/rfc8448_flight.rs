@@ -40,6 +40,26 @@
 //! [`the_rfcs_certificate_message_has_two_unaccounted_bytes`] asserts it so that
 //! nobody later "fixes" the fixture. Real servers emit a consistent list, and a
 //! list that is inconsistent is refused by `hearth_tls::client`.
+//!
+//! # The certificate in this trace expired on 2026-07-30
+//!
+//! `notBefore` 2016-07-30T01:23:59Z, `notAfter` 2026-07-30T01:23:59Z: the server
+//! certificate RFC 8448 recorded ran out three months before this test was
+//! written. That is a fact about the fixture, not a problem with it — the trace is
+//! a recording and its signature stays valid — but it is the sharpest possible
+//! argument for the shape of the verifier interface. A verifier that read the
+//! clock for itself would now reject RFC 8448's own handshake, and a test that
+//! asserted "this chain is valid" would be asserting something about the calendar
+//! rather than about this code. The instant is therefore an input
+//! (`hearth_tls::ClientConfig::validation_time`), and the expiry tests of the
+//! certificate slice can name any date they like.
+//!
+//! [`the_certificate_in_the_trace_carries_this_modulus`] and
+//! [`the_published_rsa_signature_verifies_over_the_published_signed_data`] are the
+//! tests that read the certificate. The modulus and the two hash constants they
+//! assert come from `scripts/tls_rfc8448_rsa.py`, which derives all of them from
+//! the hex above with OpenSSL and prints them — so the provenance of those three
+//! constants is checkable by running it, not by trusting a comment.
 
 use hearth_tls::handshake::{
     encode, parse_server_hello, HandshakeReader, TYPE_CERTIFICATE, TYPE_CERTIFICATE_VERIFY,
@@ -51,6 +71,7 @@ use hearth_tls::keyschedule::{
 use hearth_tls::record::{RecordLayer, TrafficKeys, CONTENT_TYPE_HANDSHAKE};
 use hearth_tls::sha256::{hmac_sha256, Sha256};
 use hearth_tls::x25519;
+use hearth_tls::{verify_handshake_signature, PublicKey, RsaPublicKey, VerifyError};
 
 const CLIENT_HELLO_HEX: &str = "\
 01 00 00 c0 03 03 cb 34 ec b1 e7 81 63 ba 1c 38 \
@@ -151,6 +172,32 @@ const CLIENT_FINISHED_RECORD_HEX: &str = "\
 a7 1e 21 9c 56 cc 77 b0 51 7f e9 b9 3c 7a 4b fc \
 44 d8 7f 38 f8 03 38 ac 98 fc 46 de b3 84 bd 1c \
 ae ac ab 68 67 d7 26 c4 05 46";
+/// The trace's server certificate, not transcribed here but *read* out of it: the
+/// `cryptography` package parsed the 432-byte DER certificate from the message
+/// above and printed this modulus, and
+/// [`the_certificate_in_the_trace_carries_this_modulus`] requires those bytes to
+/// appear inside that very certificate, so the two cannot drift apart.
+const SERVER_MODULUS_HEX: &str = "\
+b4 bb 49 8f 82 79 30 3d 98 08 36 39 9b 36 c6 98 \
+8c 0c 68 de 55 e1 bd b8 26 d3 90 1a 24 61 ea fd \
+2d e4 9a 91 d0 15 ab bc 9a 95 13 7a ce 6c 1a f1 \
+9e aa 6a f9 8c 7c ed 43 12 09 98 e1 87 a8 0e e0 \
+cc b0 52 4b 1b 01 8c 3e 0b 63 26 4d 44 9a 6d 38 \
+e2 2a 5f da 43 08 46 74 80 30 53 0e f0 46 1c 8c \
+a9 d9 ef bf ae 8e a6 d1 d0 3e 2b d1 93 ef f0 ab \
+9a 80 02 c4 74 28 a6 d3 5a 8d 88 d7 9f 7f 1e 3f";
+/// `Hash(ClientHello..Certificate)`, re-derived here from the trace by an
+/// independent implementation and then re-derived again by [`Trace::hash_through`]
+/// below. The two agreeing is what lets the signature check stand on its own.
+const HASH_THROUGH_CERTIFICATE_HEX: &str = "\
+76 4d 66 32 b3 c3 5c 3f 32 05 e3 49 9a c3 ed ba \
+ab b8 82 95 fb a7 51 46 1d 36 78 e2 e5 ea 06 87";
+/// `SHA-256` of the 130 bytes RFC 8446 §4.4.3 says the signature covers, which
+/// pins those bytes — 64 spaces, the context string, the zero, the transcript
+/// hash — rather than only that *some* 130 bytes were used.
+const SIGNED_DATA_HASH_HEX: &str = "\
+be ed 95 af 40 4e 23 dd 55 3e bc fb 4a 00 b8 db \
+bf 22 44 db 2a 9a a3 9a 37 92 56 51 26 7c 14 1f";
 fn bytes(text: &str) -> Vec<u8> {
     let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(cleaned.len().is_multiple_of(2), "odd hex length");
@@ -338,16 +385,139 @@ fn the_certificate_verify_signed_data_has_the_published_shape() {
     // 128 bytes -- so the signature is 128 bytes.
     assert_eq!(body[4..].len(), 128, "an RSA-1024 signature");
 
-    // RFC 8446 section 4.4.3's signed content. The signature itself cannot be
-    // checked yet -- RSA-PSS verification arrives with certificate verification
-    // -- but the structure and the transcript hash it covers are checkable here,
-    // and the hash through Certificate is independently fixed by the Finished
-    // MAC above.
+    // RFC 8446 section 4.4.3's signed content. The signature over it is checked in
+    // `the_published_rsa_signature_verifies_over_the_published_signed_data`; here
+    // the structure and the transcript hash are pinned, and the hash through
+    // `Certificate` is independently fixed by the Finished MAC above.
     let mut signed = vec![0x20u8; 64];
     signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
     signed.push(0);
     signed.extend_from_slice(&trace.hash_through(2));
     assert_eq!(signed.len(), 130);
+}
+
+/// The 432-byte DER certificate from the trace's `Certificate` message, framed
+/// as RFC 8446 §4.4.2 requires. The two unaccounted bytes the RFC's own lengths
+/// imply are *not* part of the entry and are left out, which is the same reading
+/// [`the_rfcs_certificate_message_has_two_unaccounted_bytes`] pins.
+fn trace_certificate(trace: &Trace) -> Vec<u8> {
+    let body = &trace.messages[1][4..];
+    assert_eq!(body[0], 0, "an empty certificate_request_context");
+    let entry_len = u32::from_be_bytes([0, body[4], body[5], body[6]]) as usize;
+    body[7..7 + entry_len].to_vec()
+}
+
+#[test]
+fn the_certificate_in_the_trace_carries_this_modulus() {
+    let trace = trace();
+    let certificate = trace_certificate(&trace);
+    assert_eq!(certificate.len(), 432, "the entry's own length");
+    let modulus = bytes(SERVER_MODULUS_HEX);
+    assert_eq!(modulus.len(), 128, "an RSA-1024 modulus");
+    // The modulus appears verbatim in the certificate's SubjectPublicKeyInfo, which
+    // is what ties the constant above to the certificate above: neither can be
+    // edited without breaking this.
+    assert!(
+        certificate
+            .windows(modulus.len())
+            .any(|window| window == &modulus[..]),
+        "the embedded modulus must appear inside the trace's certificate"
+    );
+    // And it is a 1024-bit modulus with the usual exponent, checked through the
+    // same constructor the verifier will use.
+    let key = RsaPublicKey::from_be_bytes(&modulus, &[1, 0, 1]).expect("e = 65537");
+    assert_eq!(key.key_bits(), 1024);
+    assert_eq!(key.modulus_bytes(), 128);
+    assert_eq!(key.exponent(), 65537);
+}
+
+#[test]
+fn the_published_rsa_signature_verifies_over_the_published_signed_data() {
+    let trace = trace();
+
+    // Step 1: the bytes that were signed, rebuilt here exactly as RFC 8446 §4.4.3
+    // defines them, and pinned twice -- once by the transcript hash this crate
+    // computes from the flight, once by the hash of the whole 130-byte string,
+    // which an independent implementation also produced.
+    let through_certificate = trace.hash_through(2);
+    assert_eq!(
+        through_certificate,
+        hash32(HASH_THROUGH_CERTIFICATE_HEX),
+        "the crate's transcript must agree with the independent derivation"
+    );
+    let mut signed = vec![0x20u8; 64];
+    signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed.push(0);
+    signed.extend_from_slice(&through_certificate);
+    assert_eq!(signed.len(), 130);
+    assert_eq!(sha(&[&signed]), hash32(SIGNED_DATA_HASH_HEX));
+
+    // Step 2: the signature and the key, both taken from the trace. This is the
+    // whole point of the test: the signature was made by OpenSSL in 2016 over a
+    // transcript recorded by the RFC, and if any one of these bytes is wrong --
+    // ours or the RFC's -- PSS decoding fails and says which rule.
+    let signature = &trace.messages[2][8..];
+    assert_eq!(signature.len(), 128);
+    assert_eq!(trace.messages[2][4..6], [0x08, 0x04], "rsa_pss_rsae_sha256");
+    let key =
+        RsaPublicKey::from_be_bytes(&bytes(SERVER_MODULUS_HEX), &[1, 0, 1]).expect("e = 65537");
+    assert_eq!(
+        key.verify_pss_sha256(&signed, signature),
+        Ok(()),
+        "the RFC's own rsa_pss_rsae_sha256 signature over its own transcript"
+    );
+
+    // And the same check through the path a handshake actually takes: the wire
+    // scheme read out of the trace itself, the parsed public key, and the function
+    // a `CertificateVerify` reaches. The direct call above proves the arithmetic;
+    // this one proves the *dispatch* -- that the code point the RFC used maps to
+    // the suite that verifies it -- over a real signature rather than a synthetic
+    // one. The scheme is read from the trace rather than typed, so the two cannot
+    // drift apart.
+    let scheme = u16::from_be_bytes([trace.messages[2][4], trace.messages[2][5]]);
+    assert_eq!(scheme, 0x0804, "rsa_pss_rsae_sha256, from the trace");
+    let modulus = bytes(SERVER_MODULUS_HEX);
+    let parsed = PublicKey::Rsa {
+        modulus: &modulus,
+        exponent: 65537,
+    };
+    assert_eq!(
+        verify_handshake_signature(scheme, &parsed, &signed, signature),
+        Ok(()),
+        "the RFC's signature through the scheme dispatch"
+    );
+    // The asymmetry RFC 8446 section 4.2.3 keeps, on the same key and the same
+    // bytes: 0x0401 is `rsa_pkcs1_sha256`, which a *certificate* may be signed
+    // with and a handshake signature may not. The signature is refused for its
+    // wire value alone, before any arithmetic -- so this fails even though the
+    // key and the bytes are exactly the ones that just verified.
+    assert_eq!(
+        verify_handshake_signature(0x0401, &parsed, &signed, signature),
+        Err(VerifyError::UnsupportedScheme(0x0401))
+    );
+
+    // Step 3: the same signature must not verify anything else. The signed data
+    // is the transcript through `Certificate`, so a single changed byte anywhere
+    // in it -- including in the trailing hash, not just the ASCII prefix -- has to
+    // break the check.
+    for index in [0usize, 40, 64, 96, 97, 98, 129] {
+        let mut other = signed.clone();
+        other[index] ^= 1;
+        assert!(
+            key.verify_pss_sha256(&other, signature).is_err(),
+            "byte {index} of the signed data was not covered"
+        );
+    }
+    // As does verifying against a different transcript: the hash through
+    // `CertificateVerify`, which is one message further on.
+    let mut later = signed.clone();
+    later[98..].copy_from_slice(&trace.hash_through(3));
+    assert!(key.verify_pss_sha256(&later, signature).is_err());
+
+    // And the signature is still refused by the *other* half of the check: with
+    // the right modulus but a different exponent, nothing decodes.
+    let wrong = RsaPublicKey::from_be_bytes(&bytes(SERVER_MODULUS_HEX), &[3]).expect("e = 3");
+    assert!(wrong.verify_pss_sha256(&signed, signature).is_err());
 }
 
 #[test]

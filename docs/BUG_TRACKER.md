@@ -38,6 +38,42 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 9 — PKCS#1 v1.5, the scheme/key decision, and a fixture that shared a key (buffy, 2026-10-16)
+
+`rsa.rs` gained `sha256WithRSAEncryption` — the one RSA suite this crate lacked and the one nearly
+every certificate in the world carries — and a new `verify.rs` holds the decision half's first pieces:
+`Suite`, `VerifyError`, `verify_certificate_signature` and `verify_handshake_signature`.
+
+- **The `DigestInfo` is checked structurally, never searched for.** `check_pkcs1v15_sha256` accounts for
+every byte by position: block type, at least eight `0xFF`, the zero separator, a `DigestInfo` of exactly
+the SHA-256 length, then the hash in the last 32 bytes. Bleichenbacher's 2006 attack needs a verifier that
+looks for the `DigestInfo` *anywhere* and ignores its surroundings; there is no such code path here, and
+the SHA-1-style prefix encodings that a searching verifier accepts are negative tests. The 19-byte prefix
+is transcribed **and then re-derived** in a test from the SHA-256 OID through `oid_from_dotted`, with each
+field asserted, so a wrong byte cannot pass.
+- **PKCS#1 v1.5 is for certificates only, and that is enforced by shape rather than by a comment.**
+`verify_handshake_signature` takes a wire scheme and accepts exactly `0x0804` (`rsa_pss_rsae_sha256`) and
+`0x0403` (`ecdsa_secp256r1_sha256`); `0x0401` (`rsa_pkcs1_sha256`) is `UnsupportedScheme`. Proven on RFC
+8448's own CertificateVerify, which now verifies *through the dispatch* under the scheme byte read out of
+the trace and is refused under `0x0401` with the same key and the same bytes.
+- **A fixture defect, found by a control that passed when it should not have.** Verifying the
+`SELF_SIGNED_PSS` fixture with the *root's* key returned `Ok(())`. Not a verification bug: the generator
+built that certificate with `root_key`, so it was signed by, and carried, the root's key. Two fixtures
+sharing a key means the fixture set cannot distinguish verification from a key lookup, and "a certificate
+verified with the wrong identity fails" was not a check it could make. Fixed in
+`scripts/tls_x509_fixtures.py` (one seed per identity, with a note saying why), the pinned data
+regenerated, and the control now fails for a genuine reason. Same class as the previous slice's circular
+Montgomery-domain tests: the assertion held for a reason unrelated to the property it named.
+- **Which rule fires on a wrong key is deliberately not pinned.** A wrong key's RSA operation produces an
+effectively random block, so the refusal can come from the block type, the padding, the `DigestInfo` or
+the hash. The test asserts only that it fails at the RSA layer, and prints the actual error if it does
+not — pinning the specific rule would pin an accident of that key.
+
+177 checks green on the hardware path and on `HEARTH_TLS_NO_HW=1` (169 before), fmt and
+`clippy --all-targets -D warnings` clean, `cargo doc` zero warnings, `cargo check --workspace
+--all-targets` clean. `[dependencies]` still empty, and `grep` for the crate name outside itself still
+finds nothing, so no `https://` path can reach any of this yet.
+
 ### hearth-tls slice 4 — the record layer, pinned by RFC 8448's own record (buffy, 2026-10-16)
 
 `record.rs`: AEAD framing, the nonce from the sequence number, the encrypted
@@ -86,6 +122,198 @@ nothing and the record legitimately opened; and a test reused a receiver after a
 fatal record, forgetting that a failed record does not advance the sequence, so
 the second open failed authentication for a legitimate reason. Worth recording
 because in both cases the assertion was the wrong thing, not the implementation.
+
+### hearth-tls slice 7 — reading DER and X.509, and the four bugs my own test data had (buffy, 2026-10-16)
+
+**The reading half of certificate verification.** `crates/hearth-tls/src/der.rs` is a strict DER
+(X.690) reader and `x509.rs` reads a certificate over it. 152 checks (121 before, plus 15 DER
+unit tests, 7 in `x509.rs` and 9 fixture tests), clippy
+`-D warnings` and `cargo fmt --check` clean, `cargo doc` clean, workspace check clean, `std`-only,
+empty `[dependencies]`, 152 on the hardware path *and* on `HEARTH_TLS_NO_HW=1`. Still not reachable
+from any URL: `grep` for the crate name outside itself finds nothing, so the seam stays closed.
+
+**DER is strict by construction, not by option.** Definite lengths only; the short form must be
+minimal and long form must not have a leading zero byte or be used below 128; no high-tag-number
+form; no trailing bytes after the outer element; a truncated length or body is an error rather than
+an empty read. The reader's `take`/`take_if` leave it *untouched* on a tag mismatch, which `take_if`'s
+contract already promised — a first version consumed first and checked after, and its own test caught
+it. Every one of those rules has a hand-built malformed encoding behind it, plus the DER of the real
+RFC 8448 certificate as the positive case.
+
+**The fixtures are generated, not transcribed.** `scripts/tls_x509_fixtures.py` builds six
+certificates with OpenSSL via Python's `cryptography` — an RSA root, an EC root, an intermediate, an
+RSA leaf (SANs, EKU serverAuth), an EC leaf, and a PSS-signed self-signed EC cert — with keys derived
+from a fixed seed, and with the expectations (including the key-usage *names* as OpenSSL reports
+them) parsed back out of the generated certs rather than written by hand. Six rather than five
+because the EC leaf is signed by an *RSA* issuer, so a PSS-signed self-signed EC cert was needed to
+cover that `AlgorithmIdentifier` shape. Two rules came
+out of RFC 5280 and have their own fixture: a critical extension the parser does not understand must
+be **rejected** (§4.2), and the `signatureAlgorithm` inside the signed part must be byte-identical to
+the one outside it (§4.1.1.2).
+
+**The first version of this paragraph said the fixtures "regenerate byte-identically", and that was
+wrong — the mistake was in a claim, not in code, and only regenerating and diffing caught it.**
+Regenerating to a scratch path produced four hunks: the RSA-PSS fixture's signature (a random salt),
+an ECDSA signature whose *length* also changed, and the `der_len` that follows from it. So two of the
+six fixtures are not byte-reproducible; four are. The generator's own docstring had the same claim
+in a subtler form ("the RSA certificates regenerate byte for byte" — the PSS certificate *is* an RSA
+certificate). Both now say which two, and why. The property that actually matters was then verified
+rather than assumed: the regenerated file was swapped in and the fixture tests were run against it,
+**9/9 green including the changed `der_len`**, which is what proves the expectations are parsed out
+of the certificates instead of typed. The file in the tree is therefore an *equivalent* pin, not a
+byte-exact one, and it is now commented as such.
+
+**Four of the failures in this slice were wrong test data, not wrong code, and three of them were
+copied from memory.** (1) I wrote the expected `UnixTime` constants for ten calendar rows out of my
+head and **every single one was wrong**; recomputing them from CPython's `datetime` *and* from the
+`days_from_civil` algorithm independently gave two implementations that agreed with each other and
+with the Rust code. A memorized constant is not a vector. (2) `keyUsage` bit order was genuinely
+wrong — it is a `BIT STRING` counting from the most-significant bit of the first byte, not from bit 0.
+(3) A test asserted the TBS started at offset zero; it starts after the certificate's outer header.
+(4) A test assumed the signature length follows the *subject's* key — it follows the **issuer's**,
+which is exactly why the EC leaf carries a 256-byte RSA signature.
+
+**`x509` refuses anywhere two readers could disagree.** `Certificate` borrows its input, so nothing
+is copied out of the DER; both names are kept as their own DER for byte-exact chain linkage rather
+than as parsed strings; the signature covers `tbs_certificate` and nothing else (asserted); SPKI,
+`basicConstraints`, `keyUsage`, `extendedKeyUsage` and `subjectAltName` are read, with non-DNS SAN
+entries kept but only DNS ones usable as names. Not yet present, and the next session's work: chain
+building to a pinned root, ECDSA verification, name matching, the validity check and a minimum key
+size. Until those exist `RejectAll` remains the only verifier in the crate.
+
+### hearth-tls slice 8 — P-256 and ECDSA, and the bug two of my own tests hid (buffy, 2026-10-16)
+
+**Both halves of signature verification now exist.** `p256.rs` is the curve — the field, the group
+and the two scalar multiplications ECDSA needs — and `ecdsa.rs` is `ecdsa_secp256r1_sha256` over it.
+**169 checks green on the hardware path and on `HEARTH_TLS_NO_HW=1`** (152 before), clippy
+`--all-targets -D warnings`, `cargo fmt --check`, `cargo doc` (zero warnings) and a workspace check
+all clean, `std`-only, empty `[dependencies]`. Still unreachable from any URL: grep for the crate name
+outside itself finds nothing, and `RejectAll` is still the only verifier in the crate.
+
+**The constants are read out of OpenSSL, not remembered.** `scripts/tls_p256_params.py` runs
+`openssl ecparam -name prime256v1 -param_enc explicit -text` and then *checks the group* before
+printing Rust: `p` and `n` prime (sympy, which shares no code with OpenSSL), `a == p - 3`, the
+generator on the curve, `n * G` the identity via a plain-Python affine multiply, `n` inside the Hasse
+interval around `p + 1` with cofactor 1, and `p < 2n` with `n > 2^255` — the last two are what make a
+single conditional subtraction a valid reduction. The Rust asserts the first four again by itself, and
+the two Montgomery constants (`-m^-1 mod 2^64`, `2^512 mod m`) are **derived in `const fn`** from the
+modulus, with the script printing its own values only so the test can check that derivation. Nothing in
+`p256.rs` is a literal that was not printed by a program that first proved it.
+
+**Four of five test expectations I wrote were wrong; the fifth hid a real bug.** The one that matters:
+`Fe::ONE` was `[1, 0, 0, 0]` — the limbs one, in a type where *every* value is in Montgomery form —
+and `Fe::invert` returned a plain value into that same Montgomery world. The two mistakes cancelled:
+`R / R` is one, so `inverse * value == ONE` passed, and the coefficient-of-one doubling formula quietly
+stopped producing a point on the curve. What exposed it was arithmetic rather than review — 7G came
+back off the curve and `n * G` was not the identity — and the reason it survived a first run is worth
+recording: my "independent" checks were **circular**. `assert_eq!(4G_from_the_ladder, 4G_from_the_group_law)`
+compared `g.double().double()` with a ladder that computes exactly the same thing, so a doubling formula
+correct only when `Z == 1` passed every comparison. The fix is a `mont_pow` primitive that makes the
+domain explicit, `ONE` written as a conversion rather than a literal, and **pinned 2G/3G/4G/6G/7G x
+coordinates taken from the independent Python implementation**, one of them reached by doubling a point
+whose `Z` is not 1. The inverse test now asserts the domain directly (`ONE` reads back as the bytes `1`,
+and a value survives the round trip through its Montgomery form) because no test that multiplies an
+inverse back can see the difference.
+
+**The ECDSA vectors carry a chain of evidence, not a snapshot.** `scripts/tls_p256_vectors.py` derives a
+private scalar from a label, signs six messages with OpenSSL, and then requires that each vector passes
+an **independent verifier written in plain Python integers over affine coordinates** *and* OpenSSL's own
+verify, before writing any of it out. Six shapes of signature integer appear (both 32- and 33-byte
+encodings of `r` and `s`), and one of the messages is exactly the RFC 8446 §4.4.3 construction — 64
+spaces, `"TLS 1.3, server CertificateVerify"`, a zero byte, a 32-byte transcript hash — so the shape
+the real handshake signs is covered. The end-to-end case is the `SELF_SIGNED_EC` X.509 fixture: DER
+framing, the certificate fields, the P-256 point parser and the equation, over an OpenSSL certificate,
+with a second half that flips one byte of the serial number and requires the same signature to fail —
+which is what shows the signature covers the bytes that were *read* rather than a re-encoding.
+
+**Two kinds of negative vector, checked differently.** A *cryptographic* negative (a flipped bit of `r`
+or `s`, `r = 0`, `s = n`, `s = n + 1`) must come back as `VerificationFailed` or `ScalarOutOfRange`, and
+the test asserts which. An *encoding* negative (a redundant leading zero, a negative `INTEGER`, a
+trailing byte, a third integer, `SET` instead of `SEQUENCE`, a truncated sequence, the raw `r || s`
+form) must be refused **as an encoding**, and each is pinned to the rule that has to fire rather than to
+a boolean — a boolean cannot tell "refused this signature" from "refused this byte string". The
+redundant leading zero is what makes that concrete: it is legal BER naming the same integer, so a
+lenient reader reads a signature DER does not have. One claim I did *not* get to keep: I had written
+that OpenSSL's decoder is lenient about some of these, and the generator records which negatives a
+lenient reader accepts — in this run it refused every one of them, so the honest statement is that the
+pinning is about which rule fires, not about a disagreement in outcomes.
+
+**High-S is accepted, deliberately.** `(r, n - s)` is the other valid signature over the same message.
+Requiring the smaller one is a Bitcoin consensus rule, not an X9.62 or TLS one, so a conforming server
+may produce it and this verifier must not invent a reason to refuse it. That is pinned as a test so the
+decision is stated rather than assumed.
+
+**Cost, measured rather than guessed: 345.6 µs per verification** (release, `--ignored` timing test on
+the TLS-shaped vector). That is slow for P-256 — OpenSSL is several times quicker — and the reasons are
+known and recorded rather than mysterious: no windowing or precomputed table for the fixed base, no
+signed-digit recoding, a coarse "multiply then reduce" Montgomery product, and a Fermat inversion
+(~384 multiplications) instead of a binary extended Euclidean one. For one handshake per download that
+is not worth optimising yet; it is in `RESUME.md` with the plan if it ever is.
+
+### hearth-tls slice 6 — RSA-PSS verification, pinned to RFC 8448's own signature (buffy, 2026-10-16)
+
+**The first half of certificate verification, and the half that can be *proven* today.**
+`crates/hearth-tls/src/rsa.rs` adds `RsaPublicKey` (modulus + exponent), `rsa_vp1` (RFC 8017 §5.2.2)
+and `verify_pss_sha256` (RSASSA-PSS-VERIFY, §9.1.2) with MGF1-SHA-256 and a 32-byte salt. 121 checks
+(the suite was 106), clippy `-D warnings` and `cargo fmt --check` clean, `std`-only, still no
+dependencies. Nothing calls it yet — the public key has to come out of a certificate first — so the
+only verifier the crate ships is still `RejectAll` and no `https://` path exists.
+
+**The vector is the RFC's own recorded signature, not a value we produced.** RFC 8448's trace
+contains a complete `rsa_pss_rsae_sha256` signature, made by OpenSSL, over the 130 bytes the client
+state machine already rebuilds. `tests/rfc8448_flight.rs` now decrypts the recorded flight with the
+crate's own record layer, re-derives the transcript through `Certificate`, and verifies that signature
+with the server's modulus read out of the trace's 432-byte certificate. Three independent values pin
+it: `Hash(ClientHello..Certificate)` = `764d6632…` (derived here from the trace *and* computed by the
+crate), `SHA-256(signed_data)` = `beed95af…`, and the 128-byte modulus, which the test requires to
+appear verbatim inside the certificate so the two constants cannot drift apart. Flip any byte of the
+signed data — including inside the trailing hash — and it stops verifying, which is the whole point:
+the signature covers that exact transcript or nothing.
+
+**Second vector set: both `emLen` cases, and the negative ones.** `tests/rsa_vectors.rs` carries 24
+constants generated by *other implementations*: `s^e mod n` from CPython's `pow` at 4, 8, 9, 16, 24
+and 32 limbs (exponent 3 as well as 65537), real PSS signatures from OpenSSL, and two primes from
+`sympy.randprime` for a key OpenSSL's generator refuses to make. That last one is a **1025-bit key**:
+1025 ≡ 1 (mod 8), so `k = 129` while `emLen = 128`, and a 2048-bit key would never notice the
+difference. A signature that is a real signature but with a 20-byte salt is refused, because RFC 8446
+§4.2.3 says the salt length MUST equal the digest length — OpenSSL will happily produce such a
+signature, so it is a live case rather than a hypothetical. Also refused: every single-bit change to a
+signature, a different message, a signature one byte short or long, `s == n` and `s == n + 1`, all
+zeros, and a 512-bit key that cannot hold the encoding at all (`KeyTooSmall { bits: 512, needed_bits:
+522 }`, checked before any arithmetic, so the bounds cannot underflow).
+
+**Two mistakes were mine, and the tests caught both.** `limbs_from_be` packed the input byte string
+in the wrong order — most-significant chunk into the least-significant limb — which reverses the limbs
+of any value wider than one limb and doubles its apparent width; a 65-bit modulus reported as 128 bits.
+Taking the chunks **from the end**, zero-padding each on its high side, is the fix, and a test now pins
+the endianness at one, two and 17 limbs. Separately, a generator loop that waited for OpenSSL to
+produce a 2049-bit modulus never terminated: `generate_private_key` always sets the top bit, so it
+never returns one. Every retry loop in the generator is now bounded. Both are the same lesson as the
+transcription bug in slice 5, one layer up: a wrong expectation and an unbounded loop look like
+"waiting" rather than "broken".
+
+**The generators are committed, so the provenance is checkable.** `scripts/tls_rfc8448_rsa.py` derives
+the modulus and both hash constants from the RFC's hex with OpenSSL and prints them; its output was
+diffed against the constants in `tests/rfc8448_flight.rs` and is identical character for character.
+`scripts/tls_rsa_vectors.py` regenerates the vector table: run against the committed file it
+reproduces **all 18 modpow constants byte for byte** and emits new PSS ones, which is the documented
+behaviour rather than a failure — OpenSSL seeds itself from the OS, so only the CPython-derived half
+can be reproduced, and that half now demonstrably is. Both live in `scripts/` with the existing Python
+helpers instead of in `target/`, where the earlier slices' generators were written and lost.
+
+**A measurement, since a number in a document should have been measured.** The public-key operation on
+a 2048-bit modulus takes **94.5 µs** (`cargo test --release -p hearth-tls --lib -- --ignored
+--nocapture measure`), which is 17 Montgomery multiplications plus the two conversions: schoolbook
+multiply into a double-width buffer, then reduce from the bottom up. That is ~4x OpenSSL and entirely
+irrelevant here — a downloader handshake verifies one signature per connection — so the coarse-grained
+form was kept over the interleaved CIOS one because it is easier to check by reading. There is no
+division routine in the module at all: `R^2` is reached by 2·64·limbs modular doublings.
+
+**Not the end of the job.** Still missing before any URL can use this: DER parsing, chain building to
+a pinned root, `ecdsa_secp256r1_sha256` (the other scheme this client offers), name matching, the
+validity window check, and a **minimum key size**, which is deliberately *not* in this module — it
+accepts a 1024-bit key because RFC 8448's fixture is one, and the policy belongs where the key comes
+from.
 
 ### hearth-tls slice 5 — the handshake: key schedule, messages, and the client state machine (buffy, 2026-10-16)
 
@@ -154,8 +382,10 @@ whole crate in the earlier slices, so `cargo fmt --check` reported pre-existing 
 **What this does not do yet.** No certificate verification (so the crate must not be wired to an
 `https://` path), no client authentication (a `CertificateRequest` is refused, not ignored), no
 resumption/PSK or 0-RTT, no ALPN, no post-handshake authentication, and `aarch64` PMULL/AES is still
-missing for macOS. `NewSessionTicket` and similar post-handshake messages are refused explicitly
-rather than swallowed.
+missing for macOS. The verifier interface, however, is now settled: chain, signed data, signature
+scheme, the name we asked for and the instant all arrive as arguments, so the certificate slice can be
+written as a pure function and tested against expired/not-yet-valid fixtures that never go stale.
+`NewSessionTicket` and similar post-handshake messages are refused explicitly rather than swallowed.
 
 **Peer review caught a real hole in the "no accept-all" claim. It is fixed, and now enforced
 (SparkOC, same session).** The trait carried a blanket `impl CertificateVerifier for F where F:
@@ -168,13 +398,44 @@ and `ExpectingChain` in the tests, `RejectAll` in the crate). SparkOC's related 
 messages it is handed, so a verifier no longer has to capture the expected host name — and a captured
 copy cannot silently drift from the name on the wire.
 
+**The second half of that review was right too, and it is the same defect one field over (SparkOC,
+same session): the validity time was missing.** `certificate_list`, `signature_scheme`,
+`signature`, `signed_data` and `server_name` covered everything except *when* — expiry and
+not-before checks need a `now`, and a verifier that calls `SystemTime::now()` itself cannot be
+handed an expired or not-yet-valid chain in a test without those tests expiring along with the
+fixtures they use. This crate's one rule for the verifier interface is that the handshake supplies
+every input the verifier cannot derive from the messages, and the time is not in any message, so it
+belongs in the input rather than in the verifier's captured state. Fixed by adding
+`ClientConfig::validation_time` and `CertificateVerifyInput::validation_time`, both a new
+**`UnixTime`** (whole seconds since the epoch, `i64` so a subtraction against a validity bound cannot
+wrap, with `from_system_time` saturating rather than panicking on a clock set absurdly far out and a
+one-line `outside(not_before, not_after)` so the comparison the certificate slice turns on is written
+once). Roots and policy stay construction-captured on the named verifier type, as before; only the
+instant moves. The state machine still touches no clock — the caller reads it (`SystemTime::now()
+.into()`, or anything else) and the value flows through untouched, which is what makes the future
+negative suite deterministic.
+
+**That new property is checked by mutation, not by assertion.**
+`the_verifier_is_given_the_callers_instant_and_not_the_clock` runs a complete honest handshake at four
+instants that no clock would ever report — one second *before* 1970, 1970 itself, 2023, and 2100 — and
+requires the verifier to be shown each verbatim. It was then verified to be load-bearing rather than
+tautological: replacing the call site with `UnixTime::from_system_time(SystemTime::now())` makes it
+fail with `left: [UnixTime { secs: 1792130736 }] / right: [UnixTime { secs: -1 }]`, and the mutant was
+reverted. Without that mutation check, a test that hands in a fixed time and reads it back could pass
+for the wrong reason. 106 checks green on both paths (100 unit + 5 integration + 1 doctest).
+
+`cargo doc -p hearth-tls` also surfaced two pre-existing rustdoc warnings in slices 1-2, both of them
+a doc-list link resolving to the wrong kind of item: `[`x25519`]` is both a module and a function, so
+the module list needed `mod@x25519`, and `[`verify_finished`](crate::keyschedule::verify_finished)`
+carried an explicit target that the label already resolves to. Both fixed; the crate now documents with zero warnings.
+
 **The property is now checkable rather than asserted in prose, which is the part worth keeping.** A
 `compile_fail` doctest in the module docs requires the closure form to be rejected, so CI enforces it.
 It was verified to fail for the *right* reason rather than for a typo: with the closure line disabled
 the same snippet compiles, and with it enabled the error is exactly `E0277: the trait bound
 `{closure}: CertificateVerifier` is not satisfied`. Both halves of that check were run before the
 doctest was left in place. 102 checks green on both the hardware and the forced-software path
-(96 unit + 5 integration + 1 doctest).
+(96 unit + 5 integration + 1 doctest) at that point; the clock input above brought it to 106.
 
 ### hearth-tls slice 3 — AES-NI and PCLMULQDQ, runtime-dispatched (buffy, 2026-10-16)
 
