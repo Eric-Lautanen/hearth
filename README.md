@@ -21,21 +21,35 @@ for rotation representation, avoiding gimbal lock...
 
 ## Performance
 
-All 6 Bonsai models (Qwen3, head_dim=128, vocab=151669, YaRN rope) on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5). Benchmarked at 50 generated tokens, `--temp 0`, one-word prompt, warm average over 10 runs. Hearth uses 8 workers (n/2). Ref uses llama.cpp-prism 16 threads.
+All 14 models on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5), single run each at
+`--temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`, idle machine, warmed
+up first (frequency scaling needs one throwaway run). Hearth uses 8 workers.
+Numbers move ±10–15% run to run with machine state; treat small deltas as noise.
 
-| Size | Format               | d_model | Layers | Hearth         | Ref  | H/Ref |
-| ---- | -------------------- | ------- | ------ | -------------- | ---- | ----- |
-| 1.7B | Q1_0 (1-bit, 128-el) | 2048    | 28     | **49.5 tok/s** | 32.0 | 1.55× |
-| 1.7B | Q2_0 (2-bit ternary) | 2048    | 28     | **28.7 tok/s** | 5.1  | 5.63× |
-| 4B   | Q1_0 (1-bit, 128-el) | 2560    | 36     | **23.5 tok/s** | 17.4 | 1.35× |
-| 4B   | Q2_0 (2-bit ternary) | 2560    | 36     | **13.0 tok/s** | 2.8  | 4.64× |
-| 8B   | Q1_0 (1-bit, 128-el) | 4096    | 36     | **13.4 tok/s** | 8.2  | 1.63× |
-| 8B   | Q2_0 (2-bit ternary) | 4096    | 36     | **7.1 tok/s**  | 1.5  | 4.73× |
+| Size | Format               | d_model | Layers | tok/s (2026-10-15) |
+| ---- | -------------------- | ------- | ------ | ------------------ |
+| 1.7B | Q1_0 (1-bit, 128-el) | 2048    | 28     | **47.1** |
+| 1.7B | Q2_0 (2-bit ternary) | 2048    | 28     | **24.5** |
+| 4B   | Q1_0 (1-bit, 128-el) | 2560    | 36     | **18.8** |
+| 4B   | Q2_0 (2-bit ternary) | 2560    | 36     | **12.4** |
+| 8B   | Q1_0 (1-bit, 128-el) | 4096    | 36     | **12.2** |
+| 8B   | Q2_0 (2-bit ternary) | 4096    | 36     | **6.8** |
+| 2B²  | PTQ1_0 (1-bit)       | —       | —      | **16.3** |
+| 2B²  | PQ2_0 (2-bit)        | —       | —      | **17.8** |
+| 4B²  | PTQ1_0 (1-bit)       | —       | —      | **6.6** |
+| 4B²  | PQ2_0 (2-bit)        | —       | —      | **7.5** |
+| 9B²  | PTQ1_0 (1-bit)       | —       | —      | **4.2** |
+| 9B²  | PQ2_0 (2-bit)        | —       | —      | **4.8** |
+| 27B² | PTQ1_0 (1-bit)       | —       | 64     | **1.35** |
+| 27B² | PQ2_0 (2-bit)        | —       | 64     | **1.53** |
 
-The two **Ternary Bonsai 2 27B** models (PrismML `qwen35` hybrid architecture, 64 layers) also run,  
-at **~1.3 tok/s** (PTQ1_0) and **~0.8 tok/s** (PQ2_0) — ~3 min for 256 tokens, so raise  
-`--max-tokens` deliberately. They are the reason the UI shows live progress and streams reasoning  
-as it is produced rather than buffering a reply.
+² = Ternary Bonsai 2 (PrismML `qwen35` hybrid architecture). The 27B pair runs
+at ~1.4 tok/s — ~35 s for 50 tokens, so raise `--max-tokens` deliberately.
+They are the reason the UI shows live progress and streams reasoning as it is
+produced rather than buffering a reply.
+
+This build includes the Zen4 dispatch fix (per-kernel AVX2 vs AVX-512-VNNI
+gating); Q2_0-family numbers moved up accordingly.
 
 Full benchmarks with raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md)
 

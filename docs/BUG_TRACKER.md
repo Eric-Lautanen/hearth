@@ -3,6 +3,33 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers. Ref: llama.cpp-prism.
 
+### Sweep 2026-10-15 — all 14 models, post-Zen4-fix snapshot (SparkOC)
+
+Release build at `50c88bc` (includes the Zen4 per-kernel dispatch fix).
+One run each, `--temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`,
+idle machine, warmed up first. ±10–15% run-to-run noise applies; the 6-model
+rows replace the old 10-run averages in the README chart, the 8 Bonsai-2 rows
+are new.
+
+| Model | tok/s | ms |
+| ----- | ----- | -- |
+| Bonsai-1.7B-Q1_0 | 47.13 | 1061 |
+| Ternary-Bonsai-1.7B-Q2_0 | 24.53 | 2038 |
+| Bonsai-4B-Q1_0 | 18.84 | 2654 |
+| Ternary-Bonsai-4B-Q2_0 | 12.41 | 4028 |
+| Bonsai-8B-Q1_0 | 12.20 | 4098 |
+| Ternary-Bonsai-8B-Q2_0 | 6.75 | 7409 |
+| Ternary-Bonsai-2-2B-PTQ1_0 | 16.31 | 3065 |
+| Ternary-Bonsai-2-2B-PQ2_0 | 17.79 | 2811 |
+| Ternary-Bonsai-2-4B-PTQ1_0 | 6.63 | 7542 |
+| Ternary-Bonsai-2-4B-PQ2_0 | 7.47 | 6692 |
+| Ternary-Bonsai-2-9B-PTQ1_0 | 4.23 | 11832 |
+| Ternary-Bonsai-2-9B-PQ2_0 | 4.80 | 10426 |
+| Ternary-Bonsai-2-27B-PTQ1_0 | 1.35 | 36919 |
+| Ternary-Bonsai-2-27B-PQ2_0 | 1.53 | 32626 |
+
+Raw per-model lines: [`bench_results/sweep-2026-10-15.log`](../bench_results/sweep-2026-10-15.log).
+
 ### Session 2026-10-15 — the Zen 4 AVX-512 gate could never fire, so the slower kernel was selected everywhere
 
 **Trigger:** benchmarking the Ternary Bonsai 2 file set. Every PTQ1_0 model ran at roughly *half the
