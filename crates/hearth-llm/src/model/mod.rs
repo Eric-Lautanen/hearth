@@ -816,10 +816,9 @@ impl LlamaModel {
             } else {
                 0
             };
-            let pct = if sc.timers.total_us > 0 {
-                (val * 10000 / sc.timers.total_us) as f64 / 100.0
-            } else {
-                0.0
+            let pct = match (val * 10000).checked_div(sc.timers.total_us) {
+                Some(q) => q as f64 / 100.0,
+                None => 0.0,
             };
             eprintln!(
                 "[timing]   {:<30} {:>8} {:>8} {:>7.2}%",
@@ -3032,15 +3031,21 @@ mod tests {
             .unwrap();
 
         // GPU embedding
-        let gpu = gpu_model.gpu.as_ref().unwrap();
-        let _embed_gpu_buf = gpu
+        //
+        // The pool lock lives only for this statement, so it is released as soon
+        // as the value is cloned. There used to be a `drop(gpu)` here, which did
+        // nothing: `gpu` is a reference, and dropping a reference is a no-op. It
+        // read like a resource release, so it was actively misleading.
+        let _embed_gpu_buf = gpu_model
+            .gpu
+            .as_ref()
+            .unwrap()
             .pool
             .lock()
             .unwrap()
             .get("token_embd.weight")
             .cloned()
             .unwrap();
-        drop(gpu);
         // Don't need to upload - the CPU path dequantizes directly
 
         // The CPU embedding is the correct reference. For GPU, we can't easily read back
@@ -3262,27 +3267,27 @@ mod tests {
             let entry = qw;
             let n_cols = entry.n_cols();
             let n_rows = entry.n_rows();
-            for row in 0..n_rows {
+            for (row, slot) in cpu_q.iter_mut().enumerate().take(n_rows) {
                 let w = entry.row_data(row);
-                cpu_q[row] = hearth_quant::dot_q1_0g128_f32(w, &cpu_norm_out, n_cols);
+                *slot = hearth_quant::dot_q1_0g128_f32(w, &cpu_norm_out, n_cols);
             }
         }
         {
             let entry = kw;
             let n_cols = entry.n_cols();
             let n_rows = entry.n_rows();
-            for row in 0..n_rows {
+            for (row, slot) in cpu_k.iter_mut().enumerate().take(n_rows) {
                 let w = entry.row_data(row);
-                cpu_k[row] = hearth_quant::dot_q1_0g128_f32(w, &cpu_norm_out, n_cols);
+                *slot = hearth_quant::dot_q1_0g128_f32(w, &cpu_norm_out, n_cols);
             }
         }
         {
             let entry = vw;
             let n_cols = entry.n_cols();
             let n_rows = entry.n_rows();
-            for row in 0..n_rows {
+            for (row, slot) in cpu_v.iter_mut().enumerate().take(n_rows) {
                 let w = entry.row_data(row);
-                cpu_v[row] = hearth_quant::dot_q1_0g128_f32(w, &cpu_norm_out, n_cols);
+                *slot = hearth_quant::dot_q1_0g128_f32(w, &cpu_norm_out, n_cols);
             }
         }
 

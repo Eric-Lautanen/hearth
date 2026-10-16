@@ -221,6 +221,32 @@ recurrent, so a rejected draft token must rewind conv+SSM state, not just a KV c
 
 **Files touched:** docs only — no source change from this review round.
 
+### Clippy clear-up (same session) — 36 → 31 sites, and one real bug behind a lint
+
+`cargo clippy -p hearth-llm --all-targets -- -D warnings` was failing on commits going back several
+sessions, which is why the team's CI was red. **Counting lesson first:** a single `--all-targets` run
+reports each site once and then appends two `could not compile ... due to N previous errors` summary
+lines, so 33 `error:` lines == **31 sites**; summing a `lib` run and a `lib-test` run double-counts the
+same source and produced the "68 errors" figure in the room. The real starting count was 36.
+
+**Five sites fixed in `crates/hearth-llm/src/model/mod.rs` (7 → 2), and one of them was a genuine bug:**
+`test_gpu_decode_with_real_model` called `drop(gpu)` where `gpu` is a **reference** (`gpu_model.gpu
+.as_ref().unwrap()`), so the drop was a no-op that read like a resource release. The pool lock it looked
+like it was releasing was already a temporary inside the preceding statement, so the line was removed
+outright rather than restated. Also `manual_checked_division` in the timers display (now `checked_div`,
+identical output) and three test-only index loops (`cpu_q`/`cpu_k`/`cpu_v` rows), rewritten as
+`iter_mut().enumerate().take(n_rows)` — which unlike the original also cannot panic if a row count ever
+exceeded the allocation.
+
+**No benchmark gate applied to this slice:** all five sites are in a `#[test]` function or in the
+timers-display path, not in inference. Verified with `cargo test -p hearth-llm --lib` (10 passed) and a
+real 1.7B Q1_0 run (20 tokens, 34.48 tok/s, coherent output) after the edit.
+
+**Remaining 31 sites** (`ops.rs` 21, `qwen35.rs` 4, `mod.rs` 2, `pool.rs` 2, `matmul.rs` 2) are
+`needless_range_loop` in the SIMD helpers plus eight `too_many_arguments` signatures. Both classes are
+ABI/codegen-relevant, so they need before/after benchmarks on all six models before merging; the plan
+and the exact line list are in RESUME item 0.`#[allow]` is not an option — AGENTS.md bans it.
+
 ### Session 2026-09-19 pt 6 — the 27B chat was unusable: KV cache sized from the model's *declared* context
 
 **Trigger:** "the 27b q1 on html UI chat" returned only *"The model returned no visible text (28 tokens
