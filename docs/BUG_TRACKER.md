@@ -87,6 +87,76 @@ fatal record, forgetting that a failed record does not advance the sequence, so
 the second open failed authentication for a legitimate reason. Worth recording
 because in both cases the assertion was the wrong thing, not the implementation.
 
+### hearth-tls slice 5 — the handshake: key schedule, messages, and the client state machine (buffy, 2026-10-16)
+
+**101 tests, green on both the hardware and the forced-software path**, clippy
+`--all-targets -D warnings` and `cargo fmt --check` clean, still `std`-only with an empty
+`[dependencies]`. Four new modules plus one integration test file:
+
+- `util.rs` — one constant-time comparison, shared by the GCM tag check and the Finished MAC
+  check. It lives here rather than beside its first user because a second copy is how a
+  security-relevant comparison drifts: someone eventually "optimises" theirs with `==`.
+- `keyschedule.rs` — early/handshake/master secrets, `c hs traffic`/`s hs traffic`,
+  `c ap traffic`/`s ap traffic`, `finished_key`, the Finished `verify_data`, `key_update`'s
+  `traffic upd`, and both application secrets. All pinned to RFC 8448's printed values.
+- `handshake.rs` — message framing (4-byte header, not 5), the ClientHello we send, a strict
+  ServerHello parser, and the running transcript hash. Nothing panics on hostile input:
+  every truncation and every single-bit mutation is asserted to be an error, not a panic.
+- `client.rs` — the 1-RTT state machine: ServerHello → the encrypted
+  `EncryptedExtensions`/`Certificate`/`CertificateVerify`/`Finished` flight → our own Finished →
+  application keys, plus `KeyUpdate` in both directions, `close_notify`, and the alert path. It
+  does no I/O (bytes in, bytes out) so a caller owns the transport and the CSPRNG.
+- `tests/rfc8448_flight.rs` — the published flight as an external user of the API.
+
+**The certificate verifier cannot be skipped, by construction.** `ClientHandshake::new` requires a
+`CertificateVerifier`, and the crate ships exactly one implementation: `RejectAll`, which can only
+refuse. There is no insecure flag, no environment variable and no accept-all type — a caller that
+wants a usable connection has to write and own the verification step. `HEARTH_TLS_NO_HW` (slice 3)
+can only ever select the *slower* implementation; it cannot weaken a check.
+
+**The strongest fixture is RFC 8448's real encrypted server flight, and it is self-proving.** The
+679-octet record contains all four messages. Three published values pin each other: the transcript
+hash through `ClientHello..ServerHello` fixes the hello bytes; the AEAD tag fixes every ciphertext
+byte; and the server's published Finished MAC
+(`HMAC(finished_key(s hs traffic), Hash(ClientHello..CertificateVerify))`) fixes `EncryptedExtensions`,
+`Certificate` and `CertificateVerify` message by message. The test also re-seals the *client's*
+Finished record and requires it to equal the trace's 58 bytes, which checks the sending direction
+against a real implementation's output rather than against ourselves.
+
+**A transcription error was caught by derivation, and 29-of-32 bytes matching is what caught it.**
+`researcher-web` reported the client's Finished `verify_data` as `…c1 fc eb 31 92 5f 9e…`. Deriving it
+from the published `c hs traffic` and transcript hash gave `…c1 fc eb e1 1a 03 9e…` — the same value
+in 29 of 32 bytes. A hash cannot differ in three bytes, so one of the two was a copy error: the RFC's
+own text prints `eb e1 1a 03`, so the transcription was wrong and the derivation was right. The
+generator re-derives the value before emitting it, so the constant in the repository is the RFC's.
+The general lesson stands: **a published vector is only as good as the copying**, so every value in
+this slice is either re-derived locally or asserted against a second published value that covers it.
+
+**RFC 8448's `Certificate` message is internally inconsistent, and the fixture records that rather
+than smoothing it over.** It declares a 437-byte `certificate_list` whose single entry is 432 bytes,
+accounting for 435; the two unaccounted bytes are `00 00` at the end. Both the AEAD tag and the
+published Finished MAC reproduce over exactly those bytes, and the RFC's own text shows the same
+lengths, so the anomaly is the RFC's. It is asserted by its own test so nobody later "fixes" the
+fixture. `parse_certificate` in the client is strict about this framing — real servers emit a
+consistent list — which is why the fixture drives that trace through the record and transcript layer
+instead of through the strict parser.
+
+**Three failures in this slice were again my own test expectations.** The ClientHello slice passed to
+`Server::accept` still carries its 4-byte handshake header, so my session-id offsets were four bytes
+late (every test that needed keys failed, which is how it surfaced); one negative case I wrote as
+"empty chain" (`00 00 00`, a zero-length entry) is malformed framing rather than an empty list; and a
+`KeyUpdate` test left the server's *receive* generation behind, so the next record failed to
+authenticate — which is exactly the signal that a rekey is real rather than bookkeeping, and that
+assertion is now part of the test. Also worth recording: `cargo fmt` had never been run across the
+whole crate in the earlier slices, so `cargo fmt --check` reported pre-existing diffs in
+`keyschedule.rs`, `handshake.rs` and `util.rs`; those are now formatted.
+
+**What this does not do yet.** No certificate verification (so the crate must not be wired to an
+`https://` path), no client authentication (a `CertificateRequest` is refused, not ignored), no
+resumption/PSK or 0-RTT, no ALPN, no post-handshake authentication, and `aarch64` PMULL/AES is still
+missing for macOS. `NewSessionTicket` and similar post-handshake messages are refused explicitly
+rather than swallowed.
+
 ### hearth-tls slice 3 — AES-NI and PCLMULQDQ, runtime-dispatched (buffy, 2026-10-16)
 
 Measured on one binary, interleaved, with `HEARTH_TLS_NO_HW=1` forcing the software path

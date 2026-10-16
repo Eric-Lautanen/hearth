@@ -71,6 +71,18 @@ impl TrafficKeys {
         Self { key, iv }
     }
 
+    /// The record protection key, as derived. Exposed so the key schedule can be
+    /// checked against published vectors; nothing in the crate reads it back
+    /// out.
+    pub fn key(&self) -> &[u8; 16] {
+        &self.key
+    }
+
+    /// The static IV, which the sequence number is XORed into per record.
+    pub fn iv(&self) -> &[u8; NONCE_LEN] {
+        &self.iv
+    }
+
     /// Derives the key and IV from a traffic secret, as RFC 8446 §7.3 specifies:
     /// `key = HKDF-Expand-Label(secret, "key", "", 16)` and
     /// `iv = HKDF-Expand-Label(secret, "iv", "", 12)`.

@@ -47,15 +47,27 @@
 //! runs everywhere else. `Aes128Gcm::accelerated()` reports which paths an
 //! instance actually took.
 //!
-//! Still to come, in the order the handshake needs them:
-//! 1. **The handshake** — ClientHello/ServerHello, the key schedule, the
-//!    transcript hash, and Finished MAC verification (a wrong MAC must abort,
-//!    not warn). Including `key_update`, which reuses
-//!    [`record::TrafficKeys::from_secret`].
-//! 2. **Certificate verification** — the largest and most dangerous piece:
+//! - [`keyschedule`] — the TLS 1.3 key schedule, pinned to RFC 8448's published
+//!   early/handshake/master secrets and handshake traffic keys
+//! - [`handshake`] — handshake message framing, the ClientHello we send, the
+//!   ServerHello we accept (strictly, and without panicking on hostility), and
+//!   the running transcript hash
+//! - [`client`] — the 1-RTT client state machine: ServerHello through the
+//!   `EncryptedExtensions`/`Certificate`/`CertificateVerify`/`Finished` flight,
+//!   the fatal Finished MAC check, our own Finished, `KeyUpdate` in both
+//!   directions and `close_notify`. It takes bytes in and hands bytes back, so
+//!   it drives a transport the caller owns, and it cannot be built without a
+//!   [`CertificateVerifier`].
+//!
+//! Still to come:
+//! 1. **Certificate verification** — the largest and most dangerous piece:
 //!    X.509 chain building, ECDSA/RSA signature checks and a pinned root
-//!    store. Deliberately last, and deliberately not attempted until the
-//!    transport below it is solid.
+//!    store. Until it exists the only verifier here is
+//!    [`RejectAll`], which can only refuse, so no `https://` path may be
+//!    enabled on this crate's account.
+//! 2. **The transport** — sockets, and the read/write loop that drives it. That
+//!    belongs in the downloader rather than here, where it would drag I/O into
+//!    code that is provable in isolation.
 
 /// True if `HEARTH_TLS_NO_HW` is set, which forces every primitive onto its
 /// software path.
@@ -71,11 +83,16 @@ pub(crate) fn hardware_disabled() -> bool {
 }
 
 pub mod aes;
+pub mod client;
 pub mod gcm;
+pub mod handshake;
 pub mod hkdf;
+pub mod keyschedule;
 pub mod record;
 pub mod sha256;
 pub mod x25519;
+
+pub(crate) mod util;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod aesni;
@@ -83,8 +100,17 @@ pub(crate) mod aesni;
 pub(crate) mod ghash_x86;
 
 pub use aes::Aes128;
+pub use client::{
+    CertificateVerifier, CertificateVerifyInput, ClientConfig, ClientError, ClientHandshake, Out,
+    RejectAll,
+};
 pub use gcm::{Aes128Gcm, GcmError, NONCE_LEN, TAG_LEN};
+pub use handshake::{
+    build_client_hello, parse_server_hello, ClientHelloParams, HandshakeError, HandshakeReader,
+    Message, ServerHello, Transcript,
+};
 pub use hkdf::{derive_secret, derive_secret32, hkdf_expand, hkdf_expand_label, hkdf_extract};
+pub use keyschedule::{finished_key, finished_verify_data, verify_finished, TrafficSecrets};
 pub use record::{Record, RecordError, RecordLayer, TrafficKeys};
 pub use sha256::{hmac_sha256, hmac_sha256_parts, Sha256};
 pub use x25519::{diffie_hellman, public_key, x25519, SharedSecretError, BASEPOINT};

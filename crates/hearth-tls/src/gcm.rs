@@ -28,6 +28,7 @@
 //! RFC 8446 §5.3 requires.
 
 use crate::aes::Aes128;
+use crate::util::constant_time_eq;
 use std::fmt;
 
 /// Authentication tag length (SP 800-38D §5.2.1.2): the full 128 bits, never a
@@ -262,20 +263,6 @@ pub(crate) fn multiply_software(x: u128, y: u128) -> u128 {
         i += 1;
     }
     z
-}
-
-/// Constant-time equality: no early exit, no length-dependent memory access
-/// pattern beyond the equal-length case.
-#[inline]
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]

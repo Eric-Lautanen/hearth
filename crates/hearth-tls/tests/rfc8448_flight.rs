@@ -1,0 +1,369 @@
+//! RFC 8448 section 3's server flight, as the RFC publishes it.
+//!
+//! This is the strongest fixture available for the handshake above the record
+//! layer, because it is a *recorded* connection rather than an assertion about
+//! one: the trace prints the ClientHello and ServerHello, the transcript hash
+//! through them, both handshake traffic secrets, and the complete 679-octet
+//! encrypted record the server sent. Those pin each other:
+//!
+//! 1. `Hash(ClientHello..ServerHello)` must equal the published `860c06ed...`,
+//!    which fixes the ClientHello and ServerHello bytes exactly.
+//! 2. The record must open under the key and IV derived from the published
+//!    `s hs traffic`, which fixes every ciphertext byte -- an AEAD tag does not
+//!    forgive a single wrong bit.
+//! 3. The decrypted `Finished` must verify as
+//!    `HMAC(finished_key(s hs traffic), Hash(ClientHello..CertificateVerify))`,
+//!    which fixes the `EncryptedExtensions`, `Certificate` and
+//!    `CertificateVerify` bytes: the whole flight, message by message.
+//!
+//! Every constant below was checked against all three *before* being embedded,
+//! using OpenSSL's AES-GCM through Python's `cryptography` rather than this
+//! crate, and the hex was machine-copied. A failure here is our code, not the
+//! fixture.
+//!
+//! Two transcription mistakes are worth recording, because both were caught by
+//! derivation rather than by reading. The client's Finished `verify_data`
+//! arrived with three wrong bytes in the middle -- 29 of its 32 bytes still
+//! matched, which is exactly why it was suspicious -- and the `Certificate`
+//! message's lengths do not add up in the RFC itself. Published vectors are only
+//! as good as the copying, so both are asserted explicitly below instead of
+//! being trusted.
+//!
+//! # One anomaly in the trace, recorded rather than smoothed over
+//!
+//! The trace's `Certificate` message is internally inconsistent: it declares a
+//! `certificate_list` of 437 bytes whose single entry is 432 bytes long, which
+//! accounts for 435. The two unaccounted bytes are `00 00` at the end of the
+//! list. Both the AEAD tag and the published Finished MAC reproduce over exactly
+//! those bytes, and the RFC's own printed lengths are the ones embedded here, so
+//! the anomaly is in RFC 8448 rather than in this transcription --
+//! [`the_rfcs_certificate_message_has_two_unaccounted_bytes`] asserts it so that
+//! nobody later "fixes" the fixture. Real servers emit a consistent list, and a
+//! list that is inconsistent is refused by `hearth_tls::client`.
+
+use hearth_tls::handshake::{
+    encode, parse_server_hello, HandshakeReader, TYPE_CERTIFICATE, TYPE_CERTIFICATE_VERIFY,
+    TYPE_ENCRYPTED_EXTENSIONS, TYPE_FINISHED,
+};
+use hearth_tls::keyschedule::{
+    early_secret, finished_key, handshake_secret, verify_finished, TrafficSecrets,
+};
+use hearth_tls::record::{RecordLayer, TrafficKeys, CONTENT_TYPE_HANDSHAKE};
+use hearth_tls::sha256::{hmac_sha256, Sha256};
+use hearth_tls::x25519;
+
+const CLIENT_HELLO_HEX: &str = "\
+01 00 00 c0 03 03 cb 34 ec b1 e7 81 63 ba 1c 38 \
+c6 da cb 19 6a 6d ff a2 1a 8d 99 12 ec 18 a2 ef \
+62 83 02 4d ec e7 00 00 06 13 01 13 03 13 02 01 \
+00 00 91 00 00 00 0b 00 09 00 00 06 73 65 72 76 \
+65 72 ff 01 00 01 00 00 0a 00 14 00 12 00 1d 00 \
+17 00 18 00 19 01 00 01 01 01 02 01 03 01 04 00 \
+23 00 00 00 33 00 26 00 24 00 1d 00 20 99 38 1d \
+e5 60 e4 bd 43 d2 3d 8e 43 5a 7d ba fe b3 c0 6e \
+51 c1 3c ae 4d 54 13 69 1e 52 9a af 2c 00 2b 00 \
+03 02 03 04 00 0d 00 20 00 1e 04 03 05 03 06 03 \
+02 03 08 04 08 05 08 06 04 01 05 01 06 01 02 01 \
+04 02 05 02 06 02 02 02 00 2d 00 02 01 01 00 1c \
+00 02 40 01";
+const SERVER_HELLO_HEX: &str = "\
+02 00 00 56 03 03 a6 af 06 a4 12 18 60 dc 5e 6e \
+60 24 9c d3 4c 95 93 0c 8a c5 cb 14 34 da c1 55 \
+77 2e d3 e2 69 28 00 13 01 00 00 2e 00 33 00 24 \
+00 1d 00 20 c9 82 88 76 11 20 95 fe 66 76 2b db \
+f7 c6 72 e1 56 d6 cc 25 3b 83 3d f1 dd 69 b1 b0 \
+4e 75 1f 0f 00 2b 00 02 03 04";
+/// The complete server flight as it appeared on the wire: record header,
+/// 674 bytes of AEAD ciphertext, and the tag.
+const SERVER_FLIGHT_RECORD_HEX: &str = "\
+17 03 03 02 a2 d1 ff 33 4a 56 f5 bf f6 59 4a 07 \
+cc 87 b5 80 23 3f 50 0f 45 e4 89 e7 f3 3a f3 5e \
+df 78 69 fc f4 0a a4 0a a2 b8 ea 73 f8 48 a7 ca \
+07 61 2e f9 f9 45 cb 96 0b 40 68 90 51 23 ea 78 \
+b1 11 b4 29 ba 91 91 cd 05 d2 a3 89 28 0f 52 61 \
+34 aa dc 7f c7 8c 4b 72 9d f8 28 b5 ec f7 b1 3b \
+d9 ae fb 0e 57 f2 71 58 5b 8e a9 bb 35 5c 7c 79 \
+02 07 16 cf b9 b1 18 3e f3 ab 20 e3 7d 57 a6 b9 \
+d7 47 76 09 ae e6 e1 22 a4 cf 51 42 73 25 25 0c \
+7d 0e 50 92 89 44 4c 9b 3a 64 8f 1d 71 03 5d 2e \
+d6 5b 0e 3c dd 0c ba e8 bf 2d 0b 22 78 12 cb b3 \
+60 98 72 55 cc 74 41 10 c4 53 ba a4 fc d6 10 92 \
+8d 80 98 10 e4 b7 ed 1a 8f d9 91 f0 6a a6 24 82 \
+04 79 7e 36 a6 a7 3b 70 a2 55 9c 09 ea d6 86 94 \
+5b a2 46 ab 66 e5 ed d8 04 4b 4c 6d e3 fc f2 a8 \
+94 41 ac 66 27 2f d8 fb 33 0e f8 19 05 79 b3 68 \
+45 96 c9 60 bd 59 6e ea 52 0a 56 a8 d6 50 f5 63 \
+aa d2 74 09 96 0d ca 63 d3 e6 88 61 1e a5 e2 2f \
+44 15 cf 95 38 d5 1a 20 0c 27 03 42 72 96 8a 26 \
+4e d6 54 0c 84 83 8d 89 f7 2c 24 46 1a ad 6d 26 \
+f5 9e ca ba 9a cb bb 31 7b 66 d9 02 f4 f2 92 a3 \
+6a c1 b6 39 c6 37 ce 34 31 17 b6 59 62 22 45 31 \
+7b 49 ee da 0c 62 58 f1 00 d7 d9 61 ff b1 38 64 \
+7e 92 ea 33 0f ae ea 6d fa 31 c7 a8 4d c3 bd 7e \
+1b 7a 6c 71 78 af 36 87 90 18 e3 f2 52 10 7f 24 \
+3d 24 3d c7 33 9d 56 84 c8 b0 37 8b f3 02 44 da \
+8c 87 c8 43 f5 e5 6e b4 c5 e8 28 0a 2b 48 05 2c \
+f9 3b 16 49 9a 66 db 7c ca 71 e4 59 94 26 f7 d4 \
+61 e6 6f 99 88 2b d8 9f c5 08 00 be cc a6 2d 6c \
+74 11 6d bd 29 72 fd a1 fa 80 f8 5d f8 81 ed be \
+5a 37 66 89 36 b3 35 58 3b 59 91 86 dc 5c 69 18 \
+a3 96 fa 48 a1 81 d6 b6 fa 4f 9d 62 d5 13 af bb \
+99 2f 2b 99 2f 67 f8 af e6 7f 76 91 3f a3 88 cb \
+56 30 c8 ca 01 e0 c6 5d 11 c6 6a 1e 2a c4 c8 59 \
+77 b7 c7 a6 99 9b bf 10 dc 35 ae 69 f5 51 56 14 \
+63 6c 0b 9b 68 c1 9e d2 e3 1c 0b 3b 66 76 30 38 \
+eb ba 42 f3 b3 8e dc 03 99 f3 a9 f2 3f aa 63 97 \
+8c 31 7f c9 fa 66 a7 3f 60 f0 50 4d e9 3b 5b 84 \
+5e 27 55 92 c1 23 35 ee 34 0b bc 4f dd d5 02 78 \
+40 16 e4 b3 be 7e f0 4d da 49 f4 b4 40 a3 0c b5 \
+d2 af 93 98 28 fd 4a e3 79 4e 44 f9 4d f5 a6 31 \
+ed e4 2c 17 19 bf da bf 02 53 fe 51 75 be 89 8e \
+75 0e dc 53 37 0d 2b";
+/// The RFC's client private key, which is what makes the (EC)DHE check
+/// possible from published values alone.
+const CLIENT_PRIVATE_KEY_HEX: &str = "\
+49 af 42 ba 7f 79 94 85 2d 71 3e f2 78 4b cb ca \
+a7 91 1d e2 6a dc 56 42 cb 63 45 40 e7 ea 50 05";
+const ECDHE_HEX: &str = "\
+8b d4 05 4f b5 5b 9d 63 fd fb ac f9 f0 4b 9f 0d \
+35 e6 d6 3f 53 75 63 ef d4 62 72 90 0f 89 49 2d";
+const SERVER_HANDSHAKE_TRAFFIC_HEX: &str = "\
+b6 7b 7d 69 0c c1 6c 4e 75 e5 42 13 cb 2d 37 b4 \
+e9 c9 12 bc de d9 10 5d 42 be fd 59 d3 91 ad 38";
+const CLIENT_HANDSHAKE_TRAFFIC_HEX: &str = "\
+b3 ed db 12 6e 06 7f 35 a7 80 b3 ab f4 5e 2d 8f \
+3b 1a 95 07 38 f5 2e 96 00 74 6a 0e 27 a5 5a 21";
+const HASH_AFTER_SERVER_HELLO_HEX: &str = "\
+86 0c 06 ed c0 78 58 ee 8e 78 f0 e7 42 8c 58 ed \
+d6 b4 3f 2c a3 e6 e9 5f 02 ed 06 3c f0 e1 ca d8";
+const HASH_AFTER_SERVER_FINISHED_HEX: &str = "\
+96 08 10 2a 0f 1c cc 6d b6 25 0b 7b 7e 41 7b 1a \
+00 0e aa da 3d aa e4 77 7a 76 86 c9 ff 83 df 13";
+const SERVER_FINISHED_VERIFY_DATA_HEX: &str = "\
+9b 9b 14 1d 90 63 37 fb d2 cb dc e7 1d f4 de da \
+4a b4 2c 30 95 72 cb 7f ff ee 54 54 b7 8f 07 18";
+const CLIENT_FINISHED_VERIFY_DATA_HEX: &str = "\
+a8 ec 43 6d 67 76 34 ae 52 5a c1 fc eb e1 1a 03 \
+9e c1 76 94 fa c6 e9 85 27 b6 42 f2 ed d5 ce 61";
+/// The complete record the client sends, as the trace prints it.
+const CLIENT_FINISHED_RECORD_HEX: &str = "\
+17 03 03 00 35 75 ec 4d c2 38 cc e6 0b 29 80 44 \
+a7 1e 21 9c 56 cc 77 b0 51 7f e9 b9 3c 7a 4b fc \
+44 d8 7f 38 f8 03 38 ac 98 fc 46 de b3 84 bd 1c \
+ae ac ab 68 67 d7 26 c4 05 46";
+fn bytes(text: &str) -> Vec<u8> {
+    let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(cleaned.len().is_multiple_of(2), "odd hex length");
+    (0..cleaned.len() / 2)
+        .map(|i| u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16).expect("hex"))
+        .collect()
+}
+
+fn hash32(text: &str) -> [u8; 32] {
+    bytes(text).try_into().expect("a 32-byte value")
+}
+
+fn sha(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize()
+}
+
+/// Everything the trace gives us, re-derived through this crate.
+struct Trace {
+    client_hello: Vec<u8>,
+    server_hello: Vec<u8>,
+    /// `EncryptedExtensions`, `Certificate`, `CertificateVerify`, `Finished` --
+    /// each with its handshake header, exactly as they arrived.
+    messages: Vec<Vec<u8>>,
+    handshake_secrets: TrafficSecrets,
+}
+
+impl Trace {
+    /// The transcript hash through the first `count` server messages.
+    fn hash_through(&self, count: usize) -> [u8; 32] {
+        let mut parts: Vec<&[u8]> = vec![&self.client_hello, &self.server_hello];
+        parts.extend(self.messages[..count].iter().map(Vec::as_slice));
+        sha(&parts)
+    }
+}
+
+fn trace() -> Trace {
+    let client_hello = bytes(CLIENT_HELLO_HEX);
+    let server_hello = bytes(SERVER_HELLO_HEX);
+    assert_eq!(client_hello.len(), 196); // the trace's own annotation
+    assert_eq!(server_hello.len(), 90);
+
+    // The published hash pins both hello messages.
+    assert_eq!(
+        sha(&[&client_hello, &server_hello]),
+        hash32(HASH_AFTER_SERVER_HELLO_HEX)
+    );
+
+    // The (EC)DHE secret from the RFC's own private key and key share, so the
+    // schedule is fed the same input the trace's server used.
+    let parsed = parse_server_hello(&server_hello).expect("the RFC's ServerHello parses");
+    let shared = x25519::diffie_hellman(&hash32(CLIENT_PRIVATE_KEY_HEX), &parsed.key_share)
+        .expect("the server's key share is not a low-order point");
+    assert_eq!(shared, hash32(ECDHE_HEX));
+
+    let handshake = handshake_secret(&early_secret(None), &shared).expect("hkdf");
+    let handshake_secrets =
+        TrafficSecrets::derive(&handshake, "hs", &sha(&[&client_hello, &server_hello]))
+            .expect("hkdf");
+    assert_eq!(
+        handshake_secrets.server,
+        hash32(SERVER_HANDSHAKE_TRAFFIC_HEX)
+    );
+    assert_eq!(
+        handshake_secrets.client,
+        hash32(CLIENT_HANDSHAKE_TRAFFIC_HEX)
+    );
+
+    // Open the record the server actually sent.
+    let mut layer =
+        RecordLayer::new(&TrafficKeys::from_secret(&handshake_secrets.server).expect("hkdf"));
+    let opened = layer
+        .open(&bytes(SERVER_FLIGHT_RECORD_HEX))
+        .expect("the published record authenticates");
+    assert_eq!(opened.content_type, CONTENT_TYPE_HANDSHAKE);
+    assert_eq!(opened.payload.len(), 657); // 40 + 445 + 136 + 36
+
+    let mut reader = HandshakeReader::new(&opened.payload);
+    let mut messages = Vec::new();
+    while let Some(message) = reader.next_message().expect("well-framed messages") {
+        messages.push(message.raw().to_vec());
+    }
+    assert_eq!(
+        messages.iter().map(|m| m[0]).collect::<Vec<_>>(),
+        vec![
+            TYPE_ENCRYPTED_EXTENSIONS,
+            TYPE_CERTIFICATE,
+            TYPE_CERTIFICATE_VERIFY,
+            TYPE_FINISHED
+        ]
+    );
+
+    Trace {
+        client_hello,
+        server_hello,
+        messages,
+        handshake_secrets,
+    }
+}
+
+#[test]
+fn the_published_flight_opens_and_its_finished_verifies() {
+    let trace = trace();
+    assert_eq!(
+        trace.messages.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![40, 445, 136, 36],
+        "the trace's own message sizes"
+    );
+
+    // The server's Finished covers the transcript through CertificateVerify, so
+    // this single check pins EncryptedExtensions, Certificate and
+    // CertificateVerify byte for byte.
+    let key = finished_key(&trace.handshake_secrets.server).expect("hkdf");
+    assert_eq!(
+        hmac_sha256(&key, &trace.hash_through(3)),
+        hash32(SERVER_FINISHED_VERIFY_DATA_HEX)
+    );
+    assert_eq!(
+        verify_finished(&key, &trace.hash_through(3), &trace.messages[3][4..]),
+        Ok(())
+    );
+
+    // The hash including the server's Finished is the published one, which is
+    // what the application secrets are derived from.
+    assert_eq!(
+        trace.hash_through(4),
+        hash32(HASH_AFTER_SERVER_FINISHED_HEX)
+    );
+}
+
+#[test]
+fn the_published_client_finished_also_verifies() {
+    let trace = trace();
+    // RFC 8448 prints the client's Finished too, computed over the same
+    // transcript hash as the application secrets. Checking it exercises the
+    // client handshake traffic secret and the HMAC path independently of the
+    // server's Finished.
+    let key = finished_key(&trace.handshake_secrets.client).expect("hkdf");
+    assert_eq!(
+        verify_finished(
+            &key,
+            &hash32(HASH_AFTER_SERVER_FINISHED_HEX),
+            &bytes(CLIENT_FINISHED_VERIFY_DATA_HEX)
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn our_client_finished_record_seals_to_the_published_bytes() {
+    let trace = trace();
+    let message = encode(TYPE_FINISHED, &bytes(CLIENT_FINISHED_VERIFY_DATA_HEX));
+    assert_eq!(
+        message.len(),
+        36,
+        "a Finished message is a header and one hash"
+    );
+    assert_eq!(message[4..], bytes(CLIENT_FINISHED_VERIFY_DATA_HEX)[..]);
+
+    // And sealing it with the client handshake keys at sequence 0 must produce
+    // the trace's record byte for byte. That checks the sending direction --
+    // nonce construction, the header as additional data, the inner content type
+    // -- against a real implementation's output rather than against ourselves.
+    let mut layer =
+        RecordLayer::new(&TrafficKeys::from_secret(&trace.handshake_secrets.client).expect("hkdf"));
+    let sealed = layer.seal(CONTENT_TYPE_HANDSHAKE, &message).expect("seal");
+    assert_eq!(sealed, bytes(CLIENT_FINISHED_RECORD_HEX));
+    assert_eq!(layer.sequence(), 1);
+}
+
+#[test]
+fn the_certificate_verify_signed_data_has_the_published_shape() {
+    let trace = trace();
+    let body = &trace.messages[2][4..];
+    assert_eq!(body[0..2], [0x08, 0x04], "rsa_pss_rsae_sha256");
+    assert_eq!(
+        u16::from_be_bytes([body[2], body[3]]) as usize,
+        body.len() - 4,
+        "the signature length agrees with the message"
+    );
+    // The trace's certificate carries a 1024-bit RSA key -- its DER modulus is
+    // 128 bytes -- so the signature is 128 bytes.
+    assert_eq!(body[4..].len(), 128, "an RSA-1024 signature");
+
+    // RFC 8446 section 4.4.3's signed content. The signature itself cannot be
+    // checked yet -- RSA-PSS verification arrives with certificate verification
+    // -- but the structure and the transcript hash it covers are checkable here,
+    // and the hash through Certificate is independently fixed by the Finished
+    // MAC above.
+    let mut signed = vec![0x20u8; 64];
+    signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed.push(0);
+    signed.extend_from_slice(&trace.hash_through(2));
+    assert_eq!(signed.len(), 130);
+}
+
+#[test]
+fn the_rfcs_certificate_message_has_two_unaccounted_bytes() {
+    let trace = trace();
+    let body = &trace.messages[1][4..];
+    assert_eq!(body[0], 0, "an empty certificate_request_context");
+    let list_len = u32::from_be_bytes([0, body[1], body[2], body[3]]) as usize;
+    let list = &body[4..];
+    assert_eq!(list.len(), list_len);
+    let entry_len = u32::from_be_bytes([0, list[0], list[1], list[2]]) as usize;
+    assert_eq!(entry_len, 432, "the single certificate's own length");
+    assert_eq!(
+        list_len,
+        entry_len + 3 + 2,
+        "the trace declares two bytes more than its one entry accounts for"
+    );
+    assert_eq!(&list[list.len() - 2..], &[0, 0], "the unaccounted bytes");
+}
