@@ -24,7 +24,10 @@ for rotation representation, avoiding gimbal lock...
 All 14 models on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5), single run each at
 `--temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`, idle machine, warmed
 up first (frequency scaling needs one throwaway run). Hearth uses 8 workers.
-Numbers move ±10–15% run to run with machine state; treat small deltas as noise.
+Single runs on this box vary more than the usual ±10–15%: an interleaved
+re-run later the same evening read the Q2_0 family ~25% lower on two
+independent binaries, so treat these as snapshots, not absolutes — only
+alternating same-session pairs carry information.
 
 | Size | Format               | d_model | Layers | tok/s (2026-10-15) |
 | ---- | -------------------- | ------- | ------ | ------------------ |
