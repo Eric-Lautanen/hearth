@@ -154,8 +154,10 @@ def expectations(cert):
             path_len = extension.value.path_length
 
     cn = [a.value for a in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)]
+    issuer_cn = [a.value for a in cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)]
     return {
         "subject_cn": cn[0] if cn else "",
+        "issuer_cn": issuer_cn[0] if issuer_cn else "",
         "serial": "%02x" % cert.serial_number,
         "not_before": int(cert.not_valid_before_utc.timestamp()),
         "not_after": int(cert.not_valid_after_utc.timestamp()),
@@ -183,6 +185,30 @@ def main():
     shadow_root_key = rsa_key(20261021)
     client_auth_key = rsa_key(20261022)
     no_sign_key = rsa_key(20261023)
+    sub_ca_key = rsa_key(20261024)
+    top_ca_key = rsa_key(20261025)
+    top_ca_strict_key = rsa_key(20261026)
+    sub_ca_strict_key = rsa_key(20261030)
+    leaf_sub_strict_key = rsa_key(20261031)
+    leaf_sub_key = rsa_key(20261027)
+    no_key_cert_sign_key = rsa_key(20261028)
+    leaf_of_no_sign_key = rsa_key(20261029)
+
+    def usage(**flags):
+        """A `KeyUsage` with only the named bits set."""
+        values = dict(
+            digital_signature=False,
+            content_commitment=False,
+            key_encipherment=False,
+            data_encipherment=False,
+            key_agreement=False,
+            key_cert_sign=False,
+            crl_sign=False,
+            encipher_only=False,
+            decipher_only=False,
+        )
+        values.update(flags)
+        return x509.KeyUsage(**values)
 
     def name(common):
         return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common)])
@@ -432,6 +458,143 @@ def main():
         .sign(intermediate_key, hashes.SHA256())
     )
 
+    # A two-level sub-hierarchy, for `pathLenConstraint`. The root allows one
+    # intermediate below it; `TOP_CA` allows one more, and `TOP_CA_STRICT` allows
+    # none — the same subject name and a different key, so the two can be swapped
+    # into one chain and only the limit differs. `SUB_CA` allows none either, so a
+    # path through it is legal only while nothing else is below it.
+    top_ca = (
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test Top CA"))
+        .issuer_name(root.subject)
+        .public_key(top_ca_key.public_key())
+        .serial_number(0x0B)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=1), critical=True)
+        .add_extension(usage(key_cert_sign=True, crl_sign=True), critical=True)
+        .sign(root_key, hashes.SHA256())
+    )
+
+    # Issued *by* `TOP_CA`, sharing its subject name and carrying a key of its own.
+    # That is what lets a test put this one or the real one third in the same chain
+    # and have the only difference be the limit: the names link and the signatures
+    # verify either way, because `TOP_CA` signed both `SUB_CA` and this one.
+    top_ca_strict = (
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test Top CA"))
+        .issuer_name(top_ca.subject)
+        .public_key(top_ca_strict_key.public_key())
+        .serial_number(0x0C)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(key_cert_sign=True, crl_sign=True), critical=True)
+        .sign(top_ca_key, hashes.SHA256())
+    )
+
+    sub_ca = (
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test Sub CA"))
+        .issuer_name(top_ca.subject)
+        .public_key(sub_ca_key.public_key())
+        .serial_number(0x0A)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(key_cert_sign=True, crl_sign=True), critical=True)
+        .sign(top_ca_key, hashes.SHA256())
+    )
+
+    leaf_sub = (
+        x509.CertificateBuilder()
+        .subject_name(name("sub.example"))
+        .issuer_name(sub_ca.subject)
+        .public_key(leaf_sub_key.public_key())
+        .serial_number(0x0D)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("sub.example")]), critical=False)
+        .sign(sub_ca_key, hashes.SHA256())
+    )
+
+    # The same two levels again under `TOP_CA_STRICT`, with one level's limit changed
+    # and nothing else: where the tree above has a CA allowing one intermediate below
+    # it, this one has a CA allowing none. Both subtrees are otherwise identical, so a
+    # chain built from one and then the other differs only in which limit applies.
+    sub_ca_strict = (
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test Sub CA"))
+        .issuer_name(top_ca_strict.subject)
+        .public_key(sub_ca_strict_key.public_key())
+        .serial_number(0x10)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(key_cert_sign=True, crl_sign=True), critical=True)
+        .sign(top_ca_strict_key, hashes.SHA256())
+    )
+
+    leaf_sub_strict = (
+        x509.CertificateBuilder()
+        .subject_name(name("sub-strict.example"))
+        .issuer_name(sub_ca_strict.subject)
+        .public_key(leaf_sub_strict_key.public_key())
+        .serial_number(0x11)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("sub-strict.example")]), critical=False
+        )
+        .sign(sub_ca_strict_key, hashes.SHA256())
+    )
+
+    # A CA that says it is one and then does not claim the right to sign
+    # certificates: `basicConstraints` CA is true, `keyUsage` is present without
+    # `keyCertSign`. RFC 5280 §4.2.1.9 makes that fatal to the path, and only a
+    # certificate like this can prove the check.
+    no_key_cert_sign_ca = (
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test No-Sign CA"))
+        .issuer_name(root.subject)
+        .public_key(no_key_cert_sign_key.public_key())
+        .serial_number(0x0E)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(digital_signature=True, crl_sign=True), critical=True)
+        .sign(root_key, hashes.SHA256())
+    )
+
+    leaf_of_no_sign = (
+        x509.CertificateBuilder()
+        .subject_name(name("no-sign-ca.example"))
+        .issuer_name(no_key_cert_sign_ca.subject)
+        .public_key(leaf_of_no_sign_key.public_key())
+        .serial_number(0x0F)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("no-sign-ca.example")]), critical=False
+        )
+        .sign(no_key_cert_sign_key, hashes.SHA256())
+    )
+
     # A leaf whose unknown extension is marked **critical**. RFC 5280 requires a
     # reader that does not understand a critical extension to reject the
     # certificate, so this one must not parse.
@@ -465,6 +628,14 @@ def main():
         ("SELF_SIGNED_EC", self_signed_ec),
         ("LEAF_UNKNOWN_CRITICAL", leaf_unknown_critical),
         ("ROOT_SHADOW", root_shadow),
+        ("TOP_CA", top_ca),
+        ("TOP_CA_STRICT", top_ca_strict),
+        ("SUB_CA", sub_ca),
+        ("LEAF_SUB", leaf_sub),
+        ("CA_NO_KEY_CERT_SIGN", no_key_cert_sign_ca),
+        ("LEAF_OF_NO_SIGN_CA", leaf_of_no_sign),
+        ("SUB_CA_STRICT", sub_ca_strict),
+        ("LEAF_SUB_STRICT", leaf_sub_strict),
     ]
 
     # `//` rather than `//!`: this file is pulled in with `include!`, so an inner
@@ -496,6 +667,7 @@ def main():
         out.append("            der_len: %d," % len(der))
         out.append("            version: %d," % (cert.version.value + 1))
         out.append('            subject_cn: "%s",' % want["subject_cn"])
+        out.append('            issuer_cn: "%s",' % want["issuer_cn"])
         out.append('            serial_hex: "%s",' % want["serial"])
         out.append("            not_before: %d," % want["not_before"])
         out.append("            not_after: %d," % want["not_after"])

@@ -44,12 +44,25 @@
 //!   from this module means, and it is not fixable from `std` alone.
 //! - **No host name matching** and no `nameConstraints` processing: a chain that
 //!   verifies here may still be for the wrong server. That is the next slice.
-//! - **No `pathLenConstraint` and no `keyUsage.keyCertSign` check.** Both are read
-//!   out of the certificate by [`crate::x509`] — `path_len` and `key_usage` — and
-//!   neither has a fixture that can make the check *fail*, so neither can be
-//!   proven here yet. `docs/RESUME.md` names the certificates to generate.
 //! - **No `extendedKeyUsage` policy on issuers**, no `policyConstraints`, no
 //!   `inhibitAnyPolicy`, no name constraints.
+//!
+//! # The two rules that are read out of a CA certificate
+//!
+//! `pathLenConstraint` (RFC 5280 §4.2.1.9) caps how many *intermediate* certificates
+//! may follow a CA towards the leaf, so it bounds what a sub-CA can delegate. A
+//! certificate that is **self-issued** does not count towards the number, which is
+//! what §6.1.4 excludes and what makes a key rollover possible. The limit is
+//! enforced on every CA in the presented chain *and* on the anchor, and where the
+//! anchor is itself the last certificate of the chain, that certificate is not
+//! counted against its own limit.
+//!
+//! `keyUsage.keyCertSign` is required of any issuer whose `keyUsage` extension is
+//! present: a certificate that does not assert the right to sign certificates has no
+//! business being one, whatever its `basicConstraints` says. It is **not** required
+//! of an anchor, because an anchor's authority comes from the caller: a pinned
+//! self-signed *leaf* certificate is a legitimate thing to trust and is how a
+//! deployment pins one key.
 //!
 //! Every check that *is* here is fatal on failure: there is no tolerant mode, no
 //! flag and no environment variable that turns one off.
@@ -59,7 +72,7 @@ use std::fmt;
 use crate::client::UnixTime;
 use crate::rsa::{RsaError, RsaPublicKey};
 use crate::verify::{verify_certificate_signature, VerifyError};
-use crate::x509::{Certificate, PublicKey, X509Error};
+use crate::x509::{Certificate, KeyUsage, PublicKey, X509Error};
 
 /// The knobs a caller sets. Everything else is fixed by the certificates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +172,24 @@ pub enum ChainError {
     CaUsedAsLeaf,
     /// A certificate that must be a CA is not one.
     NotACa(Position),
+    /// A certificate has a `keyUsage` extension without `keyCertSign`, so it does
+    /// not assert the right to sign certificates.
+    MissingKeyCertSign {
+        /// Where the certificate is.
+        at: Position,
+        /// Its `keyUsage` bits, so the diagnostic says what it does name.
+        key_usage: u16,
+    },
+    /// A CA has more intermediate certificates below it than its
+    /// `pathLenConstraint` allows.
+    PathLengthExceeded {
+        /// Where the CA is.
+        ca: Position,
+        /// What its `pathLenConstraint` allows.
+        allowed: u32,
+        /// How many non-self-issued CAs are actually below it.
+        found: usize,
+    },
     /// The issuer of one certificate is not the subject of the next, so the
     /// presented list is not a chain at all.
     BrokenLink {
@@ -264,6 +295,16 @@ impl fmt::Display for ChainError {
             Self::NotACa(at) => write!(
                 f,
                 "{at} is in the chain as an issuer but is not a CA (basicConstraints)"
+            ),
+            Self::MissingKeyCertSign { at, key_usage } => write!(
+                f,
+                "{at} is in the chain as an issuer but its keyUsage ({key_usage:#05x}) does not \
+                 include keyCertSign"
+            ),
+            Self::PathLengthExceeded { ca, allowed, found } => write!(
+                f,
+                "{ca} allows at most {allowed} intermediate certificate(s) below it, and there \
+                 are {found}"
             ),
             Self::BrokenLink { index } => write!(
                 f,
@@ -388,6 +429,41 @@ pub fn entries(list: &[u8]) -> Result<Vec<&[u8]>, ChainError> {
     })
 }
 
+/// Whether a certificate is self-issued: its issuer name is its own subject name.
+///
+/// Self-issued certificates are the ones RFC 5280 §6.1.4 excludes from
+/// `pathLenConstraint`, which is what allows a CA to issue itself a new key without
+/// spending the allowance it hands to its subordinates.
+fn self_issued(certificate: &Certificate<'_>) -> bool {
+    certificate.issuer().as_der() == certificate.subject().as_der()
+}
+
+/// How many non-self-issued CA certificates sit between the leaf and the CA at
+/// `index` of the presented chain.
+///
+/// `index` is an exclusive bound, so a CA's own limit is measured against the
+/// certificates below *it* — and an anchor that is itself the last certificate of the
+/// chain is measured with that certificate excluded.
+fn intermediates_below(chain: &[Certificate<'_>], index: usize) -> usize {
+    (1..index)
+        .filter(|position| !self_issued(&chain[*position]))
+        .count()
+}
+
+/// A CA whose `keyUsage` extension is present must claim `keyCertSign`.
+///
+/// RFC 5280 §4.2.1.9: without the bit, the key "MUST NOT be used to verify
+/// signatures on certificates", whatever `basicConstraints` says about being a CA.
+fn check_key_cert_sign(certificate: &Certificate<'_>, at: Position) -> Result<(), ChainError> {
+    match certificate.key_usage() {
+        Some(usage) if !usage.has(KeyUsage::KEY_CERT_SIGN) => Err(ChainError::MissingKeyCertSign {
+            at,
+            key_usage: usage.0,
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Checks one certificate's validity window against `time`.
 ///
 /// The comparison is the one [`UnixTime::outside`] makes — `time < notBefore ||
@@ -468,10 +544,23 @@ pub fn verify_chain(
     }
     // Every other certificate in the path is an issuer, so it must be a CA: a
     // non-CA certificate has no business signing other certificates, whatever its
-    // name says.
+    // name says. If it states its usage, it must claim the right to sign
+    // certificates, and if it states a path length, nothing below it may exceed it.
     for (index, issuer) in chain.iter().enumerate().skip(1) {
+        let at = Position::Chain(index);
         if !issuer.is_ca() {
-            return Err(ChainError::NotACa(Position::Chain(index)));
+            return Err(ChainError::NotACa(at));
+        }
+        check_key_cert_sign(issuer, at)?;
+        if let Some(allowed) = issuer.path_len() {
+            let found = intermediates_below(chain, index);
+            if found > allowed as usize {
+                return Err(ChainError::PathLengthExceeded {
+                    ca: at,
+                    allowed,
+                    found,
+                });
+            }
         }
     }
     for (index, certificate) in chain.iter().enumerate() {
@@ -504,6 +593,29 @@ pub fn verify_chain(
             continue;
         }
         let at = Position::Anchor(index);
+        if let Err(error) = check_key_cert_sign(anchor, at) {
+            failure = Some(error);
+            continue;
+        }
+        // The anchor's own limit is measured with the anchor excluded when the chain
+        // ends at the anchor itself, so an anchor cannot be counted against its own
+        // `pathLenConstraint` by being present in the list.
+        if let Some(allowed) = anchor.path_len() {
+            let below = if last.subject().as_der() == anchor.subject().as_der() {
+                last_index
+            } else {
+                chain.len()
+            };
+            let found = intermediates_below(chain, below);
+            if found > allowed as usize {
+                failure = Some(ChainError::PathLengthExceeded {
+                    ca: at,
+                    allowed,
+                    found,
+                });
+                continue;
+            }
+        }
         if let Err(error) = check_validity(anchor, at, time) {
             failure = Some(error);
             continue;

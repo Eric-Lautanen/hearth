@@ -38,6 +38,40 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 12 — `pathLenConstraint` and `keyUsage.keyCertSign`, each proven by removing it (buffy, 2026-10-16)
+
+`chain.rs`: the last two structural rules, and the first slice where the *test* for each rule was made to
+fail on purpose to show the rule is what produces the refusal.
+
+- **`pathLenConstraint` counts non-self-issued CAs below the CA that stated it**, so the leaf never counts
+  and a CA sitting in the chain does not count against its own limit when it is also the anchor. Both sides
+  are tested: `TOP_CA` (allows one) has one below it in a legal path, and the root (allows one) refuses the
+  same path with two below it, at `Position::Anchor(0)`.
+- **Two mirrored sub-hierarchies make the contrast exact.** The strict subtree shares *both* subject names
+  and both key usages with the normal one and differs only in one CA's limit, and `TOP_CA`'s key really did
+  sign everything in it — so the test asserts every link name and every signature itself instead of
+  claiming them in a comment. That correction came from the first reachability run: with the original
+  fixtures the refused path also had a bad link signature, so "the limit is the only difference" was
+  prose. With the mirrored subtree, removing the limit check turns the path `Ok(())`.
+- **`keyUsage.keyCertSign`**: RFC 5280 §4.2.1.9. `CA_NO_KEY_CERT_SIGN` is `CA:TRUE` with
+  `pathLenConstraint: 0` and a `keyUsage` of `digitalSignature`+`cRLSign`, so the two extensions disagree.
+  Refused as an issuer *and* as a pinned anchor — in the anchor case the test also asserts the signature it
+  would otherwise pass, which pins the ordering: the usage is checked before any trust is conferred.
+- **Reachability, run rather than argued, in three passes.** With `check_key_cert_sign` neutered the
+  key-usage test fails with `left: Ok(())`. With the *chain* `path_len` site neutered the limit test fails
+  with `left: Ok(())` at the chain assertion. With only the *anchor* site neutered — the first two rounds
+  stop the test before its anchor assertion, so that path was not yet proven — the chain assertions pass
+  and the anchor assertion fails with `left: Ok(())`. Every site was restored immediately and the restore
+  is in the diff (`chain.rs`: +125/−7, the two rules and their docs).
+- **Six new certificates (18 total)** from `scripts/tls_x509_fixtures.py`, plus a harness fix: the generator
+  now records each fixture's `issuer_cn`, so the signature test iterates `EXPECTATIONS` and finds each
+  certificate's issuer by name *and* key — a fixture can no longer be silently omitted from it, and the
+  `ROOT_SHADOW` name collision that used to need a hand-written table is handled by trying both.
+- **211 checks green** on the hardware path and with `HEARTH_TLS_NO_HW=1` (209 before, the two new tests),
+  clippy `-p hearth-tls --all-targets -D warnings` exit 0, `cargo fmt --check` clean, `cargo doc` zero
+  warnings, `cargo check --workspace --all-targets` exit 0. No inference code touched, so the 6-model
+  benchmark mandate did not apply.
+
 ### hearth-tls slice 11 — host name matching and the leaf's purpose, and two wrong rules found by their own tests (buffy, 2026-10-16)
 
 `leaf.rs`: the two checks on the leaf itself. A chain says a certificate is authentic; these say it is the
