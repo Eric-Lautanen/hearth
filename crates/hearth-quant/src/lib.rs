@@ -89,20 +89,28 @@ pub(crate) fn avx512_full_width_for(
     has_avx512f && has_avx512bw && !(is_amd && family == AMD_FAMILY_SPLIT_AVX512)
 }
 
-/// `__cpuid` is safe or unsafe depending on the target features the crate is
-/// built with, so the lint is allowed rather than the call being rewritten per
-/// build configuration.
+/// Reads a CPUID leaf.
+///
+/// An `unsafe fn` wrapper rather than a direct call, because `__cpuid`'s safety is a
+/// property of the **build**: with SSE available the intrinsic is safe and an `unsafe`
+/// block around it is redundant — which `unused_unsafe` says, and which is the case for
+/// every build made with this repository's `-C target-cpu=native` — while without SSE the
+/// call must be unsafe. Going through a wrapper makes the call site's `unsafe` necessary
+/// in both configurations, so neither needs a lint suppressed.
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
+unsafe fn cpuid(leaf: u32) -> core::arch::x86_64::CpuidResult {
+    core::arch::x86_64::__cpuid(leaf)
+}
+
+#[cfg(target_arch = "x86_64")]
 fn cpu_is_amd() -> bool {
-    let v = unsafe { std::arch::x86_64::__cpuid(0) };
+    let v = unsafe { cpuid(0) };
     cpuid_is_amd(v.ebx, v.ecx, v.edx)
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(unused_unsafe)]
 fn cpu_family() -> u8 {
-    cpuid_family(unsafe { std::arch::x86_64::__cpuid(1) }.eax)
+    cpuid_family(unsafe { cpuid(1) }.eax)
 }
 
 pub fn dequantize(dtype: GgmlDType, data: &[u8], out: &mut [f32]) -> Result<(), String> {

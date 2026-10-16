@@ -6,7 +6,11 @@ use core::arch::x86_64::*;
 /// Precomputed lookup: for each byte, extract 8 sign mask values {0xFF, 0x00}
 /// bit=0 → 0xFF (w=-1), bit=1 → 0x00 (w=+1) for xor/sub sign correction.
 /// Used by the 512-bit VNNI kernel (LUT expansion path).
-#[allow(dead_code)]
+///
+/// Compiled only for tests, with that kernel: nothing dispatched reads it, so a shipped
+/// build should not carry the table. `#[cfg(test)]` says that where a `#[allow(dead_code)]`
+/// said "unused, and I would rather not hear about it".
+#[cfg(test)]
 const Q1V_SM: [[u8; 8]; 256] = {
     let mut table = [[0u8; 8]; 256];
     let mut b = 0usize;
@@ -472,11 +476,16 @@ pub unsafe fn dot_q1_0g128_q8_0x2_ptr(
 /// vpdpbusd saves 1 μop per sub-block but LUT stores + 512-bit double-pumping
 /// add more overhead than the shuffle kernel's SIMD-only pipeline.
 /// Keep for future CPUs with native 512-bit VNNI units.
+///
+/// `#[cfg(test)]` because its only consumer is `bench_q1_0_vnni_vs_shuffle`, which is what
+/// keeps the rejection above a measurement rather than a memory: the kernel stays compiled
+/// where it is measured and out of a shipped binary, which is also why there is no
+/// `#[allow(dead_code)]` here. Re-dispatching it means removing this line, on purpose.
+#[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "avx512vnni")]
-#[allow(dead_code)]
 unsafe fn dot_q1_0g128_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     let q1_blocks = n / 128;
     let ones_8 = _mm256_set1_epi8(1);
@@ -541,11 +550,14 @@ unsafe fn dot_q1_0g128_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: u
 ///
 /// NOTE: Not dispatched by default — ~33% regression on Zen 4 vs shuffle.
 /// LUT stores + 512-bit double-pumping outweigh loop-count reduction.
+///
+/// `#[cfg(test)]` for the same reason as its 256-bit sibling: measured by a test, never
+/// dispatched, so it does not belong in a shipped binary.
+#[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "avx512vnni")]
 #[target_feature(enable = "avx512dq")]
-#[allow(dead_code)]
 unsafe fn dot_q1_0g128_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     let q1_blocks = n / 128;
     let ones_8 = _mm512_set1_epi8(1);
