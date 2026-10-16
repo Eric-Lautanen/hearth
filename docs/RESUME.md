@@ -39,15 +39,30 @@
    mandate models — everything within ±3%. The Q2_0 dip shows in **both** arms (8B Q2_0: 5.05 pre vs
    5.06 post against the chart's 6.75), which is what proves it is machine state rather than code.
    Nothing left to do on this item.
-1. **TLS slice 2: AES-128-GCM, then X25519.** `crates/hearth-tls` exists and is in the workspace;
-   `sha256.rs` (SHA-256 + HMAC-SHA256) and `hkdf.rs` (`hkdf_extract`/`hkdf_expand`/`hkdf_expand_label`/
-   `derive_secret`) are done, 15 tests, all against published vectors (FIPS 180-4, RFC 4231, RFC 5869).
-   Next, in the order the handshake needs them: **AES-128-GCM** (the mandatory TLS 1.3 suite — GCM
-   needs a constant-time GHASH; test with the NIST GCM vectors *and* a tamper test proving a flipped
-   tag bit is rejected) then **X25519** (RFC 7748 vectors, including the low-order/zero-output cases,
-   which must fail rather than produce a silent all-zero shared secret). Then the record layer, then the
-   handshake, then certificate verification last. **Verification policy is fixed: fatal, never
-   downgradeable — no switch that a URL or a user can reach can weaken it.**
+1. **TLS slices 1–2: DONE (buffy, 2026-10-16).** `crates/hearth-tls` now has `sha256.rs`, `hkdf.rs`,
+   `aes.rs`, `gcm.rs` and `x25519.rs` — **40 tests green**, clippy `-D warnings` and fmt clean, `std`
+   only with an empty `[dependencies]`. AES-128 (S-box derived at compile time, not transcribed),
+   AES-128-GCM (table-free branchless GHASH, constant-time tag compare, verify-before-decrypt,
+   no API returning unauthenticated plaintext) and X25519 (51-bit limbs, constant-time ladder,
+   small-order points refused with no unchecked twin for protocol code). Every constant was
+   re-derived from the OpenSSL-backed `cryptography` package before being pinned, and the oracle
+   scripts assert the published spec values too. Details and the throughput table: BUG_TRACKER
+   "hearth-tls slice 2".
+2. **Next, and the order now matters: hardware acceleration BEFORE the record layer.** Measured:
+   software GCM is **24.2 MB/s** (AES-128 block 63.6 MB/s, GHASH ≈ 39 MB/s by the arithmetic in
+   BUG_TRACKER), so a 4 GiB model costs **169 s** of decrypt on top of a 5-minute transfer and an
+   8 GiB file costs more than the transfer itself. AES-NI alone only reaches ~39 MB/s because GHASH
+   dominates, so the required work is **PCLMULQDQ GHASH**, with AES-NI as the cheap companion.
+   Do it the way `hearth-quant` already does kernel dispatch: runtime feature detection, software
+   path kept as the reference, and a test asserting the accelerated path is **byte-identical** to the
+   software path on the existing vectors plus random inputs (that test is the whole safety story —
+   the vectors alone would not prove the two paths agree). Report the dispatch in the same spirit as
+   the `[kernel]` banner. Then re-run `crypto_bench` and record before/after; do not merge on a
+   single run, this box moves 10–15%.
+   Only after that: the record layer (AEAD framing, nonce from the sequence number, the
+   record-type-in-inner-plaintext trick), then the handshake, then certificate verification last.
+   **Verification policy is fixed: fatal, never downgradeable — no switch that a URL or a user can
+   reach can weaken it.**
    - `Transport` in `hearth-ui/src/http.rs` is the seam and is already written for this; the `https://`
      branch of `downloads.rs::run_transfer` is what gets rewired once the record layer works. Do not
      touch `http.rs` without asking — it is SparkOC's file.
@@ -61,7 +76,7 @@
      it in the order given above and land it with negative tests (bad signature, expired, unknown
      root, hostname mismatch) before any URL is allowed to use it. Do not let the downloader take an
      `https://` path through this code until those tests exist.
-2. **The downloader defect I found: FIXED by SparkOC (`c8782dc`) and re-verified by me end to end —
+3. **The downloader defect I found: FIXED by SparkOC (`c8782dc`) and re-verified by me end to end —
    closed.** The dead end was a full-size `.part` plus a **416** to `Range: bytes=<size>-`. Both
    candidate fixes landed (heal on 416, and `part_len()` awareness). I re-ran my own repro against
    the fixed binary rather than trusting the diff: the full-size case now goes `partial 100/100` →
@@ -72,7 +87,7 @@
    checked it against a host with a real A/AAAA pair, which is latent while catalog URLs are
    `https://` through curl and live the moment TLS routes them here. That is the one loose thread
    left in this item.
-3. **Size the chunked-prefill win before designing it.** There is still **zero weight reuse** in the
+4. **Size the chunked-prefill win before designing it.** There is still **zero weight reuse** in the
    hybrid prefill: it re-streams every weight row once per prompt token, so prefill's per-token cost
    is ~= decode's (4B: 144 vs 117 ms/token). A chunked forward would amortise the weight *unpacking*
    across the chunk while the MAC count scales with tokens, so the ceiling is roughly `1 - f` where
@@ -82,7 +97,7 @@
    tested primitive it needs (bit-identical to two single calls, **currently unreferenced** — do not
    re-wire it into `matmul_batch`, that path cannot reach PTQ1_0 models). An x4 variant regressed
    3.2× in pt 5.
-4. **Speculative decoding: measure acceptance before designing anything.** This is the strongest
+5. **Speculative decoding: measure acceptance before designing anything.** This is the strongest
    decode idea on the table and the cheapest thing to falsify. 2B PTQ1_0 decodes at **50.8 ms/token
    (18.15 tok/s)** against the 27B's ~722 ms, i.e. the draft is 14× cheaper, so with acceptance `a`
    and draft length `k` the gain is `(1-a^(k+1))/(1-a)` per `1+0.07k` target-equivalents: ≈1.8× at
@@ -97,21 +112,21 @@
    post-truncation distribution and must handle the stateful repeat penalty. Cost to plan for: **3 of
    every 4 `qwen35` layers are recurrent**, so a rejected draft token must rewind conv+SSM state, not
    just a KV cache.
-5. **Sweep for other silently-wrong feature gates.** `cpu_is_amd_zen4()` was the only family check,
+6. **Sweep for other silently-wrong feature gates.** `cpu_is_amd_zen4()` was the only family check,
    but the bug class is "a gate that is always-false or always-true". Grep `hearth-quant` and
    `hearth-llm` for `is_x86_feature_detected!`, `target_feature` and `avx512`, and confirm each
    gated kernel is on the *faster* path here. `cargo run --release -p hearth-llm --example benchk --
    <model.gguf> <dtype>` prints the CPUID decode, the kernel `dot_*_ptr` selects, and every variant's
    GB/s. Still open from the last session; nothing regressed while it waited.
-6. **Zen 5 (family 1Ah) and Intel must not regress.** The fix keys on 19h specifically so they keep
+7. **Zen 5 (family 1Ah) and Intel must not regress.** The fix keys on 19h specifically so they keep
    full-width AVX-512, and there is no such hardware here to confirm it.
-7. **Keep dispatch introspection honest for each new format.** `selected_kernel(dtype)` +
+8. **Keep dispatch introspection honest for each new format.** `selected_kernel(dtype)` +
    `dispatch_report()` cover PTQ1_0, PQ2_0, Q2_0, Q1_0 and Q1_0_G128; the `[kernel]` banner prints at
    load on both paths and the service exposes `event.model.kernels`. A new quant type must add a
    `kernel_name()` arm and a `selected_kernel` arm or it will silently have no reported dispatch.
    Agreed rule: add a format to `selected_kernel` only when it has more than one implementation to
    choose between.
-8. **Three small things.** (a) AGENTS.md's verifications block says `cargo test --test-threads=1 -p
+9. **Three small things.** (a) AGENTS.md's verifications block says `cargo test --test-threads=1 -p
    hearth-quant`, which cargo rejects — it must be `cargo test -p hearth-quant -- --test-threads=1`.
    (b) Re-run the benchmark mandate on a fully idle box interleaved with the reference fork
    (`bench_results/run_cpu_bench.bat`). (c) `cargo check -p hearth-diffusion` warns that

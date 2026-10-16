@@ -10,7 +10,12 @@
 //! # Verification policy
 //!
 //! Every primitive is checked against its specification's own vectors
-//! (FIPS 180-4, RFC 4231, RFC 5869) rather than against our own output. When
+//! (FIPS 180-4, RFC 4231, RFC 5869, FIPS-197, SP 800-38D) rather than against
+//! our own output, and wherever an independent implementation exists on the
+//! development machine those vectors are re-derived from it before being
+//! embedded (OpenSSL via the Python `cryptography` package for AES-GCM and
+//! X25519). A constant copied out of memory is a guess wearing a test's
+//! clothing; two independent implementations agreeing is evidence. When
 //! the handshake lands, certificate verification must be **fatal and never
 //! downgradeable**: a failed chain, a wrong signature or an unexpected
 //! parameter must abort the connection. There must be no "insecure" switch
@@ -22,12 +27,17 @@
 //! - [`sha256`] — SHA-256, HMAC-SHA256 (the transcript hash and the HMAC base)
 //! - [`hkdf`] — HKDF-Extract/Expand plus the RFC 8446 `HKDF-Expand-Label` and
 //!   `Derive-Secret` helpers the key schedule is built from
+//! - [`aes`] — AES-128 block cipher (forward direction only; GCM needs no
+//!   inverse cipher), with the S-box derived at compile time instead of
+//!   transcribed
+//! - [`gcm`] — AES-128-GCM, the mandatory TLS 1.3 record cipher, with a
+//!   branchless and table-free GHASH and a constant-time tag compare
+//! - [`x25519`] — X25519 key exchange, with the small-order-point check that
+//!   RFC 7748 §6.1 requires, made unskippable by having no unchecked API for
+//!   protocol code to reach for
 //!
 //! Still to come, in the order the handshake needs them:
-//! 1. **AES-128-GCM** — the TLS 1.3 record cipher (`AES-128-GCM` is the
-//!    mandatory suite; `AES-256-GCM` and ChaCha20-Poly1305 follow).
-//! 2. **X25519** — key exchange, RFC 7748 vectors.
-//! 3. **The record layer** — AEAD framing, nonce construction from the
+//! 1. **The record layer** — AEAD framing, nonce construction from the
 //!    sequence number, and the TLS 1.3 record-type-in-inner-plaintext trick.
 //! 4. **The handshake** — ClientHello/ServerHello, key schedule, transcript
 //!    hash, Finished MAC verification (a wrong MAC must abort, not warn).
@@ -36,8 +46,14 @@
 //!    store. Deliberately last, and deliberately not attempted until the
 //!    transport below it is solid.
 
+pub mod aes;
+pub mod gcm;
 pub mod hkdf;
 pub mod sha256;
+pub mod x25519;
 
+pub use aes::Aes128;
+pub use gcm::{Aes128Gcm, GcmError, NONCE_LEN, TAG_LEN};
 pub use hkdf::{derive_secret, derive_secret32, hkdf_expand, hkdf_expand_label, hkdf_extract};
 pub use sha256::{hmac_sha256, hmac_sha256_parts, Sha256};
+pub use x25519::{diffie_hellman, public_key, x25519, SharedSecretError, BASEPOINT};

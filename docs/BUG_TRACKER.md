@@ -38,6 +38,56 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 2 — AES-128-GCM and X25519 (buffy, 2026-10-16)
+
+`crates/hearth-tls` gained `aes.rs` (AES-128, forward only), `gcm.rs` (AES-128-GCM)
+and `x25519.rs` (X25519). **40 tests, all green**, clippy `--all-targets -D warnings`
+and fmt clean, still `std` only with an empty `[dependencies]`.
+
+**Method: an oracle, not my memory.** `cryptography` 46.0.6 (OpenSSL 3.5.5) is on
+the box, so every constant was re-derived from an independent implementation before
+being pinned in a test, and the oracle scripts assert the published spec values too —
+so spec and oracle are checked against each other, not merely against me. Scripts:
+`target/buffy-ab/gcm_vectors.py`, `target/buffy-ab/x25519_vectors.py`. Two memorised
+AES constants were confirmed this way (AES-128 zero vector, FIPS-197 C.1) and one
+key-schedule expectation I was not sure of was **deleted rather than guessed**, since
+the C.1 cipher vector validates the whole schedule anyway. The AES S-box is derived
+at compile time from the GF(2^8) inverse plus the affine transform instead of being
+transcribed — 256 chances for a one-character error, replaced by a derivation that
+`derived_sbox_matches_known_entries` pins.
+
+Coverage: FIPS-197 C.1 + the zero block; NIST/GCM cases 1–4; odd 1-byte and 15/17-byte
+inputs where padding bugs hide; a 1000-byte message; all 128 single-bit tag flips
+rejected; tampered ciphertext, AAD, nonce and truncated ciphertext rejected; tag
+changes under every one of the 128 key-bit flips. RFC 7748 §5.2 vectors 1–2, the §6.1
+DH example, the **iterated 1- and 1000-iteration** chain, three random oracle vectors,
+clamping (low 3 bits and bit 255 ignored, bit 254 forced) and the high bit of `u`
+ignored.
+
+**Fail-closed, with no way to opt out.** `diffie_hellman` returns `Err` on an all-zero
+result rather than handing back a peer-chosen secret; OpenSSL refuses those same points,
+so the behaviour is not merely our preference. `x25519` (raw) exists only because the
+RFC vectors are defined in terms of it and is documented as not-for-protocol-code.
+GCM verifies before it decrypts and has no API that returns unauthenticated plaintext.
+
+**Measured software throughput** (`cargo run --release -p hearth-tls --example crypto_bench`):
+
+| primitive | result |
+|-----------|--------|
+| AES-128 block | 63.6 MB/s (240 ns/block) |
+| AES-128-GCM seal | 24.2 MB/s (1 MiB and 16 KiB alike) |
+| AES-128-GCM open | 24.3 MB/s |
+| X25519 | 78 us/op (12.9 k ops/s) |
+
+**This is the finding that sets the next slice.** GHASH dominates: solving
+`1/24.2 = 1/63.6 + 1/g` gives g ≈ 39 MB/s for GHASH alone, so AES-NI alone would only
+lift GCM to ~39 MB/s. A 4 GiB model therefore costs **169 s** of software decrypt — 56%
+on top of a 5-minute transfer at 100 Mbps — and an 8 GiB file costs more than the
+whole transfer. The bitwise GHASH is constant-time by construction (no table, no
+branch), and that is worth keeping as the reference path, but the downloader cannot
+ship on it: PCLMULQDQ GHASH is the required half, AES-NI the cheap half. X25519 at
+78 us is a non-issue either way.
+
 ### hearth-tls slice 1 — SHA-256, HMAC-SHA256 and the RFC 8446 key schedule (buffy, 2026-10-15)
 
 New workspace crate **`crates/hearth-tls`**: **std only, `[dependencies]` empty** (operator rule this
