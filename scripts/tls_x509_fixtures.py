@@ -217,6 +217,31 @@ def verify_cases():
         ("issuer-expired-under-a-valid-leaf", ["LEAF_EC", "INTERMEDIATE"], ["ROOT"], "LEAF_EC", None),
         ("broken-link-missing-intermediate", ["LEAF_RSA", "ROOT"], ["ROOT"], "LEAF_RSA", None),
         ("strict-sibling-CA-as-the-anchor", ["LEAF_SUB_STRICT", "SUB_CA_STRICT"], ["TOP_CA_STRICT"], "LEAF_SUB_STRICT", None),
+        ("root-included-in-the-chain", ["LEAF_RSA", "INTERMEDIATE", "ROOT"], ["ROOT"], "LEAF_RSA", None),
+        (
+            "chain-out-of-order",
+            ["LEAF_RSA", "ROOT", "INTERMEDIATE"],
+            ["ROOT"],
+            "LEAF_RSA",
+            "this crate builds exactly the path it is given, and RFC 8446 §4.4.2 requires each "
+            "certificate to certify the one before it; OpenSSL selects a path out of the pool instead",
+        ),
+        (
+            "chain-with-the-leaf-twice",
+            ["LEAF_RSA", "LEAF_RSA", "INTERMEDIATE"],
+            ["ROOT"],
+            "LEAF_RSA",
+            "a duplicate makes the presented list non-conforming, so this crate refuses it rather "
+            "than picking certificates out of it; OpenSSL ignores what it does not need",
+        ),
+        (
+            "chain-with-an-unrelated-certificate",
+            ["LEAF_RSA", "INTERMEDIATE", "SELF_SIGNED_EC"],
+            ["ROOT"],
+            "LEAF_RSA",
+            "same shape: an extra certificate is not part of the path, and this crate refuses the "
+            "list rather than selecting from it",
+        ),
         (
             "ca-certificate-as-the-server",
             ["INTERMEDIATE"],

@@ -43,6 +43,14 @@
 //! - **No revocation checking of any kind.** No CRL, no OCSP, no stapling. A
 //!   revoked certificate verifies here. This is the largest gap in what a success
 //!   from this module means, and it is not fixable from `std` alone.
+//! - **No path *selection*.** The presented list must be the path, in order: the leaf
+//!   first, then each certificate that certifies the one before it. A list that is out
+//!   of order, repeats a certificate, or carries one that is not part of the path is
+//!   refused, which is deliberate — RFC 8446 §4.4.2 requires each certificate to certify
+//!   the one preceding it, so such a list is not the thing it claims to be. OpenSSL and
+//!   browsers instead rebuild a path out of the pool and accept all three, which the
+//!   fixture tests record as the one class of divergence where this crate is the stricter
+//!   side; a caller that needs that tolerance has to select the path before calling here.
 //! - **No host name matching** and no `nameConstraints` processing: a chain that
 //!   verifies here may still be for the wrong server. That is the next slice.
 //! - **No `extendedKeyUsage` policy on issuers**, no `policyConstraints`, no

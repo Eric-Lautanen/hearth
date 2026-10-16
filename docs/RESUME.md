@@ -1,5 +1,21 @@
 # Hearth — next session
 
+> **Session 2026-10-16 (pt 10) in one paragraph.** The oracle's first real findings, from four paths about
+> the *shape* of the presented list rather than about any rule. **OpenSSL selects a path out of the pool;
+> this crate builds exactly the list it is given.** An unordered chain, a repeated certificate and an
+> unrelated certificate padded in are all accepted by OpenSSL 3.5.5 and all refused here (`BrokenLink`,
+> `NotACa`), which is deliberate and is RFC 8446 §4.4.2's own requirement — each certificate must certify
+> the one before it — but it is a **real interoperability cost**, now stated in `chain.rs`'s "what this does
+> not do": a server whose chain is out of order or padded is refused, and a caller who needs that tolerance
+> has to select the path first. Being the stricter side is the only divergence the oracle test permits, so
+> all three are recorded with their reason. They also happen to exercise "structure before links" on input
+> nobody built to be a path — the refusals name the offending certificate's position as `NotACa`, not a
+> broken link at the end — which is the property the module docs claim and no old fixture could show. 19
+> paths, 5 recorded divergences, all five strict. The oracle test now collects *every* disagreement and
+> prints the set, so adding a path costs one run rather than one run per surprise. **215 checks green on
+> both paths** (unchanged — this slice added paths, not tests), clippy, fmt, `cargo doc`, workspace and
+> generator stability all clean.
+
 > **Session 2026-10-16 (pt 9) in one paragraph.** The crate gets an **oracle**. Every check so far compared
 > our reading of a certificate against OpenSSL's *parser*, which left the policy — which rules run, and what
 > each means — checked only against my own reading of RFC 5280. Fifteen paths are now put to a second
@@ -28,6 +44,14 @@
    one. **Every check a verifier needs now exists; what is missing is the integration and the trust
    decision.** Nothing in this crate calls any of it — `RejectAll` is still the only
    `CertificateVerifier` — and there is still **no revocation checking of any kind**.
+   - **A gap the oracle's slice found by reading the code, and no test can currently reach:**
+     `intermediates_below` excludes self-issued CAs from the `pathLenConstraint` count, which is the rule
+     that makes a **key rollover** legal, and in all 24 fixtures every intermediate is non-self-issued — so
+     the branch that does the excluding never excludes anything. It needs a key-rollover pair: a CA that
+     re-issues itself under the same DN with a new key (`CA_A` signed by `ROOT`, `CA_B` signed by `CA_A`,
+     same subject name, `CA_A` with `pathLenConstraint: 0`), plus a leaf under `CA_B`. Then the path is
+     legal *only* because `CA_B` is self-issued and does not spend `CA_A`'s allowance, and OpenSSL's
+     verdict can be recorded in the table as part of the same change (4 certificates, one test, one path).
    - The seam is unchanged and is the only place to plug in: `client::CertificateVerifier`, called with
      `CertificateVerifyInput { server_name, certificate_list, signature_scheme, signature,
      signed_data }`, where `signed_data` is already the RFC 8446 §4.4.3 construction (64 spaces,

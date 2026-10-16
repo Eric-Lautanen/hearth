@@ -337,23 +337,23 @@ const SELF_SIGNED_PSS_DER_HEX: &str = "\
     a00f300d060960864801650304020105 \
     00a11c301a06092a864886f70d010108 \
     300d06096086480165030402010500a2 \
-    03020120038201010019d60aab493f95 \
-    37ad3c91be0e6ed621dbbe2c63a1689b \
-    7d2b30ee19a1be97c379d7aa97b25611 \
-    361b6f919d81f6005957f4255914aa8c \
-    6b0588474b4debf14369dd3912be70f4 \
-    071c59171538b1adfb5db871e98b52f9 \
-    eecfd8099b74387b441188aaa2ff755c \
-    a968f9e4d7264ec3dc4bc7bc1bb9885f \
-    a0c775030125fcc2abcf2ff0e463e082 \
-    5457d4208703b2971491967a7cc126e2 \
-    2e98518d7e86032118c1e2cb7cf44b69 \
-    afc90c006b0425ab1d625aebc12fbb16 \
-    01db57660f063e356a823732640fed06 \
-    0011a786e98bd0d64bbb013fdc1f230a \
-    d48f942d96c8737605956f804e93b106 \
-    af15cde9324c44d814469af22bfa9298 \
-    e8a43750b950bb0b83";
+    030201200382010100529b54bd51e581 \
+    227cf988804e9023c292b3447269e633 \
+    60808f21faff23b4bb347d890342d965 \
+    4328a7d3e15cbbbd39eb344aaba90a8b \
+    f9a1b0fe24c7160a521ea7376c1cab32 \
+    9fafa77edaa95f426f711b672ece9436 \
+    72b911d9ddce8aadaeb7965ae91ae89c \
+    4f83d26a017e4dd3f64c8a562ed4889c \
+    367a4866719c5ca6eb5329a55f39d206 \
+    9648ee83d4f154f277768826394c850d \
+    1d1d5b07b7b14b3dcdd8a5c337f33d99 \
+    0e218086d323bce92c94e1b754cd96bd \
+    3fe6b970a506e8281a0d3f1218ff959a \
+    49bebcebfde30a025f732bddf1bc1d59 \
+    99084141909d21e6ed4a9f02dea56623 \
+    1a15aa28326e0a349056d7437fdc42dc \
+    f814d738fc6d8330e3";
 
 const SELF_SIGNED_EC_DER_HEX: &str = "\
     3082012c3081d3a00302010202010530 \
@@ -370,11 +370,11 @@ const SELF_SIGNED_EC_DER_HEX: &str = "\
     27fd8842b82a3c83ecdc4bdf6a127b19 \
     a1e45d97156f12892b872beb322d51ae \
     6b74f42964944f0641a3300a06082a86 \
-    48ce3d0403020348003045022061759c \
-    d2d837edb101cef66d1176a3ca992a7f \
-    97ff61327da25c689ced601879022100 \
-    fb246e72d62009feab23a08e41ec90b9 \
-    b3a7d5794bd4d9b6e1740a6c2e396d8a";
+    48ce3d040302034800304502200b6d78 \
+    23ea21238d1a747922ef44bc0ac18c01 \
+    7080eba7f0f76a72ce4c1524f9022100 \
+    844b4eb7b807e748299f829e5de21fdc \
+    31db20a41ebc298915a59d82731612e6";
 
 const LEAF_UNKNOWN_CRITICAL_DER_HEX: &str = "\
     30820300308201e8a003020102020106 \
@@ -1770,6 +1770,46 @@ const VERIFY_CASES: &[VerifyCase] = &[
         openssl_error: Some(25),
         openssl_depth: Some(2),
         divergence: None,
+    },
+    VerifyCase {
+        name: "root-included-in-the-chain",
+        chain: &["LEAF_RSA", "INTERMEDIATE", "ROOT"],
+        anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: None,
+    },
+    VerifyCase {
+        name: "chain-out-of-order",
+        chain: &["LEAF_RSA", "ROOT", "INTERMEDIATE"],
+        anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: Some("this crate builds exactly the path it is given, and RFC 8446 §4.4.2 requires each certificate to certify the one before it; OpenSSL selects a path out of the pool instead"),
+    },
+    VerifyCase {
+        name: "chain-with-the-leaf-twice",
+        chain: &["LEAF_RSA", "LEAF_RSA", "INTERMEDIATE"],
+        anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: Some("a duplicate makes the presented list non-conforming, so this crate refuses it rather than picking certificates out of it; OpenSSL ignores what it does not need"),
+    },
+    VerifyCase {
+        name: "chain-with-an-unrelated-certificate",
+        chain: &["LEAF_RSA", "INTERMEDIATE", "SELF_SIGNED_EC"],
+        anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: Some("same shape: an extra certificate is not part of the path, and this crate refuses the list rather than selecting from it"),
     },
     VerifyCase {
         name: "ca-certificate-as-the-server",

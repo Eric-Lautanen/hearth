@@ -38,6 +38,39 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 16 — what the oracle says about chain *shape*: selection, not ordering (buffy, 2026-10-16)
+
+Four paths added to the oracle table, all about the shape of the presented list rather than about a rule:
+the root included in the chain, the chain out of order, the leaf twice, and an unrelated certificate padded in.
+The last three are a **finding**, and the first is reassurance.
+
+| path | OpenSSL 3.5.5 | this crate |
+|------|---------------|------------|
+| root included in the chain | OK | `Ok` |
+| chain out of order | **OK** | `BrokenLink { index: 0 }` |
+| chain with the leaf twice | **OK** | `NotACa(Chain(1))` |
+| chain with an unrelated certificate | **OK** | `NotACa(Chain(2))` |
+
+- **OpenSSL selects a path out of the pool; this crate builds exactly the list it is given.**
+  `verify_chain` compares each certificate's issuer name with the next certificate's subject name, so an
+  unordered list is a broken link, and a padded or repeated one puts a non-CA where an issuer belongs. Both
+  refusals are deliberate and both are RFC 8446 §4.4.2's own requirement — each certificate must certify
+  the one before it — and OpenSSL, like the browsers, rebuilds instead. Being stricter is the safe
+  direction, which is the direction the oracle test permits, so all three are recorded as divergences with
+  their reason attached. The cost is real and now written down in `chain.rs`'s "what this does not do":
+  **a server whose chain is out of order or padded is refused, and a caller who needs that tolerance has to
+  select the path before calling here.**
+- **These three cases also exercise "structure before links" with junk input**, which is the one thing the
+  old fixture set could not: the refusals are `NotACa` at the position of the offending certificate, not a
+  broken link at the end, because the structural pass runs first. That is exactly the property the module
+  docs claim, now shown on input nobody constructed to be a path.
+- **The oracle test reports every disagreement at once.** Adding a path used to mean one test run per
+  surprise, because the assertion stopped at the first; it now collects them and prints the set, which is
+  what a reviewer needs — and the fmt check caught two of my own edits in the same round, which is the
+  cheap kind of failure.
+
+19 paths now, 5 recorded divergences, all five in the strict direction.
+
 ### hearth-tls slice 15 — an oracle outside the crate: the same paths, put to the OpenSSL CLI (buffy, 2026-10-16)
 
 Every check so far compares our reading of a certificate against OpenSSL's *parser*. The **policy** — which

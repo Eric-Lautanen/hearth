@@ -1285,7 +1285,10 @@ fn every_path_is_verified_the_same_way_the_openssl_cli_verifies_it() {
     // Only the *verdict* is compared. Which certificate gets blamed is not comparable:
     // OpenSSL numbers depths from the leaf and counts the anchor when it is a chain
     // element, and it reports the highest expired certificate while this crate reports the
-    // first one it reaches — two refusals for the same expired path, four depths apart.
+    // first one it reaches — two refusals for the same expired path, four depths apart.    // Every disagreement is collected and reported together: a test that stops at the
+    // first one turns adding a path into one run per surprise, and the *set* of
+    // disagreements is what a reviewer needs to see.
+    let mut disagreements: Vec<String> = Vec::new();
     for case in VERIFY_CASES {
         let chain_ders: Vec<Vec<u8>> = case.chain.iter().map(|label| fixture(label)).collect();
         let anchor_ders: Vec<Vec<u8>> = case.anchors.iter().map(|label| fixture(label)).collect();
@@ -1305,30 +1308,39 @@ fn every_path_is_verified_the_same_way_the_openssl_cli_verifies_it() {
                     "{}: a divergence needs a reason",
                     case.name
                 );
-                assert!(
-                    !ours.is_ok(),
-                    "{}: recorded as a divergence ({reason}) but this crate accepts it, so \
-                     the divergence has gone stale",
-                    case.name
-                );
-                assert!(
-                    case.openssl_ok,
-                    "{}: the recorded divergence is in the wrong direction — OpenSSL refused \
-                     this path as well, so the two implementations do not actually disagree",
-                    case.name
-                );
+                if ours.is_ok() {
+                    disagreements.push(format!(
+                        "{}: recorded as a divergence ({reason}) but this crate accepts it, so the \
+                         divergence has gone stale",
+                        case.name
+                    ));
+                }
+                if !case.openssl_ok {
+                    disagreements.push(format!(
+                        "{}: recorded as a divergence, but OpenSSL refused this path as well \
+                         ({:?} at depth {:?}), so the two do not actually disagree",
+                        case.name, case.openssl_error, case.openssl_depth
+                    ));
+                }
             }
-            None => assert_eq!(
-                ours.is_ok(),
-                case.openssl_ok,
-                "{}: this crate says {ours:?}, OpenSSL says ok={} (error {:?} at depth {:?})",
-                case.name,
-                case.openssl_ok,
-                case.openssl_error,
-                case.openssl_depth
-            ),
+            None => {
+                if ours.is_ok() != case.openssl_ok {
+                    disagreements.push(format!(
+                        "{}: this crate says {ours:?}, OpenSSL says ok={} (error {:?} at depth \
+                         {:?})",
+                        case.name, case.openssl_ok, case.openssl_error, case.openssl_depth
+                    ));
+                }
+            }
         }
     }
+    assert!(
+        disagreements.is_empty(),
+        "{} of {} paths disagree:\n{}",
+        disagreements.len(),
+        VERIFY_CASES.len(),
+        disagreements.join("\n")
+    );
 
     // A table that only asked about paths everyone accepts would prove nothing, so both
     // answers have to be in it, and the refusals have to include ones that come from a
