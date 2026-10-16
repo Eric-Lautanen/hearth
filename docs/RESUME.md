@@ -265,12 +265,28 @@
    post-truncation distribution and must handle the stateful repeat penalty. Cost to plan for: **3 of
    every 4 `qwen35` layers are recurrent**, so a rejected draft token must rewind conv+SSM state, not
    just a KV cache.
-6. **Sweep for other silently-wrong feature gates.** `cpu_is_amd_zen4()` was the only family check,
-   but the bug class is "a gate that is always-false or always-true". Grep `hearth-quant` and
-   `hearth-llm` for `is_x86_feature_detected!`, `target_feature` and `avx512`, and confirm each
-   gated kernel is on the *faster* path here. `cargo run --release -p hearth-llm --example benchk --
-   <model.gguf> <dtype>` prints the CPUID decode, the kernel `dot_*_ptr` selects, and every variant's
-   GB/s. Still open from two sessions ago; nothing regressed while it waited.
+6. **Feature-gate sweep — closed in quant, still open elsewhere.** *Done:* every
+   `is_x86_feature_detected!` / `target_feature` / `avx512` site in `hearth-quant` was read, and the
+   one real defect is fixed — `q2_0`'s dispatch *and* its `kernel_name()` wrapped the AVX-512 arms
+   in `#[cfg(target_feature = …)]`, making a kernel's existence a property of the build machine; both
+   now share one cached runtime probe, and a negative-target-feature build
+   (`-C target-feature=-avx512f,-avx512vnni,-avx512dq`) is the regression test. `ptq1_0` and
+   `q1_0g128` were already runtime-dispatched (`q1_0g128` deliberately has no AVX-512 path: ~33%
+   regression, measured, kept as a test-only kernel).
+   *Still open:* (a) the **same audit in `hearth-llm`**, which has the remaining 13 `allow` blocks
+   (5 `dead_code`, 4 `needless_range_loop`, 3 `too_many_arguments`) — `AGENTS.md` forbids them, and
+   the `needless_range_loop` ones sit in matmul/ops where the honest fix costs a benchmark;
+   (b) `.cargo/config.toml` sets `-C target-cpu=native`, so **every release build in this repo is
+   host-specific** — the kernels are runtime-dispatched, but the rest of the binary (auto-vectorised
+   loops, memcpy, the tokenizer) may carry AVX-512 with no guard, and a build made on a machine
+   without VNNI compiles the VNNI *call sites* out. Nothing here ships binaries yet, so this is a
+   decision to make deliberately and to **measure** (compare a `target-cpu=native` build against
+   `x86-64-v3` on the 6-model suite before choosing), not a line to change on principle.
+   *Harness notes:* `cargo run --release -p hearth-llm --example benchk -- <model.gguf> <dtype>`
+   prints the CPUID decode and every variant's GB/s; **`benchk … | head` exits 101** (SIGPIPE) so
+   redirect to a file or use `tail` when the exit status is the verdict; and **cold runs are ~2×
+   under warm ones** (today: dispatched 1.62 cold against 3.09 recorded warm), so always warm up
+   before comparing against the numbers in the comments.
 7. **Zen 5 (family 1Ah) and Intel must not regress.** The fix keys on 19h specifically so they keep
    full-width AVX-512, and there is no such hardware here to confirm it.
 8. **Keep dispatch introspection honest for each new format.** `selected_kernel(dtype)` +

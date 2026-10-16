@@ -38,6 +38,58 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-quant — five allow-blocks removed, and a dispatch gate that followed the build machine (buffy, 2026-10-16)
+
+Started as the open audit item ("a gate that is always-false or always-true") and found two
+rule violations instead of a wrong predicate.
+
+- **AGENTS.md forbids `#[allow(...)]`, and `hearth-quant` had five.** Both `unused_unsafe` ones
+  were *measured* to be load-bearing before being touched: deleting them prints
+  "unnecessary `unsafe` block" twice, because `__cpuid` is safe when the build has SSE and every
+  build here has it through `.cargo/config.toml`'s `-C target-cpu=native`. The cause is now
+  removed rather than the lint silenced — both call through an `unsafe fn` wrapper, which makes
+  the call site's `unsafe` necessary in *both* build configurations. The three `dead_code` ones
+  hid the rejected AVX-512 Q1_0 VNNI kernels and the LUT they share: their only consumer is
+  `bench_q1_0_vnni_vs_shuffle`, so they are `#[cfg(test)]` now — compiled where they are
+  measured, absent from a shipped binary, and re-dispatching one means deleting a line on
+  purpose. `hearth-quant` now has zero `allow` attributes (the two remaining grep hits are doc
+  prose about the removed one).
+- **The bug they were sitting next to, which is the same class as the 34% PTQ1_0 one:**
+  `q2_0::dot_q2_0_q8_0_ptr` *and* `q2_0::kernel_name()` wrapped their AVX-512 arms in
+  `#[cfg(target_feature = …)]`. That makes a kernel's **existence** a property of the machine the
+  crate was built on rather than the machine it runs on: a binary built anywhere without AVX-512
+  VNNI cannot select the fastest Q2_0 kernel even on a CPU that has it, and the report could name
+  a kernel the dispatch could not reach. Both now call one cached runtime probe per arm (the
+  arrangement `ptq1_0` has always used), so drift between report and dispatch is impossible;
+  the kernels already carry `#[target_feature]`, which is what allows them to be compiled
+  unconditionally and called behind a runtime check.
+- **Evidence, all reproducible.** Built with `-C target-feature=-avx512f,-avx512vnni,-avx512dq`
+  — simulating a build made on a machine without AVX-512 — the suite is green and the report
+  names `vnni512x2`, which is what the *running* CPU implies. With the old `cfg` gate restored
+  under that same build, the new test `the_reported_kernel_is_the_one_the_features_imply` fails,
+  so that test is the regression test rather than a restatement. Three neutering rounds (gate
+  restored, order swapped, oracle falsified), all caught. 42 tests, `clippy --all-targets -D
+  warnings`, `fmt`, and a warning-free release build.
+- **benchk pq2_0 (4B PQ2_0, `blk.0.`), before/after, cold machine:** dispatched 1.62 → 1.65,
+  `vnni512x2` 1.59 → 1.55, `vnni256` 1.51 → 1.54, `avx2_lut` 1.30 → 1.28 GB/s. Selection and
+  ordering unchanged, which is the point of the change: it removes a build-time dependency
+  without moving dispatch on a build that already had the features.
+- **The recorded warm figures in those comments do not reproduce cold.** The comments quote
+  3.09 (`vnni512x2`) / 3.10 (`vnni256`) / 2.91 (`avx2_lut`) GB/s from a warm machine; today's cold
+  runs are ~2× lower at the same ordering. Same trap as the tok/s warmup note, in a different
+  harness, and now written down in the comment beside the numbers.
+- **Harness trap worth keeping:** `benchk … | head` exits **101** — SIGPIPE from `head` closing
+  the pipe, which reads like a crash if the exit status is taken. Redirect to a file or use
+  `tail` when the verdict is the exit code.
+- **One correction for the record:** that commit's message says "four" allow-blocks; the real
+  count was five (three `dead_code`, two `unused_unsafe`). Left in history rather than
+  force-pushed over — the operator had just finished a history rewrite, and a second rewrite to
+  fix a number in a message is a worse trade than this note.
+- **What remains of the same rule:** `hearth-llm` 13 (5 `dead_code`, 4 `needless_range_loop`,
+  3 `too_many_arguments`, 1 combined), `hearth-diffusion` 7, `hearth-compute` 4, `hearth-gguf` 1.
+  The `needless_range_loop` and `too_many_arguments` ones sit in matmul/ops hot paths, where the
+  honest fix (iterator forms, a struct for the arguments) needs a benchmark, not a rewrite.
+
 ### hearth-tls slice 20 — the verifier: the first thing in the crate that can accept (buffy, 2026-10-16)
 
 Every rule existed and nothing called any of them: `RejectAll` was the only `CertificateVerifier`,
