@@ -2,7 +2,7 @@
 
 > **Date**: 2026-10-15 — collaborative build. No reference repo, no competition. Hearth is the source of truth. Make everything better: faster inference, solid professional UI, clean repo/docs.
 
-***ALWAYS*** keep bug reports updated and compilation errors and warnings clean. NEVER USE allow blocks! NEVER git commit/push unless explicitly asked — this is a working copy, not a shared repo.
+***ALWAYS*** keep bug reports updated and compilation errors and warnings clean. NEVER USE allow blocks! Commit and push as you go, trailer-free — the operator lifted the old no-push rule: never leave work only in the working tree.
 
 ## Collaboration plan (active)
 
@@ -45,7 +45,7 @@ We work together in the shared chat room `hearth` at `http://127.0.0.1:5757` (ad
 
 Running anything in parallel on this 8C/16T CPU causes thermal throttling and SMT contention that invalidates benchmark results and corrupts test output. One command per message. Period.
 
-**IMPORTANT: Never push code to github. Only use git for diffs if noticable performance degredation.
+**IMPORTANT: Use git for diffs when investigating performance changes, and always commit and push finished work — never leave it only in the working tree.
 
 **IMPORTANT: ALWAYS update `docs/BUG_TRACKER.md` and at the end of each session completely rewrite `docs/RESUME.md` with things to try during the next session!!!
 

@@ -7,3 +7,7 @@ target/
 # Local run logs and agent/tooling scratch
 logs/
 .freebuff/
+
+# Python bytecode caches (regenerated; e.g. scripts used as modules)
+__pycache__/
+*/__pycache__/

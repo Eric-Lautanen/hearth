@@ -148,7 +148,7 @@ Only set what you want to change — the rest follows the model:
 | Variable | Default | What it does |
 | -------- | ------- | ------------ |
 | `HEARTH_MODELS_DIR` | repo `models/` | Model folder for UI + CLI resolution |
-| `HEARTH_CTX_CAP` / `HEARTH_THREADS` | model's length / ~3/4 cores | KV cap, worker count |
+| `HEARTH_CTX_CAP` / `HEARTH_THREADS` | model's length / ~3/4 cores (hybrid only) | KV cap; worker count for the `qwen35` path (dense models use a fixed 8-worker pool) |
 | `HEARTH_MODEL_CATALOG_JSON` / `HEARTH_DL_ALLOW_HTTP` / `HEARTH_NO_AUTO_SHUTDOWN` | built-in / off / off | Catalog override, http mirrors, keep UI up |
 
 ## Architecture
