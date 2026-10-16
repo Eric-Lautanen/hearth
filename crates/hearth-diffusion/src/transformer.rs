@@ -42,7 +42,10 @@ pub struct FluxTransformer {
     gpu: Option<GpuCompute>,
     /// GPU buffers for Q2_0 weights, uploaded once during construction.
     gpu_q2_bufs: HashMap<String, GpuBuffer>,
-    /// GPU buffers for BF16 weights converted to f32.
+    /// GPU buffers for BF16 weights converted to f32. Written during
+    /// construction but not yet consumed by any forward path (unfinished
+    /// GPU work, same as the dead_code-marked stubs in vae.rs).
+    #[allow(dead_code)]
     gpu_f32_bufs: HashMap<String, GpuBuffer>,
 }
 
