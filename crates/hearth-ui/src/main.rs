@@ -175,6 +175,10 @@ struct AppCtx {
     tabs: Mutex<HashMap<String, Instant>>,
     /// Set once the first tab ever says hello (boot grace).
     ever_seen_tab: AtomicBool,
+    /// Opt-in shared-machine token (`HEARTH_UI_TOKEN`). `None` means open
+    /// access for local callers (the default); `Some` requires the token on
+    /// every /api/* call, via header or `?token=`.
+    api_token: Option<String>,
 }
 
 impl AppCtx {
@@ -198,6 +202,29 @@ impl AppCtx {
 
     fn push_event(&self, ev: Json) {
         self.events.lock().unwrap().publish(&ev);
+    }
+
+    /// Token gate for /api/*. Open when no token is configured; otherwise the
+    /// request must carry it as `X-Hearth-Token` or `?token=` (EventSource
+    /// cannot set headers, so the query form exists for it).
+    fn check_token(&self, req: &Request) -> bool {
+        let Some(expected) = self.api_token.as_deref() else {
+            return true;
+        };
+        if let Some(got) = req.token.as_deref() {
+            if got == expected {
+                return true;
+            }
+        }
+        // Minimal query parse: look for a top-level token= pair only.
+        for pair in req.query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "token" && v == expected {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn finish_generation(&self, error: Option<String>, stopped: bool) {
@@ -576,7 +603,54 @@ fn handle_service_event(ctx: &Arc<AppCtx>, v: Json) {
 struct Request {
     method: String,
     path: String,
+    query: String,
     body: Vec<u8>,
+    /// Raw `Host` header, lowercased and trimmed.
+    host: String,
+    /// Raw `Origin` header, if the client sent one (browsers do).
+    origin: Option<String>,
+    /// `X-Hearth-Token` header, if present.
+    token: Option<String>,
+}
+
+/// Hosts this server answers to. The socket is bound to loopback, and the
+/// Host check is the layer that makes that binding stick against DNS
+/// rebinding: a page that reached us through a rebound name carries that
+/// name here, and it is refused.
+fn host_allowed(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    let bare = if let Some(rest) = h.strip_prefix('[') {
+        // Bracketed IPv6 literal, "[::1]" or "[::1]:port".
+        rest.split(']').next().unwrap_or("")
+    } else if h.matches(':').count() == 1 {
+        h.split(':').next().unwrap_or("")
+    } else {
+        h.as_str()
+    };
+    matches!(bare, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// The request came from a web page whose origin is usable (`Origin` is only
+/// sent by browsers). Anything that is not this machine is refused; a missing
+/// header means a non-browser client (curl, EventSource reconnects carry no
+/// Origin on some stacks) and is allowed through.
+fn origin_allowed(origin: Option<&str>) -> bool {
+    let Some(o) = origin else { return true };
+    let o = o.trim().to_ascii_lowercase();
+    let after_scheme = match o.split_once("://") {
+        Some((scheme, rest)) if scheme == "http" || scheme == "https" => rest,
+        _ => return false,
+    };
+    let host = if let Some(rest) = after_scheme.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if after_scheme.matches(':').count() == 1 {
+        after_scheme.split(':').next().unwrap_or("")
+    } else {
+        after_scheme
+    };
+    // Strip any path the sender attached; only the host matters.
+    let host = host.split('/').next().unwrap_or("");
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
@@ -589,6 +663,9 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     let target = parts.next()?.to_string();
 
     let mut content_length = 0usize;
+    let mut host = String::new();
+    let mut origin: Option<String> = None;
+    let mut token: Option<String> = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).ok()? == 0 {
@@ -601,6 +678,12 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
         if let Some((name, value)) = header.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("host") {
+                host = value.trim().to_ascii_lowercase();
+            } else if name.eq_ignore_ascii_case("origin") {
+                origin = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case("x-hearth-token") {
+                token = Some(value.trim().to_string());
             }
         }
     }
@@ -610,10 +693,22 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
         return None;
     }
 
-    // Strip any query string; the API is POST-body driven.
-    let path = target.split('?').next().unwrap_or(&target).to_string();
+    // Split the query string off the path (the API is POST-body driven, but
+    // the token may ride along as ?token= where headers cannot go).
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target.clone(), String::new()),
+    };
 
-    Some(Request { method, path, body })
+    Some(Request {
+        method,
+        path,
+        query,
+        body,
+        host,
+        origin,
+        token,
+    })
 }
 
 fn http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
@@ -1175,8 +1270,47 @@ fn handle_client(ctx: Arc<AppCtx>, stream: TcpStream) {
             None => return,
         };
 
+        // Layer 1 — DNS rebinding: the socket is loopback-only, and this
+        // check makes that stick. A page that reached us through a rebound
+        // name carries that name in Host and is refused here.
+        if !host_allowed(&req.host) {
+            http_response(
+                &mut stream,
+                "403 Forbidden",
+                "text/plain",
+                b"refused: unknown host",
+            );
+            continue;
+        }
+
         let path = req.path.trim_end_matches('/');
         let path = if path.is_empty() { "/" } else { path };
+
+        // Layer 2 — opt-in token for shared machines
+        // (`HEARTH_UI_TOKEN`). The page itself (`/`) always loads so the UI
+        // can prompt; every /api/* call must prove it. Header first (fetch),
+        // `?token=` fallback for EventSource, which cannot set headers.
+        if path.starts_with("/api/") && !ctx.check_token(&req) {
+            let mut v = Json::obj();
+            v.set("ok", Json::Bool(false));
+            v.set("error", Json::str("auth required: set HEARTH_UI_TOKEN on the server and send it as X-Hearth-Token (or ?token=)".to_string()));
+            v.set("auth_required", Json::Bool(true));
+            json_response(&mut stream, &v);
+            continue;
+        }
+
+        // Layer 3 — cross-site request forgery: state-changing requests from
+        // a web page must come from this machine. Absent Origin means a
+        // non-browser client and is allowed through.
+        if req.method == "POST" && !origin_allowed(req.origin.as_deref()) {
+            http_response(
+                &mut stream,
+                "403 Forbidden",
+                "text/plain",
+                b"refused: foreign origin",
+            );
+            continue;
+        }
 
         match (req.method.as_str(), path) {
             ("GET", "/") => {
@@ -1266,6 +1400,14 @@ fn main() {
     };
 
     let dl = downloads::Manager::new();
+    // Opt-in shared-machine token. Empty/unset means open local access.
+    let api_token = std::env::var("HEARTH_UI_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if api_token.is_some() {
+        eprintln!("[hearth-ui] API token required (HEARTH_UI_TOKEN is set)");
+    }
     let ctx = Arc::new(AppCtx {
         events: Mutex::new(EventHub::default()),
         slots: Mutex::new(HashMap::new()),
@@ -1275,6 +1417,7 @@ fn main() {
         dl: dl.clone(),
         tabs: Mutex::new(HashMap::new()),
         ever_seen_tab: AtomicBool::new(false),
+        api_token,
     });
     // Download progress/completion fans out to every open tab over SSE.
     {

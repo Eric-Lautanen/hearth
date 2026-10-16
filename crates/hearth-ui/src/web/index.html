@@ -731,6 +731,41 @@ const scroller = $("scroller"), chatCol = $("chatCol"), input = $("input"),
       ejectBtn = $("ejectBtn"), statusDot = $("statusDot"),
       statusText = $("statusText"), statusPill = $("statusPill");
 
+// Auth token for servers started with HEARTH_UI_TOKEN. EventSource cannot
+// set headers, so it rides as ?token=; fetch calls carry X-Hearth-Token.
+S.token = "";
+try { S.token = localStorage.getItem("hearth_token") || ""; } catch (e) {}
+const _fetch = window.fetch.bind(window);
+async function ensureToken() {
+  const v = prompt("This Hearth server requires an API token (HEARTH_UI_TOKEN). Enter it to continue:");
+  if (v && v.trim()) {
+    S.token = v.trim();
+    try { localStorage.setItem("hearth_token", S.token); } catch (e) {}
+    connectEvents(); // reconnect the SSE stream with the token
+    return true;
+  }
+  toast("API token required", "err");
+  return false;
+}
+window.fetch = async function apiFetch(url, opts, retried) {
+  const o = Object.assign({}, opts);
+  o.headers = Object.assign({}, (opts && opts.headers) || {});
+  // Drop any stale token header so the retry below cannot reuse it.
+  delete o.headers["X-Hearth-Token"];
+  if (typeof url === "string" && url.indexOf("/api/") === 0 && S.token) {
+    o.headers["X-Hearth-Token"] = S.token;
+  }
+  const r = await _fetch(url, o);
+  if (r.status === 401 && !retried) {
+    let j = null;
+    try { j = await r.clone().json(); } catch (e) {}
+    if (j && j.auth_required && await ensureToken()) {
+      return apiFetch(url, opts, true);
+    }
+  }
+  return r;
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1328,7 +1363,7 @@ window.addEventListener("pagehide", () => {
 
 function connectEvents() {
   if (S.evtSource) S.evtSource.close();
-  const es = new EventSource("/api/events");
+  const es = new EventSource("/api/events" + (S.token ? "?token=" + encodeURIComponent(S.token) : ""));
   S.evtSource = es;
   es.onmessage = (m) => {
     let ev;

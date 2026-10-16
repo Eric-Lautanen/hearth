@@ -129,6 +129,14 @@ finished files appear in the dropdown. Custom `.gguf` URL row included.
 Power options: `models/catalog.json` or `HEARTH_MODEL_CATALOG_JSON` overrides
 the catalog; `HEARTH_DL_ALLOW_HTTP=1` permits plain-http mirrors.
 
+**Security model:** the server binds `127.0.0.1` only — nothing off the
+machine can reach it. On top of that it enforces same-machine `Host`
+(kills DNS rebinding), rejects foreign `Origin` on state-changing calls
+(plain `curl` has no `Origin` and is unaffected), and supports an opt-in
+token for shared boxes: set `HEARTH_UI_TOKEN`, and every `/api/*` call must
+carry it as `X-Hearth-Token` (or `?token=` for the event stream) — the UI
+prompts once and remembers it.
+
 ### Flags & environment
 
 Only set what you want to change — the rest follows the model:
@@ -150,6 +158,7 @@ Only set what you want to change — the rest follows the model:
 | `HEARTH_MODELS_DIR` | repo `models/` | Model folder for UI + CLI resolution |
 | `HEARTH_CTX_CAP` / `HEARTH_THREADS` | model's length / ~3/4 cores (hybrid only) | KV cap; worker count for the `qwen35` path (dense models use a fixed 8-worker pool) |
 | `HEARTH_MODEL_CATALOG_JSON` / `HEARTH_DL_ALLOW_HTTP` / `HEARTH_NO_AUTO_SHUTDOWN` | built-in / off / off | Catalog override, http mirrors, keep UI up |
+| `HEARTH_UI_TOKEN` | off (open) | Require a token on every `/api/*` call (header or `?token=`); the UI prompts once |
 
 ## Architecture
 
