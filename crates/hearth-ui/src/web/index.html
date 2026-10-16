@@ -1393,20 +1393,26 @@ function finishStream(ev) {
     (ev.stopped ? " · stopped" : "");
   const finalText = (ev.text || "").trim();
   const finalReason = (ev.reason_text || "").trim();
-  // Fallback split: some models (notably 1-bit ones) emit reasoning text
-  // without ever opening <think>, then close it. The engine only routes an
-  // explicitly opened block to the reason channel, so that reasoning would
-  // render inline with a stray </think> tag. Re-split for display so it
-  // still lands in the collapsible drawer.
+  // Fallback split: some models (notably 1-bit/ternary ones) emit reasoning
+  // text without ever opening <think>, then close it — sometimes with a
+  // variant tag (</thinks> has been observed in the wild). The engine only
+  // routes an explicitly opened canonical block to the reason channel, so
+  // that reasoning would render inline with a stray tag. Re-split for
+  // display so it still lands in the collapsible drawer, and never leak
+  // think control tags into the visible answer.
   let text = finalText, reason = finalReason;
-  if (!reason && text.includes("</think>")) {
-    const cut = text.lastIndexOf("</think>");
-    const maybeThink = text.slice(0, cut).replace(/<think>/g, "").trim();
-    if (maybeThink) {
-      reason = maybeThink;
-      text = text.slice(cut + "</think>".length).trim();
+  if (!reason) {
+    const closes = [...text.matchAll(/<\/thinks?>/g)];
+    if (closes.length > 0) {
+      const last = closes[closes.length - 1];
+      const maybeThink = text.slice(0, last.index).replace(/<thinks?>/g, "").trim();
+      if (maybeThink) {
+        reason = maybeThink;
+        text = text.slice(last.index + last[0].length).trim();
+      }
     }
   }
+  text = text.replace(/<\/?thinks?>/g, "").trim();
   // Slow models are the interesting case: name the real cost per prompt token
   // instead of blaming the reply budget.
   const perPromptTok = prompt > 0 ? (ev.elapsed_ms / 1000) / prompt : 0;
