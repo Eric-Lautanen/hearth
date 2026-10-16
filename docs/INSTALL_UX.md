@@ -77,8 +77,13 @@ downloader fills it) and the README. No admin rights needed anywhere.
 
 ## Work list (in order)
 
-1. `scripts/package-macos.sh` + `Info.plist` template.
-2. `hearth.desktop` + icon SVG + Linux install notes in README.
+1. `scripts/package-macos.sh` + `Info.plist` template. ✅ written (`scripts/`,
+   `resources/`), needs a Mac to verify.
+2. `hearth.desktop` + icon SVG + Linux install notes in README. ✅ written,
+   needs a Linux box to verify.
 3. Windows zip layout doc (one paragraph in README) + console-vs-GUI call.
+   ✅ **Verified 2026-10-16**: both release exes copied to a foreign dir,
+   launched with `HEARTH_MODELS_DIR` set — service spawned, `/api/models`
+   listed all 14, clean shutdown, no repo paths involved.
 4. Per-OS verify matrix: launch → tab → close tab → process gone, for each.
 5. Later: Inno Setup, signing/notarization, single-instance lock.

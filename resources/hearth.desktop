@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Hearth Chat
+Comment=Local LLM chat with model downloader
+Exec=hearth-ui
+# If installed outside PATH, point Exec at the unpacked binary instead:
+# Exec=/opt/hearth/hearth-ui
+Terminal=false
+Categories=Utility;Network;
+StartupNotify=false
+# After `cargo build --release`, copy this file to
+# ~/.local/share/applications/ and the SVG to ~/.local/share/icons/.
+Icon=hearth
