@@ -1,31 +1,31 @@
 # Hearth — next session
 
-> **Session 2026-10-16 (pt 4, continued) in one paragraph.** Chain building exists. `chain.rs` takes the
-> four fields a verifier is handed — `certificate_list`, the caller's trust anchors, the validation
-> instant, a `Policy` — and answers whether the path frames, parses, respects its structural rules, is
-> signed by the next certificate's key at every link, and ends at an anchor's key. Structure is checked
-> before links, so a chain of the wrong shape is refused before any public-key operation runs on hostile
-> input, and a **name match alone anchors nothing**: the key must verify. That last claim is provable
-> rather than asserted, because a new fixture (`ROOT_SHADOW`) is a self-signed CA that carries the root's
-> *subject name* with a different key — without it, the path a name-only matcher accepts had no negative
-> test, which is the same pattern as the shared-key defect of slice 9, one level up. `client.rs`'s
-> certificate framing now calls the same entry walk the verifier uses, so the rule exists once. What is
-> still missing is the last check before a `https://` URL can use any of this: **host name matching**,
-> plus the two certificate rules that need their own failure fixtures (`pathLenConstraint`,
-> `keyUsage.keyCertSign`) and the fact that there is **no revocation checking of any kind**. **195
-> checks green on the hardware path and on `HEARTH_TLS_NO_HW=1`** (177 before), clippy
+> **Session 2026-10-16 (pt 5, continued) in one paragraph.** The checks are complete. `chain.rs` builds
+> the path from the wire bytes to a caller-supplied anchor (structure before links, and a **name match
+> alone anchors nothing** — proven by a fixture that carries the root's subject name with a different
+> key), and now `leaf.rs` adds the two checks on the leaf itself: whether the certificate names the server
+> being connected to, and whether it may be used as a server certificate at all. Host names come only from
+> `subjectAltName` (no `commonName` fallback), only `dNSName` entries are compared, a wildcard is one whole
+> leftmost label or nothing, and the whole rule is a pure function tested exhaustively without a
+> certificate. Purpose means `serverAuth` in `extendedKeyUsage` and `digitalSignature` in `keyUsage`, each
+> when the extension is present, each with a fixture that makes it fail. The session's second finding was
+> in the address check, twice: `::1` was first reported as a *malformed name* rather than an address (the
+> colon was rejected before the address check ran, leaving its IPv6 branch dead and the docs wrong), and
+> fixing the order exposed a worse rule — "contains a colon" called `models.example:443` an address
+> literal. **209 checks green on the hardware path and on `HEARTH_TLS_NO_HW=1`** (195 before), clippy
 > `--all-targets -D warnings`, fmt, `cargo doc` (zero warnings) and the workspace check clean, `std`-only,
-> empty `[dependencies]`, still unreachable from any `https://` path. History: `docs/BUG_TRACKER.md`.
+> empty `[dependencies]`, and still nothing in the crate calls any of it: `RejectAll` is the only
+> `CertificateVerifier`, and there is **no revocation checking of any kind**. History: `docs/BUG_TRACKER.md`.
 
 ## Next session — in this order
 
 1. **Certificate verification — one check short of a decision.** A certificate parses (`x509.rs`), every
-   suite verifies (`rsa.rs`, `ecdsa.rs`), `verify.rs` decides which scheme may verify which key, and
+   suite verifies (`rsa.rs`, `ecdsa.rs`), `verify.rs` decides which scheme may verify which key,
    `chain.rs` builds the path from the wire bytes to a caller-supplied anchor with the structural rules
-   and the validity window. **What is missing is host name matching**, which is now the single check
-   standing between this crate and an `https://` URL — a chain that verifies today may still be for the
-   wrong server. The pieces are also still wired to nothing: nothing in this crate calls `chain.rs`, and
-   `RejectAll` remains the only `CertificateVerifier`.
+   and the validity window, and `leaf.rs` checks that the certificate names the server and may be used as
+   one. **Every check a verifier needs now exists; what is missing is the integration and the trust
+   decision.** Nothing in this crate calls any of it — `RejectAll` is still the only
+   `CertificateVerifier` — and there is still **no revocation checking of any kind**.
    - The seam is unchanged and is the only place to plug in: `client::CertificateVerifier`, called with
      `CertificateVerifyInput { server_name, certificate_list, signature_scheme, signature,
      signed_data }`, where `signed_data` is already the RFC 8446 §4.4.3 construction (64 spaces,
@@ -60,26 +60,32 @@
         needs a fixture that can make it fail — a CA with `path_len = 0` that has another CA below it,
         and a CA whose `keyUsage` lacks `keyCertSign` (both need a child certificate to test the link,
         so two fixtures each). Also absent: revocation of any kind, and `extendedKeyUsage` on issuers.
-     3. **Hostname matching** — exact or case-insensitive `dNSName` match against `server_name`, no
-        wildcard surprises (if wildcards ship at all, one leading label only, and the prefix must not
-        be empty or match a public suffix).
-     4. **The validity window — done, in `chain.rs`**, and checked on every certificate in the path and
-        on the anchor, inclusively at both ends, against the `UnixTime` the handshake already carries.
-        Still to do: `keyUsage` / `extendedKeyUsage` sanity on the *leaf* (`serverAuth`), plus the two
-        revert-check-less call sites named above (the anchor's window and its key size have no negative
-        test because no fixture anchor can fail them while the chain is valid).
-   - **The root store is a decision to make explicitly, not to drift into.** `std` has no way to read
-     the OS trust store on all three platforms, so the choice is a small pinned set in-tree with
-     fingerprints and a documented update path, versus a per-platform reader. Pick the pinned set, say
-     so in the module docs, and make its contents reviewable in one screen.
-   - Land it with the negative tests before any URL can use it: **expired, not-yet-valid, unknown
-     root, hostname mismatch, a CA used as a leaf (basicConstraints), a chain that is too long, an RSA
-     key that is too small, and a scheme that does not match the key type**. The "bad signature" and
-     "malformed encoding" cases now exist at the primitive level (`tests/ecdsa_vectors.rs`,
-     `tests/rsa_vectors.rs`), so what is left is the chain-level set. Do not let the downloader take an
-     `https://` path through this code until those exist. Calibration from the three slices: RSA was
-     ~600 lines, the X.509 reading half ~1000, and P-256 + ECDSA ~1000 including their vectors — so the
-     decision half is plausibly another 600–900, most of it policy and tests rather than arithmetic.
+     3. **Host name matching — done, in `leaf.rs`.** `subjectAltName` is the only place a name is looked
+        for (no `commonName` fallback — RFC 6125 §6.4.4 deprecated it, and `LEAF_EC` is the fixture that
+        refuses its own subject's name), only `dNSName` entries are compared, comparison is ASCII
+        case-insensitive with one trailing dot ignored, a wildcard is one whole leftmost label or
+        nothing at all (and must leave two labels, so `*.com` matches nothing), and an IP literal is
+        refused rather than matched. The rule is a pure function — `leaf::dns_name_matches` — so it is
+        unit-tested exhaustively without a certificate.
+     4. **The validity window — done, in `chain.rs`**, checked on every certificate in the path and on
+        the anchor, inclusively at both ends, against the `UnixTime` the handshake already carries. The
+        leaf's purpose is also done (`leaf::verify_server_auth`): `extendedKeyUsage` including
+        `serverAuth` when present, and `keyUsage` including `digitalSignature` when present, each with a
+        fixture that makes it fail. Still untested: the anchor's own window and key size (no fixture
+        anchor can fail either while the chain is still valid).
+   - **The root store is the caller's decision, and the crate is built that way.** `client.rs` already
+     says this crate has no root store and no business having one: [`chain::verify_chain`] takes the
+     anchors as an argument. So the question moves to the downloader — a pinned set in `hearth-ui` with
+     fingerprints and a documented update path, versus a per-platform OS trust reader that `std` cannot
+     give on all three platforms — and either way its contents have to be reviewable in one screen and
+     its failures loud. **Do not put a root store in `hearth-tls`.**
+   - The negative set is now complete except for two rules and one absence: the chain-level **bad
+     signature, malformed encoding, expired, not-yet-valid, unknown root, name mismatch, CA used as a
+     leaf, non-CA issuer, broken link, chain too long, RSA key too small, scheme that does not match the
+     key type, framing failures, and a purpose the leaf is not allowed** all have tests. What is missing
+     is `pathLenConstraint`, `keyUsage.keyCertSign`, and any form of revocation checking. Do not let the
+     downloader take an `https://` path through this code until at least the first two exist and the
+     absence of the third is a decision rather than an oversight.
    - `Transport` in `hearth-ui/src/http.rs` is the seam and the `https://` branch of
      `downloads.rs::run_transfer` is what gets rewired afterwards. **Do not touch `http.rs` without
      asking — it is SparkOC's file.** Loose thread to close at the same time: the downloader's DNS

@@ -181,6 +181,8 @@ def main():
     # note in the module docstring. Nothing is issued by it, which is the point —
     # it exists to be an anchor whose name matches and whose key does not.
     shadow_root_key = rsa_key(20261021)
+    client_auth_key = rsa_key(20261022)
+    no_sign_key = rsa_key(20261023)
 
     def name(common):
         return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common)])
@@ -360,6 +362,76 @@ def main():
         .sign(ec_leaf_key, hashes.SHA256())
     )
 
+    # A leaf the intermediate issued for **client** authentication only. The chain is
+    # perfectly good and the name is right; the purpose is what makes it not a server
+    # certificate, and the check that refuses it needs exactly this certificate.
+    leaf_client_auth = (
+        x509.CertificateBuilder()
+        .subject_name(name("client.example"))
+        .issuer_name(intermediate.subject)
+        .public_key(client_auth_key.public_key())
+        .serial_number(0x08)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=True,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("client.example")]), critical=False
+        )
+        .sign(intermediate_key, hashes.SHA256())
+    )
+
+    # A leaf whose `keyUsage` allows encipherment but not signing. TLS 1.3 removed key
+    # transport entirely, so a certificate like this can never complete a handshake —
+    # and the rule that refuses it is only provable with a certificate that carries it.
+    leaf_no_sign = (
+        x509.CertificateBuilder()
+        .subject_name(name("no-sign.example"))
+        .issuer_name(intermediate.subject)
+        .public_key(no_sign_key.public_key())
+        .serial_number(0x09)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=True,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("no-sign.example")]), critical=False
+        )
+        .sign(intermediate_key, hashes.SHA256())
+    )
+
     # A leaf whose unknown extension is marked **critical**. RFC 5280 requires a
     # reader that does not understand a critical extension to reject the
     # certificate, so this one must not parse.
@@ -387,6 +459,8 @@ def main():
         ("INTERMEDIATE", intermediate),
         ("LEAF_RSA", leaf_rsa),
         ("LEAF_EC", leaf_ec),
+        ("LEAF_CLIENT_AUTH", leaf_client_auth),
+        ("LEAF_NO_DIGITAL_SIGNATURE", leaf_no_sign),
         ("SELF_SIGNED_PSS", self_signed_pss),
         ("SELF_SIGNED_EC", self_signed_ec),
         ("LEAF_UNKNOWN_CRITICAL", leaf_unknown_critical),

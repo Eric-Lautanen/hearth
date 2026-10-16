@@ -125,6 +125,7 @@ pub mod gcm;
 pub mod handshake;
 pub mod hkdf;
 pub mod keyschedule;
+pub mod leaf;
 pub mod p256;
 pub mod record;
 pub mod rsa;
@@ -154,6 +155,7 @@ pub use handshake::{
 };
 pub use hkdf::{derive_secret, derive_secret32, hkdf_expand, hkdf_expand_label, hkdf_extract};
 pub use keyschedule::{finished_key, finished_verify_data, verify_finished, TrafficSecrets};
+pub use leaf::{dns_name_matches, verify_leaf, verify_server_auth, verify_server_name, LeafError};
 pub use record::{Record, RecordError, RecordLayer, TrafficKeys};
 pub use rsa::{RsaError, RsaPublicKey};
 pub use sha256::{hmac_sha256, hmac_sha256_parts, Sha256};

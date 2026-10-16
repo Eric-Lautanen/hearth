@@ -38,6 +38,40 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 11 — host name matching and the leaf's purpose, and two wrong rules found by their own tests (buffy, 2026-10-16)
+
+`leaf.rs`: the two checks on the leaf itself. A chain says a certificate is authentic; these say it is the
+*right* certificate, and they were the last two between this crate and an `https://` URL.
+
+- **`subjectAltName` is the only place a name is looked for.** No `commonName` fallback (RFC 6125 §6.4.4
+  deprecated it, and a name in a free-text field is not a constraint), and only `dNSName` entries are
+  compared — `LEAF_EC` has a `commonName` of `ec.example` and no SAN, and is the fixture that refuses its
+  own subject's name with `NoDnsNames` rather than matching it.
+- **The wildcard policy is a pure function**, `leaf::dns_name_matches(pattern, name)`, so the part that is
+  usually wrong in a name matcher is unit-tested without a certificate: one whole leftmost label only, the
+  pattern must leave at least two labels (`*.com` matches nothing — the strongest rule available without a
+  public suffix list), no `*` anywhere else, and a server name that is itself a pattern never matches.
+- **A test found one wrong rule, and fixing it exposed a worse one.** `::1` was reported as a *malformed
+  name* rather than an address, because a colon is not a host-name byte and the address check ran second —
+  which left the IPv6 branch of `is_ip_literal` unreachable and the module docs describing behaviour the
+  code could not reach. Reordering the checks fixed the diagnosis and then failed again immediately:
+  "contains a colon" was calling `models.example:443` an address literal. The rule is now address-shaped
+  — four digit runs, or two or more colons with nothing but hex digits, colons and dots. Every version
+  refused the connection, so nothing unsafe shipped; what was wrong twice was the *diagnosis*, and only a
+  test that asserts the error could see it.
+- **Two fixtures make the purpose checks provable**, each with its own key per the generator's
+  one-key-per-identity rule: `LEAF_CLIENT_AUTH` (a perfectly good chain whose `extKeyUsage` is
+  `clientAuth` alone) and `LEAF_NO_DIGITAL_SIGNATURE` (`keyUsage` without the bit that signs a
+  `CertificateVerify`).
+- An absent `extKeyUsage` means any purpose is allowed (RFC 5280 §4.2.1.12), and the parser refuses an
+  *empty* extension, so an empty slice can only mean "absent" — the purpose check relies on that, and
+  says so in the code that relies on it.
+
+209 checks green on the hardware path and on `HEARTH_TLS_NO_HW=1` (195 before), fmt, clippy
+`--all-targets -D warnings`, `cargo doc` (zero warnings) and `cargo check --workspace --all-targets` all
+clean. Still nothing calls any of it: `RejectAll` remains the only `CertificateVerifier`, and there is
+still **no revocation checking of any kind**.
+
 ### hearth-tls slice 10 — chain building, and the fixture a name-only matcher needs (buffy, 2026-10-16)
 
 `chain.rs`: framing, structure, links and anchoring, over the scheme dispatch in `verify.rs`. The
