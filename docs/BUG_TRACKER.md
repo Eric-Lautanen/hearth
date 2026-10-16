@@ -3,6 +3,74 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers. Ref: llama.cpp-prism.
 
+### Session 2026-10-15 — the Zen 4 AVX-512 gate could never fire, so the slower kernel was selected everywhere
+
+**Trigger:** benchmarking the Ternary Bonsai 2 file set. Every PTQ1_0 model ran at roughly *half the
+effective bandwidth* of its PQ2_0 sibling (4B: 6.6 vs 9.2 tok/s, 9B: 4.0 vs 6.3) even though
+`gguf_info.py` showed the two files carry **identical block counts** (69.9M for both 9B files) — so
+per-token cost should have been equal or better for the 1-bit format, not 1.6× worse.
+
+**Root cause.** `cpu_is_amd_zen4()` (`crates/hearth-quant/src/lib.rs`) read CPUID leaf 1 EAX bits 8–11
+— the *base* family field — and compared it to 25. Modern AMD always reports base family **0xF** with
+the real family in the *extended* field (bits 20–27), so Zen 4 arrives as base 15 + ext 0xA = **0x19**,
+and the predicate could never be true. `avx512_full_width()` therefore always returned `true` on this
+8840HS and every kernel gated on it took the AVX-512 path. On Zen 4's double-pumped 256-bit datapath
+that is the *slower* choice for the LUT-style kernels: measured PTQ1_0 **1.28 GB/s (AVX-512) vs
+1.76 GB/s (AVX2)**, +34%.
+
+**Fix, in two parts — the right answer turned out to be per-kernel, not a blanket ban.**
+
+| # | Change | Why |
+|---|--------|-----|
+| 1 | `cpu_is_amd_zen4()` reconstructs the effective family (`base == 0xF ? base + ext : base`) and compares to **0x19**. `avx512_full_width()` is now correctly `false` here, so PTQ1_0 dispatches to AVX2 | PTQ1_0's AVX-512 kernel is strictly slower on this part |
+| 2 | The Q2_0 VNNI kernels stopped requiring `avx512_full_width()` and are gated on the VNNI feature bits alone (`dot_q2_0_q8_0_ptr`) | Fixing (1) alone would have pushed Q2_0 onto the *slower* AVX2 LUT kernel — but VNNI **wins** on Zen 4 because `vpdpbusd` cuts front-end work enough to pay for the half-width datapath |
+
+**Kernel measurements (single thread, `benchk`, warm).**
+
+| format | tensor set | dispatched | avx2 | avx512 | scalar |
+|--------|-----------|-----------|------|--------|--------|
+| PTQ1_0 | 4B `blk.0` aggregate | **1.70** (avx2) | 1.72 | 1.28 | 0.67 |
+| PQ2_0 (Q2_0 kernels) | 4B `blk.0` aggregate | **3.09** (vnni256) | 2.91 (avx2 LUT) | 3.10 vnni256 / 3.02 vnni512x2 | — |
+
+**Verification.** `benchk` now prints the CPUID decode *and* the kernel `dot_ptq1_0_q8_0_ptr` actually
+selects (new `ptq1_0::kernel_name()`, which reuses the real predicates rather than copying them):
+`base_family=15 ext_family=0xA real_family=0x19`, **`dispatch selects: avx2`**. Two side findings: the
+`scalar` kernel really is ~0.67 GB/s, so an earlier "dispatched = 0.66 = scalar" reading was a
+cold-clock artifact on the first-measured variant rather than a dispatch failure; and the bench needed a
+time-based warmup before per-variant numbers were comparable at all.
+
+**Model results** (`--temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`, 2nd (warm) run):
+
+| model | before | after | Δ |
+|-------|--------|-------|---|
+| Ternary-Bonsai-2-2B-PTQ1_0 | 15.6 | **19.1** | +22% |
+| Ternary-Bonsai-2-4B-PTQ1_0 | 6.6 | **7.7** | +17% |
+| Ternary-Bonsai-2-9B-PTQ1_0 | 4.0 | **4.8–5.0** | +20–25% |
+| Ternary-Bonsai-2-27B-PTQ1_0 | 1.23 | **1.41** | +15% |
+
+The six mandate models were re-run and show no regression (all inside the ±4–5% single-run spread pt 6
+documented): 1.7B Q1_0 45.0 (sess. baseline 45.9), 1.7B Q2_0 25.1, 4B Q1_0 21.1 (21.3), 4B Q2_0 11.6,
+8B Q1_0 12.0 (12.2), 8B Q2_0 6.5. The Q2_0 models are unchanged **by design** — VNNI is selected both
+before and after fix (2), which is exactly what part 2 was for.
+
+**Correctness.** All 33 `hearth-quant` tests pass; `cargo clippy -p hearth-quant --all-targets -- -D
+warnings` and `cargo fmt --all --check` are clean. Generated text is **byte-identical** to the pre-fix
+binary on all four PTQ1_0 models (AVX2 and AVX-512 agree exactly), so this is a pure speed change.
+
+**Also fixed:** `scripts/gguf_info.py` listed PTQ1_0 as dtype **45** with an **18-byte**/128-element
+block. The Rust parser uses dtype **143** and a **28-byte**/128-element block; PQ2_0 is **142**, not 44.
+The script's dtype census was silently wrong for the new formats (it reported 71.4 MB where the file
+really holds 111.2 MB), which would have hidden exactly the kind of layout mistake this session chased.
+
+**Files touched:** `crates/hearth-quant/src/lib.rs`, `q2_0.rs`, `ptq1_0.rs`;
+`crates/hearth-llm/examples/benchk.rs` (rewritten as a head-to-head kernel bench that also reports the
+ground-truth dispatch); `scripts/gguf_info.py`. **Nothing committed** — the tree also holds
+another agent's in-progress edits (see RESUME).
+
+**Still open, unchanged by this session:** PTQ1_0 and PQ2_0 have **no x2 (paired) kernel**, so prefill
+on every Ternary Bonsai 2 model still re-expands each weight row once per prompt token. On the 27B that
+is the remaining UX blocker: ~1.8–2.3 s per *prompt* token against ~0.9 s per *decoded* token.
+
 ### Session 2026-09-19 pt 6 — the 27B chat was unusable: KV cache sized from the model's *declared* context
 
 **Trigger:** "the 27b q1 on html UI chat" returned only *"The model returned no visible text (28 tokens

@@ -1,3 +1,50 @@
+# Hearth — Session 2026-10-15: the Zen 4 AVX-512 gate could never fire
+
+> `cpu_is_amd_zen4()` compared the CPUID *base* family field (bits 8–11, always 0xF on modern AMD)
+> against 25, so it was never true and `avx512_full_width()` always said yes: every AVX-512-gated
+> kernel took the AVX-512 path on this double-pumped 8840HS. PTQ1_0 lost ~34% there (1.28 vs 1.76
+> GB/s) — 2B 15.6→19.1, 4B 6.6→7.7, 9B 4.0→5.0, 27B 1.23→1.41 tok/s, output byte-identical. The
+> gate is now correct (family reconstructed, 19h = 0x19) and **per-kernel**: PTQ1_0 → AVX2, Q2_0
+> VNNI → kept (3.10 vs 2.91 GB/s for AVX2 LUT), because a blanket "no AVX-512 on Zen 4" would have
+> regressed Q2_0. Kernel-level numbers and the `benchk` verification are in BUG_TRACKER
+> "Session 2026-10-15". 33 quant tests pass, clippy/fmt clean, **nothing committed**.
+
+## Next session — things to do/try
+
+1. **Prefill on the 27B is the last thing that makes the chat feel broken, and it is now the only hot
+   format without a paired kernel.** pt 5 added `DotFn2` in `pool.rs` (each weight row expanded once
+   for two prompt tokens) and it bought Q2_0 31% and Q1_0_G128 8–11% on prefill. **PTQ1_0 and PQ2_0
+   have no x2 variant at all**, so every Ternary Bonsai 2 model still re-expands each row once per
+   token: ~1.8–2.3 s per *prompt* token vs ~0.9 s per *decoded* token on the 27B. Write
+   `dot_ptq1_0_q8_0x2_ptr` and `dot_pq2_0_q8_0x2_ptr` and wire them into the `dot_fn2` table. While
+   in there, answer the open question: why is prefill ~2× *slower* per token than decode on these
+   hybrids, when a fixed-size recurrence should make the two cost about the same? (An x4 variant
+   regressed 3.2× in pt 5 — measure before merging.)
+2. **Sweep for other gate mistakes.** `cpu_is_amd_zen4()` was the only family check, but the class of
+   bug is "a feature gate that is silently always-false (or always-true)". Grep `hearth-quant` and
+   `hearth-llm` for `is_x86_feature_detected!`, `target_feature`, and `avx512`, and confirm each
+   gated kernel is on the *faster* path on this box. `benchk` is the tool and now reports the
+   ground-truth choice: `cargo run --release -p hearth-llm --example benchk -- <model.gguf> <dtype>`
+   prints the CPUID decode, the kernel `dot_*_ptr` selects, and every variant's GB/s.
+3. **Zen 5 (family 1Ah) and Intel must not regress.** The fix keys on 19h specifically so they keep
+   full-width AVX-512 — but there is no such hardware here to confirm that, and the comment in
+   `avx512_full_width()` now states the 19h rule. Re-measure PTQ1_0's AVX-512 vs AVX2 on the first
+   non-Zen-4 AVX-512 machine the repo runs on before trusting the gate.
+4. **Give the other dtypes the same introspection.** Only PTQ1_0 has a `kernel_name()`, so Q2_0's and
+   Q1_0_G128's dispatch can still only be inferred from timing — which is exactly how this bug hid for
+   so long. Prefer one shared `selected_kernel(dtype)` report printed in the model-load banner.
+5. **Two smaller things.** (a) AGENTS.md's verifications block says `cargo test --test-threads=1 -p
+   hearth-quant`; that is rejected by cargo (it must be `cargo test -p hearth-quant --
+   --test-threads=1`). (b) Re-run the mandate set on a fully idle box interleaved with the reference
+   fork (`bench_results/run_cpu_bench.bat`) — today's pass was clean but the fork was not present.
+
+**Working-copy warning.** Another agent (SparkOC) holds `task2-ui-docs-downloader` in this same
+checkout, so `crates/hearth-llm/src/model/mod.rs`, `qwen35.rs`, `pool.rs`,
+`crates/hearth-diffusion/src/transformer.rs` and the probe examples are modified by *them*, not by
+this session. Do not revert or commit those alongside AVX-512 work.
+
+---
+
 # Hearth — Session 2026-09-19 (pt 6): the 27B's context was allocated from its declared size
 
 > The 27B chat ran (or didn't) out of RAM: the KV cache is allocated at load from the context
@@ -9,7 +56,7 @@
 > parks on a condvar with a syscall-free dispatch path (`pool.rs`), idle CPU 0.0%, throughput
 > unchanged. See BUG_TRACKER pt 6.
 
-## Next session — things to do/try
+## Next session — things to do/try (superseded by 2026-10-15 above)
 
 1. **27B prefill is the one thing that still makes the chat feel broken.** Measured this session:
    1.8–2.3 s per *prompt* token (a 33-token chat prompt = 60–76 s before the first token) against
