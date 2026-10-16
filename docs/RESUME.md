@@ -1,5 +1,20 @@
 # Hearth — next session
 
+> **Session 2026-10-16 (pt 11) in one paragraph.** A gap found by reading the code rather than by a failing
+> test: `intermediates_below` excludes self-issued certificates from a `pathLenConstraint` count — the rule
+> that makes a **key rollover** legal — and in all 24 fixtures then every intermediate was non-self-issued,
+> so the branch that does the excluding never excluded anything. It now has a rollover path
+> (`ROLLOVER_CA_A` → `ROLLOVER_CA_B`, same DN, new key → a leaf), legal *only* because the rollover is
+> self-issued, with the contrast in the same test and the branch proven load-bearing by neutering
+> `self_issued` (the path is then `PathLengthExceeded { ca: Chain(2), allowed: 0, found: 1 }`). The oracle
+> then produced the most useful result of the day: with no key identifiers it refused two **sound** rollover
+> paths with error 7 and error 19 *while this crate accepted them* — a disagreement in the forbidden
+> direction, which the test therefore refused to accept as a divergence. The fix was the fixtures (these
+> three, and only these three, now carry AKI/SKI) and both paths then agree, which also re-reads the earlier
+> `-x509_strict` finding: key identifiers are how a real verifier tells two same-DN certificates apart, so
+> their absence was unrealistic fixtures, not a strict-mode nicety. **216 checks green on both paths** (215
+> before), clippy, fmt, `cargo doc`, workspace and generator stability clean; 27 fixtures, 21 oracle paths.
+
 > **Session 2026-10-16 (pt 10) in one paragraph.** The oracle's first real findings, from four paths about
 > the *shape* of the presented list rather than about any rule. **OpenSSL selects a path out of the pool;
 > this crate builds exactly the list it is given.** An unordered chain, a repeated certificate and an
@@ -44,14 +59,15 @@
    one. **Every check a verifier needs now exists; what is missing is the integration and the trust
    decision.** Nothing in this crate calls any of it — `RejectAll` is still the only
    `CertificateVerifier` — and there is still **no revocation checking of any kind**.
-   - **A gap the oracle's slice found by reading the code, and no test can currently reach:**
-     `intermediates_below` excludes self-issued CAs from the `pathLenConstraint` count, which is the rule
-     that makes a **key rollover** legal, and in all 24 fixtures every intermediate is non-self-issued — so
-     the branch that does the excluding never excludes anything. It needs a key-rollover pair: a CA that
-     re-issues itself under the same DN with a new key (`CA_A` signed by `ROOT`, `CA_B` signed by `CA_A`,
-     same subject name, `CA_A` with `pathLenConstraint: 0`), plus a leaf under `CA_B`. Then the path is
-     legal *only* because `CA_B` is self-issued and does not spend `CA_A`'s allowance, and OpenSSL's
-     verdict can be recorded in the table as part of the same change (4 certificates, one test, one path).
+   - **Closed in pt 11: the self-issued branch is now reachable.** `ROLLOVER_CA_A` / `ROLLOVER_CA_B` (the
+     same DN, a new key) / `LEAF_OF_ROLLOVER_CA_B` make a key rollover a path, legal only because the
+     self-issued certificate does not spend its parent's allowance of none; neutering `self_issued` turns it
+     into `PathLengthExceeded`. Those three are also the only fixtures carrying AKI/SKI, because without
+     them OpenSSL cannot tell two same-DN certificates apart and refuses sound rollover paths.
+   - **The lesson from that slice, which applies to every remaining rule:** a rule whose branch no fixture
+     can reach is a rule nobody has checked, and it looks exactly like one that works. When adding a rule,
+     add the fixture that makes it *refuse* something in the same change — and prefer one where the rule is
+     the only thing standing between the path and `Ok`.
    - The seam is unchanged and is the only place to plug in: `client::CertificateVerifier`, called with
      `CertificateVerifyInput { server_name, certificate_list, signature_scheme, signature,
      signed_data }`, where `signed_data` is already the RFC 8446 §4.4.3 construction (64 spaces,

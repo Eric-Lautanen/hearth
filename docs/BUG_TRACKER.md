@@ -38,6 +38,38 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 17 — the one rule no fixture could reach: key rollover and the self-issued count (buffy, 2026-10-16)
+
+`intermediates_below` excludes self-issued certificates from a `pathLenConstraint` count, which is the rule
+that makes a **key rollover** possible, and **in all 24 fixtures at the time every intermediate was
+non-self-issued** — so the branch that does the excluding never excluded anything. Found by reading the code
+after the oracle work, not by a failing test, which is the point: a rule with no fixture is a rule nobody has
+checked, and it looked exactly like a rule that worked.
+
+- **A key rollover is now a fixture.** `ROLLOVER_CA_A` (signed by the root, `pathLenConstraint: 0`),
+  `ROLLOVER_CA_B` (signed by `ROLLOVER_CA_A`'s key, **the same distinguished name**, a different key) and a
+  leaf under `ROLLOVER_CA_B`. The path is legal *only* because `ROLLOVER_CA_B` is self-issued — the same DN in
+  the subject and issuer fields, whatever key signed it — and therefore does not spend `ROLLOVER_CA_A`'s
+  allowance of none.
+- **Proven load-bearing by neutering `self_issued` to `false`:** the rollover path is then refused with
+  `PathLengthExceeded { ca: Chain(2), allowed: 0, found: 1 }`. Restored, and the restore verified by an empty
+  `git diff` on `chain.rs`.
+- **The test carries its own contrast**, so the assertion is about self-issuance rather than about
+  permissiveness: the sibling strict CA, one property different, does refuse its non-self-issued child.
+- **The oracle agreed with us only after the fixtures became realistic, and that disagreement was the most
+  useful thing in the slice.** With no key identifiers, OpenSSL matched these certificates **by subject name
+  alone** — a rollover is ambiguous that way by construction — and refused two sound paths with error 7
+  ("certificate signature failure") and error 19 ("self-signed certificate in certificate chain") *while this
+  crate accepted them*. That is a disagreement in the direction the oracle test forbids, and it correctly
+  refused to let me write it off as a divergence. The fix was the fixtures: these three, and only these three,
+  now carry `subjectKeyIdentifier`/`authorityKeyIdentifier`, and both paths then agree. So the earlier
+  `-x509_strict` finding (error 85, missing AKI/SKI) is not a strict-mode nicety — key identifiers are how a
+  real verifier tells two same-DN certificates apart, and without them the *fixtures* are what is unrealistic.
+- It also closes the loop on the `-auth_level`/`-partial_chain` flags: no flag made OpenSSL take the rollover
+  path, because no flag substitutes for a key identifier.
+- **216 checks green** on both paths (215 before), clippy, fmt, `cargo doc` zero warnings, workspace check exit
+  0, generator output fmt-stable. 27 fixtures, 21 oracle paths, 5 recorded divergences (all strict).
+
 ### hearth-tls slice 16 — what the oracle says about chain *shape*: selection, not ordering (buffy, 2026-10-16)
 
 Four paths added to the oracle table, all about the shape of the presented list rather than about a rule:

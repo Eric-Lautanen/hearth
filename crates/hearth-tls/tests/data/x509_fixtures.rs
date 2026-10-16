@@ -337,26 +337,26 @@ const SELF_SIGNED_PSS_DER_HEX: &str = "\
     a00f300d060960864801650304020105 \
     00a11c301a06092a864886f70d010108 \
     300d06096086480165030402010500a2 \
-    030201200382010100529b54bd51e581 \
-    227cf988804e9023c292b3447269e633 \
-    60808f21faff23b4bb347d890342d965 \
-    4328a7d3e15cbbbd39eb344aaba90a8b \
-    f9a1b0fe24c7160a521ea7376c1cab32 \
-    9fafa77edaa95f426f711b672ece9436 \
-    72b911d9ddce8aadaeb7965ae91ae89c \
-    4f83d26a017e4dd3f64c8a562ed4889c \
-    367a4866719c5ca6eb5329a55f39d206 \
-    9648ee83d4f154f277768826394c850d \
-    1d1d5b07b7b14b3dcdd8a5c337f33d99 \
-    0e218086d323bce92c94e1b754cd96bd \
-    3fe6b970a506e8281a0d3f1218ff959a \
-    49bebcebfde30a025f732bddf1bc1d59 \
-    99084141909d21e6ed4a9f02dea56623 \
-    1a15aa28326e0a349056d7437fdc42dc \
-    f814d738fc6d8330e3";
+    0302012003820101001c258cf0ce0c86 \
+    049b347d5cdf83c9a50c88954cd00ff7 \
+    f2f67e1f0f22f355b20c2a784f2742b5 \
+    8c6f39e0f6b63db73fb8aef5c14d4462 \
+    0fbe95d26f7b53715ce02011c6ed7eae \
+    ec4bff34e136c510786e6d8be8e09165 \
+    64887cc5186a91edd24db7dacdc8d86f \
+    b49fe5eaaa6078eaab54c0e463bb9c38 \
+    6542a9f76769e80fa3299cf9a9d17c4e \
+    74ed565ea8c17418ed545619adb1b4f0 \
+    610cc7c7c43b87ed31ae4c3bd868148d \
+    98363a883ee4bce56a55e71da8c7e50b \
+    917e0338df63e5e4726795f80bc75469 \
+    82855f9f70d35ff88d7cd1dc725e9c96 \
+    d515df233ef0396707c9021e09c8e591 \
+    9efa92dd4f598b039212570d2e69d45a \
+    e4eaa511afe527405d";
 
 const SELF_SIGNED_EC_DER_HEX: &str = "\
-    3082012c3081d3a00302010202010530 \
+    3082012b3081d3a00302010202010530 \
     0a06082a8648ce3d0403023020311e30 \
     1c06035504030c154865617274682054 \
     657374204543205369676e6572301e17 \
@@ -370,11 +370,11 @@ const SELF_SIGNED_EC_DER_HEX: &str = "\
     27fd8842b82a3c83ecdc4bdf6a127b19 \
     a1e45d97156f12892b872beb322d51ae \
     6b74f42964944f0641a3300a06082a86 \
-    48ce3d040302034800304502200b6d78 \
-    23ea21238d1a747922ef44bc0ac18c01 \
-    7080eba7f0f76a72ce4c1524f9022100 \
-    844b4eb7b807e748299f829e5de21fdc \
-    31db20a41ebc298915a59d82731612e6";
+    48ce3d0403020347003044022025e299 \
+    8c17c9cf99203f91d76807b2ff9cae47 \
+    4c7fa0a4f9b117fbb666396f21022066 \
+    7b4a505811cd5e29abe4fcb3019f3781 \
+    3c001792f628887a7f969f12ee9267";
 
 const LEAF_UNKNOWN_CRITICAL_DER_HEX: &str = "\
     30820300308201e8a003020102020106 \
@@ -1149,6 +1149,167 @@ const LEAF_OF_NON_CA_SIGNER_DER_HEX: &str = "\
     2c889434e6856c2a9829ee5df62bc4ea \
     a64564067bbe690f6b79";
 
+const ROLLOVER_CA_A_DER_HEX: &str = "\
+    3082032130820209a003020102020140 \
+    300d06092a864886f70d01010b050030 \
+    1e311c301a06035504030c1348656172 \
+    7468205465737420526f6f7420434130 \
+    1e170d3236303130313030303030305a \
+    170d3237303130313030303030305a30 \
+    223120301e06035504030c1748656172 \
+    7468205465737420526f6c6c6f766572 \
+    20434130820122300d06092a864886f7 \
+    0d01010105000382010f003082010a02 \
+    82010100a70c7e28ceb7fb947cb1d959 \
+    ad69ca9f33e1464c0e237689dfa471fd \
+    640ca29f7df5147e68f2a5cb877f25ec \
+    a05afb9d32d6b270f4d1ead82aa2f10e \
+    a010997e0454b9785afd34923e8a347e \
+    2b1b36e36b315828d57ec2db4e100ef4 \
+    5bc4ef581c62b3054ddac08367d138af \
+    d7da85b3d2090c688ec0ebb7e80c5e7a \
+    e2fa85405ba9507798db274cc404d413 \
+    9b99a8c07ac5218d666ea4fb356eb521 \
+    7859638265295ad497cb52cc1c9ae2ab \
+    0e743a9c067277f27edb1b4222863bf7 \
+    54aeb10c944a45833ded384591ab293b \
+    91a8bb588861ad18f40750cb71d2764c \
+    e17b169885e01d6d2ce4bf4919ddaf1a \
+    d3060c2c2bf7ce5f7232c451e6ba72f6 \
+    35ef396b0203010001a3663064301206 \
+    03551d130101ff040830060101ff0201 \
+    00300e0603551d0f0101ff0404030201 \
+    06301d0603551d0e0416041467c2441e \
+    be11170cbf2441bc545e78215582694b \
+    301f0603551d230418301680142cceca \
+    4ed77514bd86af4fd28087791eceeeca \
+    a8300d06092a864886f70d01010b0500 \
+    03820101006545bc795476f2d94bc53d \
+    d823165f709f57ede810afb7faace785 \
+    d8ca0ddb2fa28587339aa5053d55e809 \
+    992ee4c786c6fb94bb0b899ec617d336 \
+    5d018260a71d7410126a16cf477ef67b \
+    55a6714e5945caf901a383807e334312 \
+    b04aaf9394774b071765b46d39729eff \
+    3151e79d80e2278f496a37d22ec4dca9 \
+    b3269f4bbed1aa9dcc8368cb8c469fd8 \
+    4d3d9e7415132e3ecb21d9ee2f64b181 \
+    9d19c4f24d9695f49dd45661302f70fa \
+    fe87b38038fdc622dfaa345e587a3436 \
+    da1d640199c34f3ebb8c9fa359020336 \
+    1bf3eb20764da00d1643889fbd522cf0 \
+    f0479a9515c41179f1a87d3752c709cf \
+    9defa699b74dd596fe9ce4223f596a8e \
+    d34feea1d4";
+
+const ROLLOVER_CA_B_DER_HEX: &str = "\
+    308203253082020da003020102020141 \
+    300d06092a864886f70d01010b050030 \
+    223120301e06035504030c1748656172 \
+    7468205465737420526f6c6c6f766572 \
+    204341301e170d323630313031303030 \
+    3030305a170d32373031303130303030 \
+    30305a30223120301e06035504030c17 \
+    486561727468205465737420526f6c6c \
+    6f76657220434130820122300d06092a \
+    864886f70d01010105000382010f0030 \
+    82010a0282010100b741c793170956a6 \
+    b90b8f4ea1cee38015eac55c01391d3f \
+    a0212ab58c7a1104265cba77d438d581 \
+    e528b51e47becf1f95a6f94c6df164ea \
+    b5507cda6da9e5c094a4d2aa95a4f286 \
+    6c170615d42c2706674921bdbd742b30 \
+    ebf707f55d211a31b2e6841c12844ce4 \
+    5f02e8222cf8d6980c71c0f25b92050c \
+    d748b61c141732cecbbfbf3cd2972eee \
+    b89999a0a110a2e6856d6d389da63502 \
+    3164b6e9c9bdfafdef1bd622b86eba22 \
+    60fdc8540d352da9b3475eaad234b467 \
+    545412d25fbad5e80975ca23ad5ced76 \
+    cb0334acc526dba5ea86434b8d9639c1 \
+    ab5ee7686ac036ceaa5cc40cdb39ce9f \
+    73ec868a0c240d9faa7c4a3560e06245 \
+    040b033eed2828e10203010001a36630 \
+    6430120603551d130101ff0408300601 \
+    01ff020100300e0603551d0f0101ff04 \
+    0403020106301d0603551d0e04160414 \
+    f861c94f931a4c8dcda4aa3859d52319 \
+    0a85dff7301f0603551d230418301680 \
+    1467c2441ebe11170cbf2441bc545e78 \
+    215582694b300d06092a864886f70d01 \
+    010b050003820101000a9b86d2e91207 \
+    adc91d9f105992b52595de77520867b5 \
+    a963c25608b0f152c95960c6fcb68455 \
+    2fcc045ffc474bf664dc5cf2d822ee44 \
+    3441145ccaef983b71c848e5b20c7377 \
+    0563171639a0efa0ed819d7926612fa8 \
+    b0239d55457106b97ff46d705df4fc25 \
+    6bf4dec182e7df41b1b1ff60efa8f222 \
+    7124d3152aabd8fc6ed96123b046d424 \
+    844487e81f5a570f757240f91be76a61 \
+    9a50de6fa8167f9dbc0cc8644b5b23b7 \
+    dc1571c0bf8ce52d1fbbb4a53f640443 \
+    6fd6bb8fa56bd46ead25f6490e90b1fb \
+    44027bdfbf896afdf60c601603edd5a6 \
+    323fc425a4425f4d747075390ab59830 \
+    5e5c0fa4181dcc986df33b77a2794df0 \
+    2c5909c5adf6600148";
+
+const LEAF_OF_ROLLOVER_CA_B_DER_HEX: &str = "\
+    3082034c30820234a003020102020142 \
+    300d06092a864886f70d01010b050030 \
+    223120301e06035504030c1748656172 \
+    7468205465737420526f6c6c6f766572 \
+    204341301e170d323630313031303030 \
+    3030305a170d32373031303130303030 \
+    30305a301b3119301706035504030c10 \
+    726f6c6c6f7665722e6578616d706c65 \
+    30820122300d06092a864886f70d0101 \
+    0105000382010f003082010a02820101 \
+    00a18266f277e87fe61f2fa014b14182 \
+    4fa40ff2bc6d4b6d2c56408002eca34b \
+    42ec4573822ad8f42ea35d8a2ff0cf3f \
+    3cb2bc7a995593232608892ed6bdbc90 \
+    ace6abe63185fdedf9802224d2083d46 \
+    d8ac37c3004b9ad4393ed3908ec480b5 \
+    c54ced5e57c0c8098501aa11e9ebc09a \
+    96043d0b37fcc1bda76027b939010145 \
+    11c4313709c107ef07e71955ff9d56a7 \
+    a97a6e62ae7531730827e5e469c366da \
+    85576c4589d0923fd0325f8892f27787 \
+    82b9c9680d5f9a22349cd64e202f4ab9 \
+    efae71ef05fde7bdfe08b7857a617d4f \
+    dd90d7053edb0326a774a3a1ff11e0e9 \
+    4331b33977fb60a1fc389c42f6b520b6 \
+    1c88a1e9286c766827b7eb9ca064b1c4 \
+    c10203010001a38193308190300c0603 \
+    551d130101ff04023000300e0603551d \
+    0f0101ff04040302078030130603551d \
+    25040c300a06082b0601050507030130 \
+    1b0603551d11041430128210726f6c6c \
+    6f7665722e6578616d706c65301d0603 \
+    551d0e04160414f977004d17c947cc10 \
+    a11b2953b4ded9d27e8c71301f060355 \
+    1d23041830168014f861c94f931a4c8d \
+    cda4aa3859d523190a85dff7300d0609 \
+    2a864886f70d01010b05000382010100 \
+    095a1be2dbebb4ed565a2cb987542504 \
+    31d1cba40e8e18ca1fbe8a2ff9c1ea48 \
+    976ebabdceb77163569fbe9ebfdcaed4 \
+    a35eadc43cdf3b8339f23abb5baf4e12 \
+    95682884d1fdfefae7bd4dc1b8ef267c \
+    3565844a6daeb473fa3babf9390fc2fe \
+    26935764410b2a2788f750661614917a \
+    1e214b4809ff01f4995ba127d9f211d7 \
+    762fbaa0e21f0205aebf5c45561baa9a \
+    3061bf9f209134537ee2b6bb3785254f \
+    ef3ca59a8ba0eabd00954b23c3847573 \
+    2d984d379c4409774102033cc4c9e732 \
+    4e3a2c339ffaa91845ad894201355e44 \
+    8ea27ec0613add112838c014b3101c56 \
+    a9e080656eede9059112924870820ba8 \
+    0e7ea8021bef6d46ede50508c684620e";
+
 /// What OpenSSL's parser says about each fixture above.
 const EXPECTATIONS: &[(&str, Expectation)] = &[
     (
@@ -1294,8 +1455,8 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
     (
         "SELF_SIGNED_EC",
         Expectation {
-            der_len: 304,
-            signature_len: 71,
+            der_len: 303,
+            signature_len: 70,
             version: 3,
             subject_cn: "Hearth Test EC Signer",
             issuer_cn: "Hearth Test EC Signer",
@@ -1631,6 +1792,66 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             key: Key::Rsa { modulus: "992a7521ad3ccfa08a5aa128bfacba3ac95b6c7a6cd7e08c0dba575c9e53d398a7bc307c98a91607547a403138f7be38a7f76201136bcce963f1e103236f56c95e0f365a5446329507cd6620dc72e20a34f3a205806c0f2b4b930bb23ede00780976c46e6a29d0412a05ae637494f911ba3fcd26ced94f23c1a67c09887202209afc5ca80c8bb1ccb3ce3f60d8a87971ff76c6f6ee374a9c5839dc79b84bc2174ad62dc9c5cfff7b0b517a2e877af29bc20d8c6dafbec9160aead72d8d0056a27b7c08cc195e928a8618ff2f0f0c465ec2fb1b43eaa0577dea81805024e326670b0588dd91f85f2a899d4c60da083ee705ee2c9621adfee6cb94f819af1c9d19", exponent: 65537 },
         },
     ),
+    (
+        "ROLLOVER_CA_A",
+        Expectation {
+            der_len: 805,
+            signature_len: 256,
+            version: 3,
+            subject_cn: "Hearth Test Rollover CA",
+            issuer_cn: "Hearth Test Root CA",
+            serial_hex: "40",
+            not_before: 1767225600,
+            not_after: 1798761600,
+            is_ca: true,
+            has_basic_constraints: true,
+            path_len: Some(0),
+            key_usage: Some(0x060),
+            san_dns: &[],
+            signature_algorithm: "1.2.840.113549.1.1.11",
+            key: Key::Rsa { modulus: "a70c7e28ceb7fb947cb1d959ad69ca9f33e1464c0e237689dfa471fd640ca29f7df5147e68f2a5cb877f25eca05afb9d32d6b270f4d1ead82aa2f10ea010997e0454b9785afd34923e8a347e2b1b36e36b315828d57ec2db4e100ef45bc4ef581c62b3054ddac08367d138afd7da85b3d2090c688ec0ebb7e80c5e7ae2fa85405ba9507798db274cc404d4139b99a8c07ac5218d666ea4fb356eb5217859638265295ad497cb52cc1c9ae2ab0e743a9c067277f27edb1b4222863bf754aeb10c944a45833ded384591ab293b91a8bb588861ad18f40750cb71d2764ce17b169885e01d6d2ce4bf4919ddaf1ad3060c2c2bf7ce5f7232c451e6ba72f635ef396b", exponent: 65537 },
+        },
+    ),
+    (
+        "ROLLOVER_CA_B",
+        Expectation {
+            der_len: 809,
+            signature_len: 256,
+            version: 3,
+            subject_cn: "Hearth Test Rollover CA",
+            issuer_cn: "Hearth Test Rollover CA",
+            serial_hex: "41",
+            not_before: 1767225600,
+            not_after: 1798761600,
+            is_ca: true,
+            has_basic_constraints: true,
+            path_len: Some(0),
+            key_usage: Some(0x060),
+            san_dns: &[],
+            signature_algorithm: "1.2.840.113549.1.1.11",
+            key: Key::Rsa { modulus: "b741c793170956a6b90b8f4ea1cee38015eac55c01391d3fa0212ab58c7a1104265cba77d438d581e528b51e47becf1f95a6f94c6df164eab5507cda6da9e5c094a4d2aa95a4f2866c170615d42c2706674921bdbd742b30ebf707f55d211a31b2e6841c12844ce45f02e8222cf8d6980c71c0f25b92050cd748b61c141732cecbbfbf3cd2972eeeb89999a0a110a2e6856d6d389da635023164b6e9c9bdfafdef1bd622b86eba2260fdc8540d352da9b3475eaad234b467545412d25fbad5e80975ca23ad5ced76cb0334acc526dba5ea86434b8d9639c1ab5ee7686ac036ceaa5cc40cdb39ce9f73ec868a0c240d9faa7c4a3560e06245040b033eed2828e1", exponent: 65537 },
+        },
+    ),
+    (
+        "LEAF_OF_ROLLOVER_CA_B",
+        Expectation {
+            der_len: 848,
+            signature_len: 256,
+            version: 3,
+            subject_cn: "rollover.example",
+            issuer_cn: "Hearth Test Rollover CA",
+            serial_hex: "42",
+            not_before: 1767225600,
+            not_after: 1798761600,
+            is_ca: false,
+            has_basic_constraints: true,
+            path_len: None,
+            key_usage: Some(0x001),
+            san_dns: &["rollover.example"],
+            signature_algorithm: "1.2.840.113549.1.1.11",
+            key: Key::Rsa { modulus: "a18266f277e87fe61f2fa014b141824fa40ff2bc6d4b6d2c56408002eca34b42ec4573822ad8f42ea35d8a2ff0cf3f3cb2bc7a995593232608892ed6bdbc90ace6abe63185fdedf9802224d2083d46d8ac37c3004b9ad4393ed3908ec480b5c54ced5e57c0c8098501aa11e9ebc09a96043d0b37fcc1bda76027b93901014511c4313709c107ef07e71955ff9d56a7a97a6e62ae7531730827e5e469c366da85576c4589d0923fd0325f8892f2778782b9c9680d5f9a22349cd64e202f4ab9efae71ef05fde7bdfe08b7857a617d4fdd90d7053edb0326a774a3a1ff11e0e94331b33977fb60a1fc389c42f6b520b61c88a1e9286c766827b7eb9ca064b1c4c1", exponent: 65537 },
+        },
+    ),
 ];
 
 /// What the OpenSSL CLI says about each of these paths.
@@ -1775,6 +1996,26 @@ const VERIFY_CASES: &[VerifyCase] = &[
         name: "root-included-in-the-chain",
         chain: &["LEAF_RSA", "INTERMEDIATE", "ROOT"],
         anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: None,
+    },
+    VerifyCase {
+        name: "key-rollover-self-issued-intermediate",
+        chain: &["LEAF_OF_ROLLOVER_CA_B", "ROLLOVER_CA_B", "ROLLOVER_CA_A"],
+        anchors: &["ROOT"],
+        attime: 1767225600,
+        openssl_ok: true,
+        openssl_error: None,
+        openssl_depth: None,
+        divergence: None,
+    },
+    VerifyCase {
+        name: "rollover-pinned-at-the-newer-ca",
+        chain: &["LEAF_OF_ROLLOVER_CA_B", "ROLLOVER_CA_B"],
+        anchors: &["ROLLOVER_CA_A"],
         attime: 1767225600,
         openssl_ok: true,
         openssl_error: None,

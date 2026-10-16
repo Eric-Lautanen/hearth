@@ -219,6 +219,22 @@ def verify_cases():
         ("strict-sibling-CA-as-the-anchor", ["LEAF_SUB_STRICT", "SUB_CA_STRICT"], ["TOP_CA_STRICT"], "LEAF_SUB_STRICT", None),
         ("root-included-in-the-chain", ["LEAF_RSA", "INTERMEDIATE", "ROOT"], ["ROOT"], "LEAF_RSA", None),
         (
+            "key-rollover-self-issued-intermediate",
+            ["LEAF_OF_ROLLOVER_CA_B", "ROLLOVER_CA_B", "ROLLOVER_CA_A"],
+            ["ROOT"],
+            "LEAF_OF_ROLLOVER_CA_B",
+            None,
+        ),
+        (
+            # The anchor shares the last certificate's distinguished name without being it,
+            # which is the branch of the anchor-side count nothing else reaches.
+            "rollover-pinned-at-the-newer-ca",
+            ["LEAF_OF_ROLLOVER_CA_B", "ROLLOVER_CA_B"],
+            ["ROLLOVER_CA_A"],
+            "LEAF_OF_ROLLOVER_CA_B",
+            None,
+        ),
+        (
             "chain-out-of-order",
             ["LEAF_RSA", "ROOT", "INTERMEDIATE"],
             ["ROOT"],
@@ -371,6 +387,9 @@ def main():
     leaf_of_weak_key = rsa_key(20261104)
     non_ca_signer_key = rsa_key(20261201)
     leaf_of_non_ca_key = rsa_key(20261202)
+    rollover_ca_a_key = rsa_key(20261301)
+    rollover_ca_b_key = rsa_key(20261302)
+    leaf_of_rollover_key = rsa_key(20261303)
 
     def usage(**flags):
         """A `KeyUsage` with only the named bits set."""
@@ -883,6 +902,82 @@ def main():
         .sign(non_ca_signer_key, hashes.SHA256())
     )
 
+    # A **key rollover**: a CA that re-issues itself under the same distinguished name with
+    # a new key, and a leaf under the new one. RFC 5280 calls such a certificate
+    # *self-issued* — the same DN in the subject and issuer fields, whatever key signed it —
+    # and §4.2.1.9 excludes self-issued certificates from a `pathLenConstraint` count, which
+    # is what makes a rollover possible at all. No other fixture here is self-issued except
+    # the roots, so without this pair the branch that does the excluding never excludes
+    # anything.
+    #
+    # These three, and only these three, carry `subjectKeyIdentifier` and
+    # `authorityKeyIdentifier`. That is not decoration: a rollover is *ambiguous by subject
+    # name alone*, and without the key identifiers a verifier that matches by name picks the
+    # wrong certificate — OpenSSL does, and reports either a signature failure (error 7) or
+    # a self-signed certificate in the chain (error 19) on paths that are in fact sound. The
+    # rest of the set omits them deliberately: it keeps those certificates minimal, and it
+    # is what makes `openssl verify -x509_strict` refuse every one of them.
+    def key_identifiers(builder, subject_key, issuer_key):
+        return (
+            builder
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(subject_key.public_key()),
+                critical=False,
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+                critical=False,
+            )
+        )
+
+    rollover_ca_a = key_identifiers(
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test Rollover CA"))
+        .issuer_name(root.subject)
+        .public_key(rollover_ca_a_key.public_key())
+        .serial_number(0x40)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(key_cert_sign=True, crl_sign=True), critical=True),
+        rollover_ca_a_key,
+        root_key,
+    ).sign(root_key, hashes.SHA256())
+
+    rollover_ca_b = key_identifiers(
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test Rollover CA"))
+        .issuer_name(rollover_ca_a.subject)
+        .public_key(rollover_ca_b_key.public_key())
+        .serial_number(0x41)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(usage(key_cert_sign=True, crl_sign=True), critical=True),
+        rollover_ca_b_key,
+        rollover_ca_a_key,
+    ).sign(rollover_ca_a_key, hashes.SHA256())
+
+    leaf_of_rollover_ca_b = key_identifiers(
+        x509.CertificateBuilder()
+        .subject_name(name("rollover.example"))
+        .issuer_name(rollover_ca_b.subject)
+        .public_key(leaf_of_rollover_key.public_key())
+        .serial_number(0x42)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("rollover.example")]), critical=False
+        ),
+        leaf_of_rollover_key,
+        rollover_ca_b_key,
+    ).sign(rollover_ca_b_key, hashes.SHA256())
+
     # A leaf whose unknown extension is marked **critical**. RFC 5280 requires a
     # reader that does not understand a critical extension to reject the
     # certificate, so this one must not parse.
@@ -930,6 +1025,9 @@ def main():
         ("LEAF_OF_WEAK_ANCHOR", leaf_of_weak_anchor),
         ("NON_CA_SIGNER", non_ca_signer),
         ("LEAF_OF_NON_CA_SIGNER", leaf_of_non_ca_signer),
+        ("ROLLOVER_CA_A", rollover_ca_a),
+        ("ROLLOVER_CA_B", rollover_ca_b),
+        ("LEAF_OF_ROLLOVER_CA_B", leaf_of_rollover_ca_b),
     ]
 
     # `//` rather than `//!`: this file is pulled in with `include!`, so an inner
