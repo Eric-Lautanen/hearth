@@ -38,6 +38,55 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 4 — the record layer, pinned by RFC 8448's own record (buffy, 2026-10-16)
+
+`record.rs`: AEAD framing, the nonce from the sequence number, the encrypted
+header as additional data, and the record-type-in-inner-plaintext construction.
+**55 tests, green on both the hardware and the forced-software path**, clippy
+`-D warnings` and fmt clean, still `std`-only with an empty `[dependencies]`.
+
+**The fixture is a real published record, and it was verified before it was
+trusted.** `researcher-web` was sent for RFC 8448 §3's client application traffic
+secret and was told to report exact bytes and to say "not published" rather than
+infer. The returned values were then re-derived here with the independent
+OpenSSL-backed library before being embedded: `HKDF-Expand-Label(secret, "key", "", 16)`
+and `("iv", "", 12)` reproduce the RFC's `17422dda596ed5d9acd890e3c63f5051` /
+`5b78923dee08579033e523d9`, and rebuilding the record from scratch (nonce = IV XOR
+sequence 0, AAD = `17 03 03 00 43`, inner = the 50-byte payload plus `0x17`)
+reproduces the RFC's ciphertext and tag exactly. Only then did the crate assert
+it. That one fixture pins four separate decisions at once: the nonce
+construction, the header-as-AAD rule, the inner content-type byte, and the
+`ciphertext || tag` layout. A second test walks the same secret through
+`TrafficKeys::from_secret`, which is what validates the `tls13 key` / `tls13 iv`
+labels and the empty context in `hkdf_expand_label`.
+
+**Design decisions worth keeping.** The sequence number lives in `RecordLayer`,
+is incremented exactly when a record is sealed or opened, has no setter, and
+returns `SequenceExhausted` rather than wrapping — nonce reuse is prevented
+structurally, since the primitive cannot detect it. A record that fails
+authentication or framing returns an error and no plaintext, and does **not**
+advance the sequence; a record that authenticates but carries an invalid content
+type is likewise fatal. `seal_padded` supports the optional zero padding of
+§5.4 and the receiver strips it without being told it was there. `key_update` and
+the alert protocol are deliberately left to the handshake slice, with
+`TrafficKeys::from_secret` as the seam a rekey uses.
+
+Coverage beyond the fixture: round-trip at every content type across lengths
+0/1/15/16/17/255/1000/16384; the padding path; the sequence number provably
+being part of the nonce (a receiver that skips a record fails); repeated
+plaintext never producing repeated ciphertext; tampering with each of the five
+fields (ciphertext, tag, outer type, length, version) rejected with the specific
+error and without consuming a sequence number; the length limits; and the
+`0x00` content type being treated as padding rather than as data.
+
+**Two of the failures in this slice were my own test expectations, not the code.
+Both are the kind of mistake that looks like a product bug.** The `length field`
+tamper moved the *high* byte of a length that is already below 256, so it changed
+nothing and the record legitimately opened; and a test reused a receiver after a
+fatal record, forgetting that a failed record does not advance the sequence, so
+the second open failed authentication for a legitimate reason. Worth recording
+because in both cases the assertion was the wrong thing, not the implementation.
+
 ### hearth-tls slice 3 — AES-NI and PCLMULQDQ, runtime-dispatched (buffy, 2026-10-16)
 
 Measured on one binary, interleaved, with `HEARTH_TLS_NO_HW=1` forcing the software path

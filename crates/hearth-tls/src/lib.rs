@@ -36,6 +36,11 @@
 //!   RFC 7748 §6.1 requires, made unskippable by having no unchecked API for
 //!   protocol code to reach for
 //!
+//! - [`record`] — the record layer: AEAD framing, the nonce derived from the
+//!   sequence number, the encrypted header as additional data, and the TLS 1.3
+//!   record-type-in-inner-plaintext trick. Pinned by RFC 8448's published
+//!   protected record, byte for byte.
+//!
 //! On x86_64, AES-NI and PCLMULQDQ are used when the CPU reports them
 //! (`crate::aesni`, `crate::ghash_x86`); the software implementations stay in
 //! place as the reference the accelerated paths are tested against, and as what
@@ -43,11 +48,11 @@
 //! instance actually took.
 //!
 //! Still to come, in the order the handshake needs them:
-//! 1. **The record layer** — AEAD framing, nonce construction from the
-//!    sequence number, and the TLS 1.3 record-type-in-inner-plaintext trick.
-//! 4. **The handshake** — ClientHello/ServerHello, key schedule, transcript
-//!    hash, Finished MAC verification (a wrong MAC must abort, not warn).
-//! 5. **Certificate verification** — the largest and most dangerous piece:
+//! 1. **The handshake** — ClientHello/ServerHello, the key schedule, the
+//!    transcript hash, and Finished MAC verification (a wrong MAC must abort,
+//!    not warn). Including `key_update`, which reuses
+//!    [`record::TrafficKeys::from_secret`].
+//! 2. **Certificate verification** — the largest and most dangerous piece:
 //!    X.509 chain building, ECDSA/RSA signature checks and a pinned root
 //!    store. Deliberately last, and deliberately not attempted until the
 //!    transport below it is solid.
@@ -68,6 +73,7 @@ pub(crate) fn hardware_disabled() -> bool {
 pub mod aes;
 pub mod gcm;
 pub mod hkdf;
+pub mod record;
 pub mod sha256;
 pub mod x25519;
 
@@ -79,5 +85,6 @@ pub(crate) mod ghash_x86;
 pub use aes::Aes128;
 pub use gcm::{Aes128Gcm, GcmError, NONCE_LEN, TAG_LEN};
 pub use hkdf::{derive_secret, derive_secret32, hkdf_expand, hkdf_expand_label, hkdf_extract};
+pub use record::{Record, RecordError, RecordLayer, TrafficKeys};
 pub use sha256::{hmac_sha256, hmac_sha256_parts, Sha256};
 pub use x25519::{diffie_hellman, public_key, x25519, SharedSecretError, BASEPOINT};

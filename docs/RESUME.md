@@ -60,12 +60,24 @@
    Note the corrected framing in that entry: software GCM at 26 MB/s still stays ahead of a 100 Mbps
    link, so the old "56% of the transfer" claim was an overstatement — it is CPU time, and it only
    caps throughput on gigabit links and local mirrors.
-3. **Then the record layer**, which is what the downloader actually needs next: AEAD framing, the
-   nonce derived from the record sequence number (GCM nonce reuse is catastrophic and the primitive
-   cannot detect it), the 16 KiB record size limit, and the TLS 1.3 record-type-in-inner-plaintext
-   trick. Then the handshake (ClientHello/ServerHello, key schedule, transcript hash, a **fatal**
-   Finished-MAC check), then certificate verification last. Consider `aarch64` PMULL/AES as well, so
-   macOS gets the slice-3 numbers instead of the software path.
+3. **Record layer: DONE (buffy, 2026-10-16).** `record.rs` does AEAD framing, derives the nonce from
+   the sequence number (owned by the struct, no setter, `SequenceExhausted` rather than wrapping), uses
+   the encrypted header as AAD, and implements the record-type-in-inner-plaintext trick with optional
+   padding. **55 tests green on both the hardware and the forced-software path.** The fixture is
+   RFC 8448's own protected `application_data` record, obtained via `researcher-web` and then
+   **re-derived here with the independent OpenSSL-backed library before being embedded** — the
+   published key, the IV and the whole record all reproduce from the traffic secret, which pins the
+   nonce, the AAD, the inner content type and the layout at once. Details: BUG_TRACKER "slice 4".
+4. **Next: the handshake**, the last piece before the downloader can use any of this. Scope:
+   ClientHello/ServerHello with `TLS_AES_128_GCM_SHA256`, `x25519` key share (already available), the
+   full key schedule from `HKDF-Extract` through `Derive-Secret` and the `traffic upd`/`key`/`iv`
+   labels, the transcript hash over the handshake messages, and **Finished MAC verification where a
+   mismatch aborts the connection**. RFC 8448 has published vectors for every intermediate secret and
+   for the handshake messages themselves, so this slice can be driven entirely by published values
+   the same way slices 2-4 were — obtain them through `researcher-web` and re-derive them locally
+   before trusting them. Also on the list: the alert protocol, `key_update` (which reuses
+   `record::TrafficKeys::from_secret`), and `aarch64` PMULL/AES so macOS gets the slice-3 numbers.
+   Only then certificate verification, and **nothing may take an `https://` path until that exists**.
    **Verification policy is fixed: fatal, never downgradeable — no switch that a URL or a user can
    reach can weaken it.**
    - `Transport` in `hearth-ui/src/http.rs` is the seam and is already written for this; the `https://`
@@ -81,7 +93,7 @@
      it in the order given above and land it with negative tests (bad signature, expired, unknown
      root, hostname mismatch) before any URL is allowed to use it. Do not let the downloader take an
      `https://` path through this code until those tests exist.
-4. **The downloader defect I found: FIXED by SparkOC (`c8782dc`) and re-verified by me end to end —
+5. **The downloader defect I found: FIXED by SparkOC (`c8782dc`) and re-verified by me end to end —
    closed.** The dead end was a full-size `.part` plus a **416** to `Range: bytes=<size>-`. Both
    candidate fixes landed (heal on 416, and `part_len()` awareness). I re-ran my own repro against
    the fixed binary rather than trusting the diff: the full-size case now goes `partial 100/100` →
@@ -92,7 +104,7 @@
    checked it against a host with a real A/AAAA pair, which is latent while catalog URLs are
    `https://` through curl and live the moment TLS routes them here. That is the one loose thread
    left in this item.
-5. **Size the chunked-prefill win before designing it.** There is still **zero weight reuse** in the
+6. **Size the chunked-prefill win before designing it.** There is still **zero weight reuse** in the
    hybrid prefill: it re-streams every weight row once per prompt token, so prefill's per-token cost
    is ~= decode's (4B: 144 vs 117 ms/token). A chunked forward would amortise the weight *unpacking*
    across the chunk while the MAC count scales with tokens, so the ceiling is roughly `1 - f` where
@@ -102,7 +114,7 @@
    tested primitive it needs (bit-identical to two single calls, **currently unreferenced** — do not
    re-wire it into `matmul_batch`, that path cannot reach PTQ1_0 models). An x4 variant regressed
    3.2× in pt 5.
-6. **Speculative decoding: measure acceptance before designing anything.** This is the strongest
+7. **Speculative decoding: measure acceptance before designing anything.** This is the strongest
    decode idea on the table and the cheapest thing to falsify. 2B PTQ1_0 decodes at **50.8 ms/token
    (18.15 tok/s)** against the 27B's ~722 ms, i.e. the draft is 14× cheaper, so with acceptance `a`
    and draft length `k` the gain is `(1-a^(k+1))/(1-a)` per `1+0.07k` target-equivalents: ≈1.8× at
@@ -117,21 +129,21 @@
    post-truncation distribution and must handle the stateful repeat penalty. Cost to plan for: **3 of
    every 4 `qwen35` layers are recurrent**, so a rejected draft token must rewind conv+SSM state, not
    just a KV cache.
-7. **Sweep for other silently-wrong feature gates.** `cpu_is_amd_zen4()` was the only family check,
+8. **Sweep for other silently-wrong feature gates.** `cpu_is_amd_zen4()` was the only family check,
    but the bug class is "a gate that is always-false or always-true". Grep `hearth-quant` and
    `hearth-llm` for `is_x86_feature_detected!`, `target_feature` and `avx512`, and confirm each
    gated kernel is on the *faster* path here. `cargo run --release -p hearth-llm --example benchk --
    <model.gguf> <dtype>` prints the CPUID decode, the kernel `dot_*_ptr` selects, and every variant's
    GB/s. Still open from the last session; nothing regressed while it waited.
-8. **Zen 5 (family 1Ah) and Intel must not regress.** The fix keys on 19h specifically so they keep
+9. **Zen 5 (family 1Ah) and Intel must not regress.** The fix keys on 19h specifically so they keep
    full-width AVX-512, and there is no such hardware here to confirm it.
-9. **Keep dispatch introspection honest for each new format.** `selected_kernel(dtype)` +
+10. **Keep dispatch introspection honest for each new format.** `selected_kernel(dtype)` +
    `dispatch_report()` cover PTQ1_0, PQ2_0, Q2_0, Q1_0 and Q1_0_G128; the `[kernel]` banner prints at
    load on both paths and the service exposes `event.model.kernels`. A new quant type must add a
    `kernel_name()` arm and a `selected_kernel` arm or it will silently have no reported dispatch.
    Agreed rule: add a format to `selected_kernel` only when it has more than one implementation to
    choose between.
-10. **Three small things.** (a) AGENTS.md's verifications block says `cargo test --test-threads=1 -p
+11. **Three small things.** (a) AGENTS.md's verifications block says `cargo test --test-threads=1 -p
    hearth-quant`, which cargo rejects — it must be `cargo test -p hearth-quant -- --test-threads=1`.
    (b) Re-run the benchmark mandate on a fully idle box interleaved with the reference fork
    (`bench_results/run_cpu_bench.bat`). (c) `cargo check -p hearth-diffusion` warns that
