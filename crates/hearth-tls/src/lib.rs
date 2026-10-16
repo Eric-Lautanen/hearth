@@ -36,6 +36,12 @@
 //!   RFC 7748 §6.1 requires, made unskippable by having no unchecked API for
 //!   protocol code to reach for
 //!
+//! On x86_64, AES-NI and PCLMULQDQ are used when the CPU reports them
+//! (`crate::aesni`, `crate::ghash_x86`); the software implementations stay in
+//! place as the reference the accelerated paths are tested against, and as what
+//! runs everywhere else. `Aes128Gcm::accelerated()` reports which paths an
+//! instance actually took.
+//!
 //! Still to come, in the order the handshake needs them:
 //! 1. **The record layer** — AEAD framing, nonce construction from the
 //!    sequence number, and the TLS 1.3 record-type-in-inner-plaintext trick.
@@ -46,11 +52,29 @@
 //!    store. Deliberately last, and deliberately not attempted until the
 //!    transport below it is solid.
 
+/// True if `HEARTH_TLS_NO_HW` is set, which forces every primitive onto its
+/// software path.
+///
+/// It exists so a benchmark can compare the two paths on one binary (this
+/// repository's rule is to interleave before believing a delta) and so CI can
+/// exercise the portable code on machines that have the instructions. It can
+/// only ever select the *slower* implementation — it cannot weaken
+/// verification, skip a check or accept a bad tag — and it is deliberately not
+/// reachable from a URL or from the record layer.
+pub(crate) fn hardware_disabled() -> bool {
+    std::env::var_os("HEARTH_TLS_NO_HW").is_some()
+}
+
 pub mod aes;
 pub mod gcm;
 pub mod hkdf;
 pub mod sha256;
 pub mod x25519;
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod aesni;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod ghash_x86;
 
 pub use aes::Aes128;
 pub use gcm::{Aes128Gcm, GcmError, NONCE_LEN, TAG_LEN};

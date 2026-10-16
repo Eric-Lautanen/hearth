@@ -38,6 +38,49 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 3 — AES-NI and PCLMULQDQ, runtime-dispatched (buffy, 2026-10-16)
+
+Measured on one binary, interleaved, with `HEARTH_TLS_NO_HW=1` forcing the software path
+(the switch can only ever select the *slower* implementation — it cannot weaken
+verification, which is why it was allowed to exist at all):
+
+| path | AES-128 block | AES-128-GCM seal | GCM open | X25519 |
+|------|---------------|------------------|----------|--------|
+| hardware (AES-NI + PCLMULQDQ) | **1304 MB/s** | **522-547 MB/s** | 556 MB/s | 14.1 k ops/s |
+| software | 68.8 MB/s | 26.4 MB/s | 26.5 MB/s | 14.1 k ops/s |
+
+Run 1 and run 3 (both hardware, software run between them) agreed within 0.5%, so this is
+not this box's usual 10-15% drift. **20x on GCM**, and a 4 GiB model drops from 159 s of
+CPU to 8 s. X25519 is unchanged because it is already field arithmetic with no table.
+
+**The reduction constant is derived, not transcribed.** The usual implementation
+byte-swaps and applies `0xc200000000000000`, a constant that works and that nobody can
+re-derive from the code. Instead: GCM reads a block with the leftmost bit as `x^0` and
+`x^128 ≡ x^7+x^2+x+1`, PCLMULQDQ reads the rightmost bit as `x^0`, and reversing the 128
+bits maps one onto the other — reversal commutes with multiplication, so reverse,
+multiply, reverse. In the reversed domain `·x^k` is a left shift, so the reduction is
+`p_lo ^ (p_hi · 0x87)` — shifts and XORs, no constant to trust. Two folds finish it, since
+`p_hi` has degree ≤ 126 and one fold leaves degree ≤ 133. The reasoning is written out in
+`ghash_x86.rs` and pinned by a 3800-pair differential test against the software multiply
+(including all-ones, single-high-bit and both-folds-needed shapes).
+
+**The acceleration is verified end-to-end, not only differentially:** the entire suite —
+FIPS-197, the NIST GCM cases, RFC 7748 including the 1000-iteration chain — passes **both**
+with hardware enabled and with `HEARTH_TLS_NO_HW=1`, 43 tests either way. That means the
+published vectors themselves run through the SIMD path.
+
+**One bug was mine, in a test, and the lesson is worth keeping.**
+`multiply_by_087_matches_a_shift_free_definition` failed against a correct implementation
+because my reference reconstruction accumulated the four shifted copies with bitwise **OR**,
+while polynomial addition in GF(2) is **XOR** — and the copies genuinely collide. The
+differential test had already passed, which is what told me to suspect the test rather than
+the code. A plausible-looking manual check can fail a correct implementation; prefer the
+comparison against an independent implementation.
+
+Remaining on this front: Apple silicon's crypto extensions (`aarch64` PMULL/AES) so macOS
+gets the same treatment, and multi-block pipelining plus aggregated GHASH powers if the
+record layer ever needs more than ~520 MB/s.
+
 ### hearth-tls slice 2 — AES-128-GCM and X25519 (buffy, 2026-10-16)
 
 `crates/hearth-tls` gained `aes.rs` (AES-128, forward only), `gcm.rs` (AES-128-GCM)
@@ -77,16 +120,17 @@ GCM verifies before it decrypts and has no API that returns unauthenticated plai
 | AES-128 block | 63.6 MB/s (240 ns/block) |
 | AES-128-GCM seal | 24.2 MB/s (1 MiB and 16 KiB alike) |
 | AES-128-GCM open | 24.3 MB/s |
-| X25519 | 78 us/op (12.9 k ops/s) |
-
-**This is the finding that sets the next slice.** GHASH dominates: solving
+| X25519 | 78 us/op (12.9 k ops/s) |**This is the finding that set the next slice.** GHASH dominated: solving
 `1/24.2 = 1/63.6 + 1/g` gives g ≈ 39 MB/s for GHASH alone, so AES-NI alone would only
-lift GCM to ~39 MB/s. A 4 GiB model therefore costs **169 s** of software decrypt — 56%
-on top of a 5-minute transfer at 100 Mbps — and an 8 GiB file costs more than the
-whole transfer. The bitwise GHASH is constant-time by construction (no table, no
-branch), and that is worth keeping as the reference path, but the downloader cannot
-ship on it: PCLMULQDQ GHASH is the required half, AES-NI the cheap half. X25519 at
-78 us is a non-issue either way.
+have lifted GCM to ~39 MB/s — PCLMULQDQ GHASH was the half that mattered. X25519 at
+78 us was a non-issue either way.
+
+**Corrected framing, and worth reading because I first got it wrong.** The 169 s for a
+4 GiB file is *CPU time*, not added latency. A 100 Mbps link delivers ~12 MB/s and the
+software path sustains 26 MB/s, so it stays ahead of the download and the cost is a busy
+core, not a slower transfer. It only becomes the bottleneck below the link rate — i.e. on
+a gigabit link or a local mirror. "56% on top of a 5-minute transfer" in the first draft
+conflated the two and was an overstatement; the corrected numbers are in slice 3 below.
 
 ### hearth-tls slice 1 — SHA-256, HMAC-SHA256 and the RFC 8446 key schedule (buffy, 2026-10-15)
 

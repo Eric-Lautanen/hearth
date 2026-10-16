@@ -16,16 +16,18 @@
 //!
 //! # Timing
 //!
-//! The S-box is a 256-byte table, i.e. four cache lines, so a local attacker who
-//! can observe this process's cache at that granularity can in principle
-//! recover key material (Bernstein 2005; Osvik–Shamir–Tromer 2006). Every other
-//! primitive here is written without data-dependent branches or lookups
-//! (constant-time GHASH, constant-time tag compare, constant-time X25519), and
-//! the intended fix for this one is hardware: AES-NI on x86_64 and
-//! `aarch64`'s crypto extensions, runtime-dispatched the way `hearth-quant`
-//! already dispatches its kernels. That is a separate, measurable slice; this
-//! module is the portable correctness baseline, and it is the path that runs on
-//! any target without those instructions.
+//! The software S-box is a 256-byte table, i.e. four cache lines, so a local
+//! attacker who can observe this process's cache at that granularity can in
+//! principle recover key material (Bernstein 2005; Osvik–Shamir–Tromer 2006).
+//! Every other primitive in this crate is written without data-dependent
+//! branches or lookups (constant-time GHASH, constant-time tag compare,
+//! constant-time X25519) and this one now has a hardware path too: on x86_64
+//! with AES-NI, [`Aes128::encrypt_block`] dispatches to `crate::aesni`, which
+//! has no table at all. [`Aes128::uses_hardware`] reports which one ran, so the
+//! caveat above applies only where it is true.
+//!
+//! Apple silicon's crypto extensions would remove the caveat on that target as
+//! well; until then macOS runs the software path here.
 
 /// Round constants (FIPS-197 §5.2), one per round key addition after the first.
 const RCON: [u8; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
@@ -104,6 +106,10 @@ pub(crate) const SBOX: [u8; 256] = build_sbox();
 pub struct Aes128 {
     /// 11 round keys of 16 bytes each (FIPS-197 §5.2).
     round_keys: [u8; 176],
+    /// Set once from the runtime probe in [`Aes128::new`], so the per-block
+    /// decision is a predictable branch instead of a CPUID query, and so this
+    /// field is the single justification for the `unsafe` call below.
+    aes_ni: bool,
 }
 
 impl Aes128 {
@@ -141,7 +147,16 @@ impl Aes128 {
             i += 4;
         }
 
-        Self { round_keys }
+        Self {
+            round_keys,
+            aes_ni: aes_ni_available(),
+        }
+    }
+
+    /// Whether block encryption is using AES-NI rather than the software
+    /// S-box path. Always `false` off x86_64.
+    pub fn uses_hardware(&self) -> bool {
+        self.aes_ni
     }
 
     /// The 176-byte key schedule, exposed for the FIPS-197 Appendix A vector.
@@ -149,8 +164,21 @@ impl Aes128 {
         &self.round_keys
     }
 
-    /// Encrypts one 16-byte block in place.
+    /// Encrypts one 16-byte block in place, via AES-NI where available.
     pub fn encrypt_block(&self, block: &mut [u8; 16]) {
+        if self.aes_ni {
+            // SAFETY: `aes_ni` is only ever true when the runtime probe in
+            // `new` reported the `aes` feature, which is exactly this call's
+            // requirement.
+            unsafe { crate::aesni::encrypt_block(&self.round_keys, block) };
+            return;
+        }
+        self.encrypt_block_software(block);
+    }
+
+    /// The portable path: same round keys, same rounds, S-box in software.
+    /// Kept as the reference the accelerated path is tested against.
+    pub fn encrypt_block_software(&self, block: &mut [u8; 16]) {
         add_round_key(block, &self.round_keys[..16]);
 
         let mut round = 1;
@@ -166,6 +194,22 @@ impl Aes128 {
         sub_bytes(block);
         shift_rows(block);
         add_round_key(block, &self.round_keys[160..176]);
+    }
+}
+
+/// Whether AES-NI is usable, or `false` on other architectures.
+#[inline]
+fn aes_ni_available() -> bool {
+    if crate::hardware_disabled() {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::aesni::available()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
     }
 }
 

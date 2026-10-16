@@ -35,10 +35,29 @@ fn main() {
         blocks as f64 / elapsed / 1e6
     );
 
+    // The same function with the hardware path ruled out, so the effect is
+    // measured in one process rather than inferred across builds.
+    let start = Instant::now();
+    for _ in 0..blocks {
+        aes.encrypt_block_software(&mut block);
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "  AES-128 software: {:>8.1} MB/s   (aes-ni={})",
+        mb_per_second((blocks * 16) as usize, elapsed),
+        aes.uses_hardware()
+    );
+
     // ---- AES-128-GCM ------------------------------------------------------
     let gcm = Aes128Gcm::new(&[0x42; 16]);
     let nonce = [0u8; 12];
     let aad = [0u8; 13];
+    let (aes_ni, pclmul) = gcm.accelerated();
+    let forced_off = std::env::var_os("HEARTH_TLS_NO_HW").is_some();
+    println!(
+        "dispatch: aes-ni={aes_ni} pclmul={pclmul} (HEARTH_TLS_NO_HW {})",
+        if forced_off { "set" } else { "unset" }
+    );
 
     for (name, len, iters) in [
         ("GCM 16 KiB record", 16 * 1024usize, 2000u32),
@@ -53,10 +72,7 @@ fn main() {
             assert_eq!(tag.len(), 16);
         }
         let elapsed = start.elapsed().as_secs_f64();
-        println!(
-            "{name}:  {:>8.1} MB/s",
-            mb_per_second(total, elapsed)
-        );
+        println!("{name}:  {:>8.1} MB/s", mb_per_second(total, elapsed));
     }
 
     // Seal-and-open, i.e. the real cost of a record in each direction.
@@ -98,9 +114,15 @@ fn main() {
     };
     for size_gib in [1.0f64, 4.0, 8.0] {
         let seconds = size_gib * 1024.0 * 1024.0 * 1024.0 / gcm_bytes_per_s;
-        println!(
-            "  a {size_gib:.0} GiB model costs {seconds:.0} s of software GCM ({:.0} % of a 5 minute transfer over 100 Mbps)",
-            seconds / 300.0 * 100.0
-        );
+        println!("  {size_gib:.0} GiB through this build's GCM: {seconds:.0} s of CPU");
     }
+    // CPU time is not added latency. A 100 Mbps link delivers about 12 MB/s, so
+    // while the decrypt path sustains more than that it keeps up even though it
+    // is burning a core; below the link rate it becomes the bottleneck itself.
+    println!(
+        "  (that is CPU time, not latency: at {:.0} MB/s this path stays ahead of a \
+         100 Mbps link's ~12 MB/s, so the cost is a busy core. On a gigabit link, or below \
+         ~12 MB/s, it caps the download instead.)",
+        gcm_bytes_per_s / (1024.0 * 1024.0)
+    );
 }

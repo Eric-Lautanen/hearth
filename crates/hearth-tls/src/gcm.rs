@@ -62,6 +62,12 @@ pub struct Aes128Gcm {
     aes: Aes128,
     /// `H = E(K, 0^128)`, the GHASH subkey (SP 800-38D §6.3).
     h: u128,
+    /// Whether the PCLMULQDQ carry-less multiply is available on this CPU.
+    ///
+    /// Set once here from the runtime probe so the hot loop does not branch on
+    /// a CPU feature per block, and so this field is the single justification
+    /// for the `unsafe` call in [`Self::ghash`].
+    pclmul: bool,
 }
 
 impl Aes128Gcm {
@@ -73,7 +79,18 @@ impl Aes128Gcm {
         Self {
             aes,
             h: u128::from_be_bytes(zero_block),
+            pclmul: pclmul_available(),
         }
+    }
+
+    /// Which implementations this instance ended up using: `(aes_ni, pclmul)`.
+    ///
+    /// Exposed for the same reason `hearth-quant` reports its selected kernel —
+    /// a dispatch that cannot be observed is a dispatch that cannot be checked.
+    /// Expect `(false, false)` on non-x86_64 targets and on x86_64 CPUs older
+    /// than Westmere.
+    pub fn accelerated(&self) -> (bool, bool) {
+        (self.aes.uses_hardware(), self.pclmul)
     }
 
     /// Encrypts and authenticates, returning `(ciphertext, tag)`.
@@ -136,17 +153,36 @@ impl Aes128Gcm {
     /// `GHASH` over `aad || pad || ciphertext || pad || len(aad) || len(ct)`
     /// (SP 800-38D §6.4).
     fn ghash(&self, aad: &[u8], ciphertext: &[u8]) -> u128 {
+        if self.pclmul {
+            // SAFETY: `pclmul` is only ever set from the runtime CPU probe in
+            // `new`, and `ghash_x86::multiply` requires exactly that feature.
+            self.ghash_with(aad, ciphertext, |x, y| unsafe {
+                crate::ghash_x86::multiply(x, y)
+            })
+        } else {
+            self.ghash_with(aad, ciphertext, multiply_software)
+        }
+    }
+
+    /// The GHASH structure, independent of which multiply is used, so the two
+    /// paths cannot drift apart in padding, ordering or the length block.
+    fn ghash_with<M: Fn(u128, u128) -> u128>(
+        &self,
+        aad: &[u8],
+        ciphertext: &[u8],
+        multiply: M,
+    ) -> u128 {
         let mut y = 0u128;
         for chunk in aad.chunks(16) {
-            y = ghash_absorb(y, chunk, self.h);
+            y = ghash_absorb(y, chunk, self.h, &multiply);
         }
         for chunk in ciphertext.chunks(16) {
-            y = ghash_absorb(y, chunk, self.h);
+            y = ghash_absorb(y, chunk, self.h, &multiply);
         }
         let aad_bits = (aad.len() as u64) << 3;
         let ct_bits = (ciphertext.len() as u64) << 3;
         let length_block = ((aad_bits as u128) << 64) | ct_bits as u128;
-        ghash_absorb(y, &length_block.to_be_bytes(), self.h)
+        ghash_absorb(y, &length_block.to_be_bytes(), self.h, &multiply)
     }
 
     /// `E(K, J0) xor S` — the tag (SP 800-38D §7.1 step 5/6).
@@ -185,10 +221,26 @@ fn inc32_n(counter: u128, n: u32) -> u128 {
 
 /// Zero-pads `chunk` to a block, XORs it into the accumulator, multiplies by `h`.
 #[inline]
-fn ghash_absorb(y: u128, chunk: &[u8], h: u128) -> u128 {
+fn ghash_absorb(y: u128, chunk: &[u8], h: u128, multiply: &dyn Fn(u128, u128) -> u128) -> u128 {
     let mut block = [0u8; 16];
     block[..chunk.len()].copy_from_slice(chunk);
-    ghash_multiply(y ^ u128::from_be_bytes(block), h)
+    multiply(y ^ u128::from_be_bytes(block), h)
+}
+
+/// Whether the x86_64 carry-less multiply is usable, or `false` elsewhere.
+#[inline]
+fn pclmul_available() -> bool {
+    if crate::hardware_disabled() {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::ghash_x86::available()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// Carry-less multiply in GF(2^128) with the GCM bit order (Algorithm 1 of
@@ -197,7 +249,7 @@ fn ghash_absorb(y: u128, chunk: &[u8], h: u128) -> u128 {
 /// `R = 11100001 || 0^120` is the reduction polynomial's low word: when the
 /// shifted-out bit is set, folding it back means XOR-ing `R` into the top byte.
 #[inline]
-fn ghash_multiply(x: u128, y: u128) -> u128 {
+pub(crate) fn multiply_software(x: u128, y: u128) -> u128 {
     let mut z = 0u128;
     let mut v = y;
     let mut i = 0u32;
