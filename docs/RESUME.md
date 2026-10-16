@@ -1,332 +1,112 @@
-# Hearth — Session 2026-10-15: the Zen 4 AVX-512 gate could never fire
+# Hearth — next session
 
-> `cpu_is_amd_zen4()` compared the CPUID *base* family field (bits 8–11, always 0xF on modern AMD)
-> against 25, so it was never true and `avx512_full_width()` always said yes: every AVX-512-gated
-> kernel took the AVX-512 path on this double-pumped 8840HS. PTQ1_0 lost ~34% there (1.28 vs 1.76
-> GB/s) — 2B 15.6→19.1, 4B 6.6→7.7, 9B 4.0→5.0, 27B 1.23→1.41 tok/s, output byte-identical. The
-> gate is now correct (family reconstructed, 19h = 0x19) and **per-kernel**: PTQ1_0 → AVX2, Q2_0
-> VNNI → kept (3.10 vs 2.91 GB/s for AVX2 LUT), because a blanket "no AVX-512 on Zen 4" would have
-> regressed Q2_0. The decision was then made testable (pure `cpuid_family` +
-> `avx512_full_width_for`, **33 → 40 tests**, the key one pinning that a real Zen 4 reports `0xF` in the
-> 4-bit family field) and self-reporting: a `[kernel] PTQ1_0=avx2 · zen4 · avx512_full_width=false`
-> load banner plus `event.model.kernels` JSON from the service for the UI. Kernel-level numbers and the
-> `benchk` verification are in BUG_TRACKER "Session 2026-10-15". clippy/fmt/check clean,
-> **nothing committed**.
+> **Session 2026-10-15 (pt 2) in one paragraph.** Peer-reviewed SparkOC's downloader, verified every
+> claim through the real `hearth-ui` HTTP API instead of by reading, and found one new defect. Corrected
+> a research claim about speculative decoding and measured the numbers it depends on. Retired the
+> "hybrid prefill is 2× slower than decode" premise that had been in this file since pt 6 — it was
+> false (27B: prefill 635 ms/token vs decode 722). Started the hand-rolled TLS work the operator asked
+> for: a new **`crates/hearth-tls`** crate (std only, **zero dependencies**) with SHA-256, HMAC-SHA256
+> and the RFC 8446 key schedule, all vector-tested. Everything from this session is committed locally;
+> nothing was pushed. History and numbers: `docs/BUG_TRACKER.md`.
 
-## Next session — things to do/try
+## Next session — in this order
 
-1. **Hybrid prefill: first explain the 2× asymmetry, then decide on a chunked prefill.** Correcting an
-   earlier claim in this file — **PQ2_0 already has a paired kernel** (`matmul.rs`:
-   `Q2_0 | PQ2_0 => Some(dot_q2_0_q8_0x2_ptr)`); only PTQ1_0 lacked one, and `dot_ptq1_0_q8_0x2_ptr` now
-   exists and is bit-identical to two single calls (test `paired_matches_two_single_calls`), **but it
-   has no reachable caller**: `DotFn2` is consumed only by `matmul_batch`, that is called only from the
-   dense path, and every PTQ1_0 model is a `qwen35` hybrid whose prefill is explicitly token-by-token
-   with x1-only dispatch. Do not re-wire it into `matmul_batch`; that is the trap that made this look
-   done. Two concrete jobs, in this order:
-   - **(a) Explain the prefill/decode asymmetry — cheap, maybe free.** The hybrid prefill re-streams
-     every weight row once per prompt token, i.e. identical per-token memory traffic to decode, so
-     "1.8–2.3 s per *prompt* token vs 0.9 s per *decoded* token" should not happen. Measure it: prompt
-     lengths 1, 8, 32, 128 on the 4B PTQ1_0 with `--max-tokens 1`, and separate template/tokenization
-     time from `forward` time (`HEARTH_Q35_TIMERS=1`, `timers_report("prefill", …)` already exists at
-     `qwen35.rs`). If it is attention over the growing prefix, that is O(n²) and shows up as a
-     superlinear curve; if it is lazy init, a warm-up run hides it; if it is a timer artifact, fix the
-     timer. Only then is a prefill optimisation measurable at all.
-   - **(b) Then design the real fix: chunked prefill.** Give two tokens' activations to one weight pass
-     while keeping the GDN recurrence sequential. This is a hybrid-forward redesign (touches
-     `qwen35.rs`'s `forward`/`mm`), needs a design note first, and the x2 kernel above is its
-     prerequisite primitive. An x4 variant regressed 3.2× in pt 5 — measure before merging.
-2. **Sweep for other gate mistakes.** `cpu_is_amd_zen4()` was the only family check, but the class of
-   bug is "a feature gate that is silently always-false (or always-true)". Grep `hearth-quant` and
-   `hearth-llm` for `is_x86_feature_detected!`, `target_feature`, and `avx512`, and confirm each
-   gated kernel is on the *faster* path on this box. `benchk` is the tool and now reports the
-   ground-truth choice: `cargo run --release -p hearth-llm --example benchk -- <model.gguf> <dtype>`
-   prints the CPUID decode, the kernel `dot_*_ptr` selects, and every variant's GB/s.
-3. **Zen 5 (family 1Ah) and Intel must not regress.** The fix keys on 19h specifically so they keep
-   full-width AVX-512 — but there is no such hardware here to confirm that, and the comment in
-   `avx512_full_width()` now states the 19h rule. Re-measure PTQ1_0's AVX-512 vs AVX2 on the first
-   non-Zen-4 AVX-512 machine the repo runs on before trusting the gate.
-4. **Keep the introspection honest as formats are added.** ~~Give the other dtypes the same
-   introspection~~ — done this session: `selected_kernel(dtype)` + `dispatch_report()` now cover PTQ1_0,
-   PQ2_0, Q2_0, Q1_0 and Q1_0_G128, the `[kernel]` banner prints at load on both the dense and hybrid
-   paths, and the service exposes `event.model.kernels` as JSON. The remaining work is the *next* format:
-   a new quant type must add a `kernel_name()` arm and a `selected_kernel` arm, or it will silently have
-   no reported dispatch again. `Q8_0` (the activation format) still has none — add it if a Q8_0 weight
-   kernel ever appears. **Rule agreed with SparkOC: add a format to `selected_kernel` only when it has more
-   than one implementation to choose between** — a name that can never vary is only noise.
-5. **Two smaller things.** (a) AGENTS.md's verifications block says `cargo test --test-threads=1 -p
-   hearth-quant`; that is rejected by cargo (it must be `cargo test -p hearth-quant --
-   --test-threads=1`). (b) Re-run the mandate set on a fully idle box interleaved with the reference
-   fork (`bench_results/run_cpu_bench.bat`) — today's pass was clean but the fork was not present.
+1. **TLS slice 2: AES-128-GCM, then X25519.** `crates/hearth-tls` exists and is in the workspace;
+   `sha256.rs` (SHA-256 + HMAC-SHA256) and `hkdf.rs` (`hkdf_extract`/`hkdf_expand`/`hkdf_expand_label`/
+   `derive_secret`) are done, 15 tests, all against published vectors (FIPS 180-4, RFC 4231, RFC 5869).
+   Next, in the order the handshake needs them: **AES-128-GCM** (the mandatory TLS 1.3 suite — GCM
+   needs a constant-time GHASH; test with the NIST GCM vectors *and* a tamper test proving a flipped
+   tag bit is rejected) then **X25519** (RFC 7748 vectors, including the low-order/zero-output cases,
+   which must fail rather than produce a silent all-zero shared secret). Then the record layer, then the
+   handshake, then certificate verification last. **Verification policy is fixed: fatal, never
+   downgradeable — no switch that a URL or a user can reach can weaken it.**
+   - `Transport` in `hearth-ui/src/http.rs` is the seam and is already written for this; the `https://`
+     branch of `downloads.rs::run_transfer` is what gets rewired once the record layer works. Do not
+     touch `http.rs` without asking — it is SparkOC's file.
+   - Measured, for calibration: `curl_available()` + the whole downloader is only the *transport*
+     question; the primitives are ~600–900 lines of arithmetic, where X.509 chain validation plus
+     RSA/ECDSA verification plus a pinned root store is the 2000–3000 line half. Budget accordingly.
+2. **The downloader defect I found, unfixed as of writing.** A full-size `.part` can never complete:
+   with `<name>.gguf.part` holding exactly `size_bytes` and the server answering **416** to
+   `Range: bytes=<size>-`, pressing Download yields `state=error error="HTTP 416" exists=false`, and
+   every retry reproduces it — the file must be deleted by hand while the UI shows 100 % beside an
+   error. Cause: `start()`'s completion shortcut reads `on_disk()` (final name only), and
+   `http::get` treats 416 as fatal while `run_http` retries only on `range_ignored`. Fix is either
+   "416 while resuming = range already satisfied → publish", or checking `part_len()` in `start()`.
+   SparkOC owns this file. **Also unfixed, code-reading only:** `to_socket_addrs().next()` uses just
+   the first address with no fallback across A/AAAA records (curl tries them all) — latent while
+   catalog URLs are `https://` and go through curl, live the moment TLS routes them here.
+3. **Size the chunked-prefill win before designing it.** There is still **zero weight reuse** in the
+   hybrid prefill: it re-streams every weight row once per prompt token, so prefill's per-token cost
+   is ~= decode's (4B: 144 vs 117 ms/token). A chunked forward would amortise the weight *unpacking*
+   across the chunk while the MAC count scales with tokens, so the ceiling is roughly `1 - f` where
+   `f` is the share of per-token time spent unpacking rather than multiplying. **Measure `f` first**
+   — the cheap probe is the same prompt at a fixed length on PQ2_0 (2-bit) versus PTQ1_0 (1-bit):
+   a materially different prefill/decode ratio isolates unpack cost. `dot_ptq1_0_q8_0x2_ptr` is the
+   tested primitive it needs (bit-identical to two single calls, **currently unreferenced** — do not
+   re-wire it into `matmul_batch`, that path cannot reach PTQ1_0 models). An x4 variant regressed
+   3.2× in pt 5.
+4. **Speculative decoding: measure acceptance before designing anything.** This is the strongest
+   decode idea on the table and the cheapest thing to falsify. 2B PTQ1_0 decodes at **50.8 ms/token
+   (18.15 tok/s)** against the 27B's ~722 ms, i.e. the draft is 14× cheaper, so with acceptance `a`
+   and draft length `k` the gain is `(1-a^(k+1))/(1-a)` per `1+0.07k` target-equivalents: ≈1.8× at
+   a=0.6, ≈2.2× at a=0.7, ≈2.6× at a=0.8 (k=4). **`a` is unmeasured and the whole plan rests on it.**
+   Prerequisite is **green**: the 2B and 27B tokenizers are byte-identical (same 248320-token list,
+   same 247587 merges, same `token_type`, same bos/eos/padding 248044/248046/248044). Two caveats:
+   `tokenizer.chat_template` differs (render with the target's template, feed both the same ids) and
+   `prism.hadamard.version` is 2/512 on the 2B vs 1/1024 on the 27B, so the two are not in the same
+   weight basis — argue acceptance from measurement, never from "same family". Losslessness is a
+   property of the *acceptance rule*: the greedy/argmax form is exact and matches our `--temp 0`
+   benchmark path; the sampling form needs rejection plus residual correction over the
+   post-truncation distribution and must handle the stateful repeat penalty. Cost to plan for: **3 of
+   every 4 `qwen35` layers are recurrent**, so a rejected draft token must rewind conv+SSM state, not
+   just a KV cache.
+5. **Sweep for other silently-wrong feature gates.** `cpu_is_amd_zen4()` was the only family check,
+   but the bug class is "a gate that is always-false or always-true". Grep `hearth-quant` and
+   `hearth-llm` for `is_x86_feature_detected!`, `target_feature` and `avx512`, and confirm each
+   gated kernel is on the *faster* path here. `cargo run --release -p hearth-llm --example benchk --
+   <model.gguf> <dtype>` prints the CPUID decode, the kernel `dot_*_ptr` selects, and every variant's
+   GB/s. Still open from the last session; nothing regressed while it waited.
+6. **Zen 5 (family 1Ah) and Intel must not regress.** The fix keys on 19h specifically so they keep
+   full-width AVX-512, and there is no such hardware here to confirm it.
+7. **Keep dispatch introspection honest for each new format.** `selected_kernel(dtype)` +
+   `dispatch_report()` cover PTQ1_0, PQ2_0, Q2_0, Q1_0 and Q1_0_G128; the `[kernel]` banner prints at
+   load on both paths and the service exposes `event.model.kernels`. A new quant type must add a
+   `kernel_name()` arm and a `selected_kernel` arm or it will silently have no reported dispatch.
+   Agreed rule: add a format to `selected_kernel` only when it has more than one implementation to
+   choose between.
+8. **Three small things.** (a) AGENTS.md's verifications block says `cargo test --test-threads=1 -p
+   hearth-quant`, which cargo rejects — it must be `cargo test -p hearth-quant -- --test-threads=1`.
+   (b) Re-run the benchmark mandate on a fully idle box interleaved with the reference fork
+   (`bench_results/run_cpu_bench.bat`). (c) `cargo check -p hearth-diffusion` warns that
+   `FluxTransformer::gpu_f32_bufs` (`transformer.rs:46`) is never read — pre-existing, in SparkOC's
+   area, deliberately left alone.
 
-**Cross-agent state (2026-10-15).** SparkOC owns `crates/hearth-ui`, `README.md` and
-`docs/screenshots`; `hearth-quant` + `hearth-llm` are mine. Two threads are open — check them rather
-than re-derive them:
-- SparkOC accepted all three downloader findings from my review and is applying them in
-  `hearth-ui/src/downloads.rs`: (1) `curl_available()` costs a measured **68–71 ms per call** and ran on
-  every `/api/downloads` poll at 1 Hz (cache it in a `OnceLock`); (2) `finish()` emits the *expected*
-  size as `downloaded_bytes` even on failure, so an incomplete transfer renders a 100% bar; (3)
-  `snapshot()` reads the final filename only, so a resumable `.part` shows `idle`/0. **Re-verify each
-  against their diff** once they say it is in — a reply is not a verification.
-- **Open operator question: hand-rolled TLS for the downloader.** My position, left in the room:
-  pure-std SHA-256/HKDF/X25519/AES-GCM is ~600–900 lines and provably testable against RFC/NIST
-  vectors, but X.509 chain validation + RSA/ECDSA verification + a pinned root store is 2000–3000 lines
-  of security-critical code whose failure mode is a **silent MITM**, so prefer bundling
-  `rustls`/`rustls-webpki`/`webpki-roots` (pure Rust, no C). Hand-roll only if the operator bans
-  dependencies outright, and then with a verify step that is **fatal and never downgradeable**. Do not
-  start it without that answer — it is a multi-session project.
+## Standings and hazards
 
-**Verification habits for a shared checkout.** `cargo fmt --all` formats the *whole workspace*,
-including the other agent's in-progress `hearth-ui/src/main.rs` — use `cargo fmt -p hearth-quant -p
-hearth-llm`. `target/release/hearth-chat-cli.exe` is often locked by their running UI, so build to a
-spare `CARGO_TARGET_DIR` rather than killing a process you do not own. And my first sweep of the model
-catalog appeared to fail with HTTP 000 on all 14 URLs purely because a helper script wrote CRLF line
-endings and curl rejected them — suspect your own harness before reporting someone else's data broken.
+- **Do not re-derive the prefill/decode asymmetry.** It was answered and the premise was wrong: with
+  `HEARTH_Q35_TIMERS=1`, the 27B PTQ1_0 is 635 ms/token prefill against 722 decode (prefill is
+  *faster*), and the 4B is 124/144 prefill vs 117/229 decode. The old "1.8–2.3 s per prompt token"
+  came from a pt-6 run under ~75 % external load with a cold file cache.
+- **Do not "fix" the first token.** The excess is storage I/O on the first read of the weight file.
+  A page-touch prefault was written and measured to change nothing (173.0 vs 173.4 ms) while costing
+  259 ms (4B) / 2402 ms (9B) of load, so it was reverted. **`HEARTH_PIN_WEIGHTS=1` on the 27B died
+  silently** on this 16 GB box with other models resident — never recommend it as a default.
+- **Do not trust a summary; verify through the interface.** Every claim in the review above came from
+  driving the real API with a catalog override (`HEARTH_MODELS_DIR` + `HEARTH_MODEL_CATALOG_JSON`,
+  `--no-browser`, `HEARTH_NO_AUTO_SHUTDOWN=1`) against a local server that logs `Range` headers — not
+  from reading code. Three of my earlier findings tested clean, and the one defect that remains was
+  only visible that way.
 
----
+## Verification habits for a shared checkout
 
-# Hearth — Session 2026-09-19 (pt 6): the 27B's context was allocated from its declared size
-
-> The 27B chat ran (or didn't) out of RAM: the KV cache is allocated at load from the context
-> ceiling, and pt 4 had raised the hybrid cap to 32768 while the model declares 262144 — 4.3 GiB of
-> KV at 128 KiB/token on a 16 GB box. Context is now sized by a byte budget (`model/kv_budget.rs`,
-> 1.25 GiB): dense models keep 4096, the 27B gets 10240. `RunStats` also stopped counting the prompt
-> as generated tokens, which is why an empty reply read as "28 tokens generated". Same session: the
-> idle worker pool spent **414% of one core** in a spin/`yield_now` loop that never blocks — it now
-> parks on a condvar with a syscall-free dispatch path (`pool.rs`), idle CPU 0.0%, throughput
-> unchanged. See BUG_TRACKER pt 6.
-
-## Next session — things to do/try (superseded by 2026-10-15 above)
-
-1. **27B prefill is the one thing that still makes the chat feel broken.** Measured this session:
-   1.8–2.3 s per *prompt* token (a 33-token chat prompt = 60–76 s before the first token) against
-   ~0.9 s per *decoded* token. That is pt 5's item 1 — paired kernels for the formats still on the
-   single-token path (`dot_ptq1_0_q8_0x2_ptr`, `dot_pq2_0_q8_0x2_ptr` wired into the `dot_fn2`
-   table) — and it is a bigger UX win than any decode work. Also check *why* prefill is 2× slower
-   per token than decode on this model, since for a hybrid that keeps a fixed-size recurrence the
-   two should cost about the same.
-2. **Re-run the 6-model benchmark on an idle machine** (`--temp 0 --max-tokens 50 --prompt "Hello"
-   --prompt-raw`). This session's pass ran under ~75% CPU load from unrelated processes and the same
-   1.7B Q1_0 binary produced 18–33 tok/s across four identical runs, so it cannot be compared with
-   the 2026-09-18 table. Interleave against the reference fork when it is available.
-3. **Make the KV budget RAM-aware.** `DEFAULT_KV_BUDGET_BYTES` is a constant (1.25 GiB) chosen by
-   hand for a 16 GB machine. Available physical memory needs an OS call (`GlobalMemoryStatusEx` on
-   Windows; the repo has no FFI today) — decide whether that is worth it, or keep the constant and
-   let `HEARTH_CTX_CAP` carry the machine-specific case.
-4. **The UI's empty-reply messages are now four distinct cases** (stopped before text / zero tokens
-   generated / reasoning only / tokens that decoded to nothing). Reproduce each one deliberately and
-   check the wording reads well; the zero-token case should also suggest the context window if the
-   prompt was longer than it.
-5. **`max_context` vs the allocated ceiling.** The request's window is a separate knob from the
-   allocation; the UI seeds its slider from `max_seq_len`, which is now the budgeted ceiling. Confirm
-   a 27B request with a small window (e.g. 1024) does not allocate the full 1.25 GiB — today the
-   allocation happens at load, so it does, and per-request demand allocation is the follow-up.
-
----
-
-# Hearth — Session 2026-09-19 (pt 5): prefill weight reuse across prompt tokens
-
-> Prefill re-expanded every weight row once per prompt token. Now a paired kernel (`DotFn2` in
-> `pool.rs`) expands each row once for two tokens: **Q2_0 prefill 25.5 → 17.5 ms/tok (31%),
-> Q1_0 8–11%, 8B Q1_0 4%**, bit-identical output, decode untouched. An x4 variant regressed 3.2×
-> and was reverted. Full table + analysis in BUG_TRACKER "pt 5".
-
-## Next session — things to do/try
-
-1. **Push the paired kernel to PTQ1_0 and PQ2_0** (`dot_ptq1_0_q8_0x2_ptr`, `dot_pq2_0_q8_0x2_ptr`)
-   and wire them into the `dot_fn2` table in `model/matmul.rs`. The 27B models are the ones where
-   prefill hurts most, and PTQ1_0 is the one hot format still on the single-token path. Follow the
-   existing pattern exactly: share the weight-side expansion only, keep accumulation order
-   identical, and assert bit-identity against the single-token kernel.
-2. **Retry the four-token kernel correctly.** The x4 attempt failed on register pressure, not on the
-   idea: keep only *one* accumulator chain per token by folding `w_scale * a_scale` into a single
-   per-sub-block FMA (numerically equivalent, no longer bit-identical — check the generated text),
-   or expand a whole weight block into a stack buffer once outside the token loop so the loop body
-   needs 4 accumulators, not 8. Q2_0's weight side is ~half its uops, so x4 predicts another ~25%
-   there. Measure against the pt 5 baseline, not against x1.
-3. **Q1_0 is no longer purely issue-bound** (8B Q1_0 only gained 4%). Before adding more kernel
-   work, find the wall: try tile sizes other than the fixed 1 MiB `tile_size` in `pool.rs` (the tile
-   is exactly Zen 4's L2, leaving no room for the activation row + output stream), and time
-   `forward_batch` stage-by-stage (`ForwardTimers` already exists for the decode path but the batch
-   path has no timers — add them behind `HEARTH_BATCH_TIMERS`). Attention is only ~2% of prefill at
-   840 tokens but ~8% at 4096, so re-check it once long-context prefill is the target.
-4. **Prefill parallel-scaling check.** `attention_batch_*_parallel` parallelizes over `n_kv_heads`
-   only (8), so a model with fewer KV heads leaves workers idle, and `par_quantize`/head-norm/RoPE
-   live in serial loops. `silu_mul_q8` (seq_len × ffn_dim `exp` calls per layer, ~5% of a 840-token
-   prefill) is the cheapest of these to parallelize through `pool.par_for`.
-
-## Benchmark hygiene
-
-Absolute prefill ms/tok on this box swings by 3× with unrelated load (12.8 → 41 ms/tok for the same
-1.7B Q1_0 build). Interleave before/after runs and compare ratios, not absolute numbers. The
-`--service` process holds `target/release/hearth-chat-cli.exe` open, so `cargo build --release` fails
-with "Access is denied" until it is stopped (`CARGO_TARGET_DIR=<tmp> cargo build` works around it).
-
----
-
-# Hearth — Session 2026-09-19 (pt 4): model-driven, adjustable inference settings
-
-> Every inference knob was hardcoded and the models' own `general.sampling.*` + `context_length`
-> metadata was ignored. Now `ModelConfig::sampler_defaults()` drives the CLI and the UI seeds all
-> sliders from the loaded model; the 27B's frozen 2048 context is gone; min-p/typical-p/seed and
-> the load strategy are adjustable end to end. See BUG_TRACKER "pt 4" for the full table.
-
-**One resolution rule everywhere:** a value you set wins *field by field*; every field you leave
-unset comes from the model's `general.sampling.*`, then the built-in default. The CLI now tracks
-`SamplerOverrides` (all `Option`) instead of a `sampler_explicit` bool, so `--temp 0` alone no longer
-discards the model's top-k/top-p/min-p — it used to, and the service already merged per field.
-`hearth-chat-cli --help` now prints the full flag/environment reference (it previously had no
-`--help` at all and treated the flag as a model path, and the usage text was missing `--prompt-raw`
-and `--dump-info`). `README.md` was brought in line: real defaults, the four new flags, the
-environment-variable table, and a `hearth-ui` section.
-
-## Next session — things to do/try
-
-1. **Benchmark all 6+ models** against the pt 4 baseline. The only inference-path change is the
-   qwen35 KV cap (2048 → 32768, ~1 GB for the 27B); confirm 27B decode tok/s did not regress and
-   tune `HEARTH_CTX_CAP` if it did. 1.7B Q1_0 CLI path was re-checked at 41.3 tok/s (baseline).
-2. **KV cache type is still F32-only.** `KVStorage::Q8_0` exists and `--kv-f32` is accepted but
-   inert. To expose it, add a `kv_q8_0: bool` to `hearth_core::PipelineRequest::TextGen` (hearth-core
-   can't depend on hearth-llm, so no KVStorage in the request) and map it in both `generate_text`
-   allocs; then surface a UI toggle. Watch for the decode regression seen when Q8 KV was reverted.
-3. **Per-model `max reply tokens`.** The UI still defaults to 512 for every model; a ~1 tok/s 27B
-   reply takes ~8 min. Consider deriving a default from model size, or showing an ETA next to the
-   live tok/s readout.
-4. **`enable_think` vs real GGUF templates.** The synthetic Qwen3 template honors it, but a model
-   whose bundled `tokenizer.chat_template` never branches on `enable_thinking` will still reason
-   when the toggle is off (reasoning is then hidden). The UI now reports the reasoning token count
-   so this is at least visible; a next step is scanning the template for the flag and disabling the
-   toggle when the model can't honor it.
-5. **Models declare only temp/top_k/top_p/min_p.** `repeat_pen` (1.1), `typical_p` (0) and `seed`
-   (0 = random) have no metadata source, so they are still effectively fixed defaults: the same
-   value for every model unless the user touches them. Check whether Prism GGUFs carry
-   `general.sampling.repeat_penalty`/`*.seed` under another key (scan all `general.sampling.*` keys
-   with `--dump-info`), and if not, decide whether a per-model heuristic beats one shared value.
-6. **Keep `--help` and the README flag table in lockstep.** Both now list the same flags/defaults
-   by hand; anything added to `print_usage()` has to be mirrored in `README.md` or the docs go stale
-   again — which is exactly how the four missing flags got documented here.
-
----
-
-# Hearth — Session 2026-09-19 (pt 3): model-dropdown fix + pt 2 stream-cleanliness work
-
-> pt 3: 27B models missing from the dropdown — `default_models_dir()` now walks up from the
-> executable's directory (plus sibling checks) so the repo `models/` is found no matter the
-> launch CWD; verified by launching from `C:\\Windows\\Temp`. Absolute model paths load fine.
->
-> pt 2 (below): found and fixed the real causes of "weird stuff in chat" — literal
-> `{% endif %}` in replies, U+FFFD garbage characters, and answers cut off right after the
-> reasoning block.
-
-## Fixed this pass
-
-1. **`{% endif %}` / template-tag leak in chat.** The jinja evaluator's `eval_if` rendered the
-   winning branch verbatim and stopped at the FIRST `{% else %}`/`{% endif %}`, so any nested
-   conditional (the new `{% if enable_thinking %}` inside `{% if add_generation_prompt %}`, and
-   any real GGUF template with nesting) leaked its tags into the prompt, which 1-bit models
-   echo back. Rewrote it as `parse_if_branches` (nesting-aware if/elif/else split) rendering
-   through the full evaluator; `eval_for` now renders loop bodies through the full evaluator
-   with a single-message context too. Message-relative conditions (`message['role'] == ...`)
-   work inside both. Regression-tested (`test_nested_if_in_template`).
-2. **U+FFFD (�) garbage characters.** `decode_token` did per-token `from_utf8_lossy`, so a
-   multi-byte character split across two tokens emitted replacement chars mid-stream. Now the
-   tokenizer buffers incomplete sequences (`utf8_stream`) and both model cores call
-   `flush_stream_decode()` before `Done` (also on cancel) so nothing is lost or leaked across
-   generations. Regression-tested (`test_split_utf8_streaming_decode`, `test_flush_stream_decode`).
-3. **`</think>` killed generation.** `is_control_token` returned true for every added token
-   (`special_tokens` map), so the engine STOPPED as soon as the model emitted `</think>` —
-   the visible answer after it never arrived, and the models looked like they "never close the
-   block". Now only `<|...|>` and classic BOS/EOS/PAD-form tokens stop generation;
-   user_defined tokens like `<think>`/`</think>` stream through. Regression-tested
-   (`test_think_tokens_are_not_control_tokens`).
-
-## Verification (per model, live through the hearth-ui service)
-
-- 1.7B Q1_0: regular / reasoning-shown / reasoning-hidden all PASS (no template leaks, no
-  U+FFFD, reason channel streams token-by-token).
-- 4B Q2_0: all three paths PASS; emoji (multi-byte) round-trips clean — the U+FFFD fix works.
-- 27B PQ2_0: reason channel streams (40 events, coherent reasoning).
-
-Note: the 27B CLI "empty output" scare was a red herring — without `--show-think` the CLI's
-`ThinkFilter` hides in-think reasoning by design; with the toggle it streams fine.
-
----
-
-# Hearth — Session 2026-09-19: hearth-ui think streaming + context window
-
-> The web chat UI now streams reasoning and answer on separate channels, and the
-> context slider clamps to the loaded model's real KV-cache limit.
-
-## State
-
-| Item | Status |
-| --- | --- |
-| hearth-ui think streaming | ✅ `reason` SSE channel; drawer auto-opens while thinking, collapses on answer |
-| `done` event | ✅ now carries `text` (+ `reason_text`/`reason_tokens`) — previously the UI read `ev.reply`/nothing and appended nothing |
-| Context slider | ✅ max 32768, clamped to `model.max_seq_len` on load |
-| All 6+ models load/chat via UI | ✅ tested on Bonsai-1.7B-Q1_0 (~58 tok/s through the service path) |
-
-## What changed this session
-
-- `hearth-tokenizer`: Qwen3 synthetic template now honors `enable_thinking` — when false it
-  pre-closes `<think>\n\n</think>` (model answers directly); when true it opens `<think>\n\n`
-  and lets the model finish the block. `TemplateContext` gained `enable_thinking`
-  (`jinja.rs` evaluates `{% if enable_thinking %}`). `apply_template(.., thinking)` maps the
-  UI toggle to it. Also fixed the pre-existing `make_mock_tokenizer` compile error (missing
-  `gpt2_style`/`gpt2_byte_encoder` fields).
-- `hearth-chat-cli/service.rs`: new `StreamSplit` routes each raw token to a reasoning or
-  answer channel. Initial state derived from the prompt's trailing think markers
-  (`StreamSplit::for_prompt`) — with an open `<think>` in the prompt, Bonsai 1.7B never emits
-  `</think>`, so sniffing the token stream alone dead-ends. `partial_close_len` holds back a
-  split-across-tokens `</think>` suffix so the tag never leaks into visible text. New events:
-  `reason` (fragment) and `done.text`/`done.reason_text`/`done.reason_tokens`. New request
-  field `enable_think` (defaults to `show_think`; UI sends both).
-- `hearth-ui`: renders the reason channel in a collapsible drawer (`.think`), auto-open while
-  generating with no answer yet; stats show `N think`; context slider 256–32768 with
-  `syncCtxSlider()` clamping to the model.
-
-## Known model-behavior quirk (not a bug)
-
-Bonsai-1.7B-Q1_0 with an open `<think>` in the prompt sometimes never emits `</think>` and
-puts its answer inside the think block. The UI handles this (drawer holds the whole reply,
-"internal reasoning" placeholder when hidden), but don't be surprised in CLI testing.
-Also seen on 1-bit models: stray `{% endif %}` echo in replies — pre-existing, happens with
-the unmodified template too.
-
-## Next session ideas
-
-1. **Benchmark before/after mandate**: nothing perf-relevant changed this session, but the
-   service now sends ~2× the SSE lines during thinking — confirm tok/s is unchanged
-   (`hearth-ui` path vs CLI path).
-2. **True context > 4096 on dense models.** `mod.rs` load caps `config.max_seq_len` at
-   `kv_ctx_cap = 4096` (F32 KV cache safety); the 27B hybrid caps at 2048. To go higher:
-   cap by free RAM instead of a constant (KV bytes = `2 · n_layers · n_kv_heads · head_dim ·
-   pos · 4B` F32, ÷~4 with Q8_0), and make `max_seq_len`-relative position wrap
-   (`truncate_left(64)` already exists) safe for RoPE (consider rope scaling on wrap).
-3. **Continue-generation for split answers.** When the reply fills `max_tokens` mid-sentence,
-   offer a "continue" button that re-queries with the partial answer appended as assistant
-   history instead of the current all-or-nothing budget.
-4. **`stop` mid-think** leaves the drawer open with partial reasoning — fine, but verify the
-   stopped generation's `reason_text` renders correctly after `done.stopped=true`.
-5. **UI polish**: persist settings (system prompt, think toggle, ctx) to localStorage; show
-   tokens/s live during streaming (currently only at done); auto-scroll currently forces to
-   bottom when near-bottom — verify long-think sessions behave.
-6. **Multi-turn history with think**: the engine history carries only visible answers
-   (`reply`), which is right for quality — but check whether feeding back a compact
-   "reasoning summary" helps the 1-bit models stay on topic in long chats.
-7. Old idea list (AVX-512 PTQ1_0 kernel, PQ2_0 kernel, batched 27B prefill, GPU 780M, f16
-   activations, KV F32-vs-Q8_0 retest) — still open, see previous sessions in BUG_TRACKER.
-
-## Useful commands
-
-```bash
-# Watch the reason channel without a browser:
-curl -N http://127.0.0.1:8899/api/events > /tmp/sse.txt &
-curl -X POST http://127.0.0.1:8899/api/generate -H "Content-Type: application/json" \
-  -d '{"message":"Hi","show_think":true,"enable_think":true,"temp":0,"max_tokens":120,"max_context":4096}'
-
-# Template sanity (both must parse; diff the trailing think markers):
-./target/release/hearth-chat-cli.exe models/Bonsai-1.7B-Q1_0.gguf --temp 0 --max-tokens 40 \
-  --prompt "What is 15+27?" --show-think
-
-cargo test -p hearth-tokenizer -- --test-threads=1
-```
+- `cargo fmt --all` reformats the *whole workspace* including the other agent's files — use
+  `cargo fmt -p <crate>`. Same for clippy with `-D warnings`.
+- `target/release/hearth-chat-cli.exe` is often locked by a running UI: build to a spare
+  `CARGO_TARGET_DIR` instead of killing a process you do not own.
+- **Suspect your own harness before reporting someone else's data as broken.** Twice this session a
+  "finding" was my own bug: a helper that wrote CRLF made curl report HTTP 000 on 14 valid URLs, and a
+  Python `allow_reuse_address` server left listening on my test port silently answered a later test
+  (Windows lets a second bind succeed), which briefly made a real edge case look handled.
+- Test fixtures must be *correct*, not just the right length: a 50-byte prefix of `b"\x00"` is not a
+  prefix of `bytes(range(100))`, and that mistake made a valid resume look like a content mismatch.

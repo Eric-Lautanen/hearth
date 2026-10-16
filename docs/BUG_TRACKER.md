@@ -132,6 +132,95 @@ through the dense projections per weight pass while keeping the GDN recurrence s
 is exactly the primitive that needs (one weight row, two Q8 activation rows, bit-identical). That is a
 hybrid-forward redesign, needs its own design note, and is **not** claimed here.
 
+**Then the measurement killed two of my own claims.** `HEARTH_Q35_TIMERS=1` prints per-stage ms/token per
+phase, so prefill and decode are directly comparable:
+
+| model | prompt | prefill ms/token | decode ms/token |
+|-------|--------|-----------------|-----------------|
+| 27B PTQ1_0 | 16 words | **635** | **722** |
+| 27B PTQ1_0 | 1 word | 6934 (first token) | 750 |
+| 4B PTQ1_0 | 32 words | 124 | 117 |
+| 4B PTQ1_0 | 128 words | 144 | 229 |
+
+1. **"Prefill is ~2× slower per token than decode" is FALSE.** On the 27B, prefill is 635 ms/token
+   against decode's 722 — *faster*, not slower. That premise had been in RESUME since pt 6 and came from
+   a run under ~75% external CPU load with a cold file cache. The stage split is stable across lengths
+   (gdn/attn 54–58%, ffn 34–38%, head 7–12%), i.e. weight-streaming matmul dominates exactly as
+   expected when there is no weight reuse. Prefill per-token *does* rise with length on the 4B
+   (marginal 113 ms/tok from 8→32, 151 ms/tok from 32→128) — attention over the growing prefix is real
+   but modest.
+2. **The first-token excess is storage I/O, not page faults and not clock ramp.** A page-touch prefault
+   of every mapped tensor was written and **measured to do nothing**: 4B first token 173.0 ms with it
+   vs 173.4 ms without, while it added **259 ms** to load at 4B and **2402 ms** at 9B — a net regression,
+   so it was reverted (`git diff` on `mod.rs` is empty again). Equally, my earlier reading that
+   `HEARTH_PIN_WEIGHTS=1` "removed 1044 ms of the 4B first token while leaving the arithmetic identical,
+   which identifies this as page-fault cost" was **wrong**: pinning moves the *first read of the file*
+   into load, and I only measured the prefill phase, not the total. With a warm page cache there is
+   essentially no first-token penalty at all (4B: 173 ms vs ~121 ms steady), and the 27B's 6934 ms first
+   token against 635 ms steady is the 5.9 GB file being read for the first time.
+
+**Also measured, and a hazard:** `HEARTH_PIN_WEIGHTS=1` on the 27B **died with no output** on this 16 GB
+box while another agent's models were resident — copying 5.9 GB plus a 1.25 GiB KV cache is not always
+survivable, and the failure is silent (the process is killed, nothing is printed). The plain
+(non-pinned) path is the safe one.
+
+**Net:** no performance change shipped from the prefill investigation. Its value is negative-result
+clarity — the 2× premise is retired, the first-token stall is storage-bound and inherent, and the only
+real prefill lever left is the chunked/weight-reuse redesign (≈2× on the projections, not on attention).
+
+### Peer-review round (same session) — verified fixes, one new defect, one corrected research claim
+
+Read-only review of the other agent's downloader work (`8327093`, `86b0bd1`), then **behavioural**
+verification of every claim through the real `hearth-ui` HTTP API (catalog override + a local server
+that logs `Range`), rather than by reading the code.
+
+**Three defects I reported earlier are fixed, and the fixes are measured:**
+
+| finding | before | after (measured) |
+|---|---|---|
+| `curl_available()` spawned `curl --version` on every `/api/downloads` poll, and the frontend polls at 1 Hz | 68/67/71 ms per poll, +1 process | **median 0.56 ms**, p95 0.76 ms, n=25 (`OnceLock`) |
+| `finish()` emitted the *expected* size as `downloaded_bytes` on failure | 100 % bar beside an error | `state=error`, `downloaded_bytes=100` of 5000, `"incomplete: got 100 of 5000 bytes"` |
+| `snapshot()` read only the final filename, so a resumable `.part` read `idle`/0 | `idle`, 0 bytes | `partial`, real `.part` bytes (50 of 100) |
+
+**Also verified positively** (neither was covered by a test through the Manager before): a 206 resume
+sends exactly one `Range: bytes=50-` and publishes a byte-exact file; a server that ignores `Range`
+(answers 200) is detected *before any byte is written*, the `.part` is reset and re-fetched, and the
+published file is still byte-exact — no corruption. `http.rs`'s 7 tests pass; `/`, `/api/models`,
+`/api/downloads` all 200.
+
+**One new defect, reproduced twice — a full-size `.part` can never complete.** With `<name>.gguf.part`
+holding exactly `size_bytes` and a server answering **416** to `Range: bytes=<size>-`, pressing Download
+gives `state=error error="HTTP 416" exists=false` and the `.part` stays; pressing again gives the
+identical error. It never self-heals — the file must be deleted by hand, while the UI shows 100 % next
+to an error. Cause: `start()`'s "already complete" shortcut uses `on_disk()`, which reads only the
+**final** name, so a full-size `.part` is not recognised; and `http::get` treats 416 as fatal while
+`run_http` retries only on `range_ignored`. Reachable by cancelling at the last byte (cancel keeps the
+`.part` by design), a failed rename, or any catalog `size_bytes` larger than the CDN serves. Fix: either
+"416 while resuming = range already satisfied → publish", or check `part_len()` in `start()`.
+
+**`http.rs` notes (code reading, no repro):** `to_socket_addrs().next()` takes only the first address,
+with no fallback across A/AAAA records where curl tries them all — latent while catalog URLs are
+`https://` (still curl), live once TLS routes them here. Cosmetic: `read_head` returns a vestigial empty
+`Vec`, its cap check is off by one, and nothing tests that `Range` survives a redirect (it does).
+
+**Corrected a research claim.** "Speculative decoding from the 2B draft is bit-identical by
+construction" is not automatic, and the win is ~2×, not ~10×: losslessness is a property of the
+*acceptance rule* (the greedy/argmax form is exact; the sampling form needs rejection plus residual
+correction over the post-truncation distribution, and the stateful repeat penalty must be handled), and
+the target forward pass is never skipped. Measured economics: **2B PTQ1_0 decodes at 50.8 ms/tok
+(18.15 tok/s), prefill 81.4 ms/tok** — 14× cheaper per token than the 27B's ~722 ms, so with acceptance
+`a` and draft length `k` the expected accepted tokens per target forward is `(1-a^(k+1))/(1-a)` at a cost
+of `1+0.07k` target-equivalents: ≈1.8× at a=0.6, ≈2.2× at a=0.7, ≈2.6× at a=0.8 (k=4). **The acceptance
+rate is the unmeasured quantity the whole plan rests on.** The prerequisite is **green**: the 2B and 27B
+tokenizers are identical (same 248320-token list, same 247587 merges, same `token_type`, same
+bos/eos/padding 248044/248046/248044). Two non-blocking differences: `tokenizer.chat_template` differs
+(render with the target's template, feed both the same ids) and `prism.hadamard.version` is 2/512 on the
+2B vs 1/1024 on the 27B — the two are *not* in the same weight basis, which is why acceptance must be
+measured rather than argued. Hidden cost for the design note: 3 of every 4 `qwen35` layers are
+recurrent, so a rejected draft token must rewind conv+SSM state, not just a KV cache.
+
+**Files touched:** docs only — no source change from this review round.
+
 ### Session 2026-09-19 pt 6 — the 27B chat was unusable: KV cache sized from the model's *declared* context
 
 **Trigger:** "the 27b q1 on html UI chat" returned only *"The model returned no visible text (28 tokens

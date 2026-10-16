@@ -422,6 +422,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hearth-tls"
+version = "0.1.0"
+
+[[package]]
 name = "hearth-tokenizer"
 version = "0.1.0"
 dependencies = [
