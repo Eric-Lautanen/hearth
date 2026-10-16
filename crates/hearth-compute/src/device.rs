@@ -1,10 +1,11 @@
-use wgpu::{Adapter, Device, DeviceDescriptor, Instance, Queue};
+use wgpu::{Device, DeviceDescriptor, Instance, Queue};
 
+/// A live wgpu device and its queue.
+///
+/// The `Instance` and `Adapter` that produced them are deliberately not kept: nothing reads
+/// them after construction, and the `Device` holds its own reference to the adapter state, so
+/// storing them would keep two handles alive for no reader.
 pub(crate) struct GpuDevice {
-    #[allow(dead_code)]
-    pub instance: Instance,
-    #[allow(dead_code)]
-    pub adapter: Adapter,
     pub device: Device,
     pub queue: Queue,
 }
@@ -40,11 +41,6 @@ impl GpuDevice {
             adapter.get_info().backend,
         );
 
-        Some(Self {
-            instance,
-            adapter,
-            device,
-            queue,
-        })
+        Some(Self { device, queue })
     }
 }

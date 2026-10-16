@@ -1,5 +1,25 @@
 # Hearth — next session
 
+> **Session 2026-10-16 (pt 15) in one paragraph.** The allow-block rule is now a property of the
+> workspace rather than a job in progress: **zero `#[allow(...)]` and zero `#[expect(...)]` anywhere**,
+> nothing silenced to get there, and the whole-repo gate green — `cargo clippy --workspace
+> --all-targets -- -D warnings`, `cargo fmt --check`, `cargo check --workspace --all-targets`
+> warning-free, `cargo test --workspace -- --test-threads=1` green (42 quant, 170 tls, rest), release
+> build clean. The 25 sites the quant sweep left were all real: 19 `too_many_arguments` (15 of them
+> `hearth-compute` dispatch methods, now taking named `Copy` shape structs in `args.rs` while the
+> buffers stay explicit; `ensure_batch_size` went from seven shape arguments to two, because the rest
+> were `self.config`; `matmul_batch`'s row count was never read and is deleted), 4 `needless_range_loop`
+> (both cache batches now iterate `caches.iter_mut().enumerate()`), `GgmlDType` variants camel-cased
+> with `name()` still returning the spec spellings so no log line moved, and dead weight deleted rather
+> than allowed — the never-wired FLUX VAE scaffolding, `GpuDevice`'s instance/adapter handles, and the
+> diffusion constructor's upload of every BF16/F32 weight as f32 that no forward path read. My own
+> scripted pass was off by one and deleted a row-buffer argument instead of the dead row count; one
+> build caught it, and the repair (and both exact deleted-line counts) is in the tracker. The AGENTS.md
+> section now states the rule — no allows ever, never a "pre-existing" warning, a finding that cannot be
+> fixed without changing behaviour is reported and measured — and its two stale claims (`cargo test
+> --test-threads=1 -p …`, "GPU stub warnings are OK") are corrected. Diffusion's VAE is still the
+> placeholder path; the real decoder is the next feature there.
+
 > **Session 2026-10-16 (pt 14) in one paragraph.** The crate now has a verifier, which is the first
 > thing in it that can *accept* anything: `verifier.rs`'s `PinnedVerifier` runs the three stages in a
 > stated order — the chain from the wire bytes (framing, parse, structure, links, anchor, windows,
@@ -273,15 +293,22 @@
    (`-C target-feature=-avx512f,-avx512vnni,-avx512dq`) is the regression test. `ptq1_0` and
    `q1_0g128` were already runtime-dispatched (`q1_0g128` deliberately has no AVX-512 path: ~33%
    regression, measured, kept as a test-only kernel).
-   *Still open:* (a) the **same audit in `hearth-llm`**, which has the remaining 13 `allow` blocks
-   (5 `dead_code`, 4 `needless_range_loop`, 3 `too_many_arguments`) — `AGENTS.md` forbids them, and
-   the `needless_range_loop` ones sit in matmul/ops where the honest fix costs a benchmark;
-   (b) `.cargo/config.toml` sets `-C target-cpu=native`, so **every release build in this repo is
-   host-specific** — the kernels are runtime-dispatched, but the rest of the binary (auto-vectorised
-   loops, memcpy, the tokenizer) may carry AVX-512 with no guard, and a build made on a machine
-   without VNNI compiles the VNNI *call sites* out. Nothing here ships binaries yet, so this is a
-   decision to make deliberately and to **measure** (compare a `target-cpu=native` build against
-   `x86-64-v3` on the 6-model suite before choosing), not a line to change on principle.
+   *Closed the same day* by the workspace allow-block sweep (pt 15): all 25 remaining sites are gone,
+   `needless_range_loop` fix included, and the whole-repo gate is green. `hearth-llm`'s audit found
+   the same class of thing the quant sweep did — a scalar reference dot nobody called, VAE scaffolding
+   nothing reached, a diffusion constructor uploading weights no path read.
+   *Still open, and now the biggest number in this file:* (b) what the release build promises.
+   `.cargo/config.toml` is now **`x86-64-v2`** (SparkOC, 26eab4b) after auditing that every
+   AVX2/AVX-512 path sits behind a runtime probe, so only autovectorised code is affected. **Measured
+   the same day: that baseline costs 3.4× on Bonsai-1.7B-Q1_0** (43.4 → 12.8 tok/s mean of three
+   interleaved rounds; the old native binary read 44.9 with byte-identical output — full table in
+   BUG_TRACKER under the allow sweep). The commit claims 1-3%; on the flagship 1.7B pair it is not.
+   **Next session, in this order:** (1) re-run the interleaved A/B per model, including at least one
+   dense Q2_0 and the 27B, using the binaries left in `target/buffy-ab/`; (2) try `x86-64-v3` — the
+   loss is in the autovectorised f32 per-token work, and v3 keeps AVX2; (3) only then decide what
+   v0.x promises, and make the README's SSE4.1-minimum claim match the decision. Do not treat the
+   6-model baseline table as comparable until the flag is settled: every number taken with v2 is on a
+   different machine model than the ones recorded before it.
    *Harness notes:* `cargo run --release -p hearth-llm --example benchk -- <model.gguf> <dtype>`
    prints the CPUID decode and every variant's GB/s; **`benchk … | head` exits 101** (SIGPIPE) so
    redirect to a file or use `tail` when the exit status is the verdict; and **cold runs are ~2×
@@ -295,12 +322,14 @@
    `kernel_name()` arm and a `selected_kernel` arm or it will silently have no reported dispatch.
    Agreed rule: add a format to `selected_kernel` only when it has more than one implementation to
    choose between.
-9. **Three small things.** (a) AGENTS.md's verifications block says `cargo test --test-threads=1 -p
-   hearth-quant`, which cargo rejects — it must be `cargo test -p hearth-quant -- --test-threads=1`.
+9. **Three small things.** (a) *Done (pt 15):* AGENTS.md's verifications block said
+   `cargo test --test-threads=1 -p hearth-quant`, which cargo rejects; both occurrences now read
+   `cargo test -p hearth-quant -- --test-threads=1`, and the same file's "pre-existing clippy warnings
+   in GPU stubs are OK" line is gone, since there are no accepted warnings left to point at.
    (b) Re-run the benchmark mandate on a fully idle box interleaved with the reference fork
-   (`bench_results/run_cpu_bench.bat`). (c) `cargo check -p hearth-diffusion` warns that
-   `FluxTransformer::gpu_f32_bufs` (`transformer.rs:46`) is never read — pre-existing, in SparkOC's
-   area, deliberately left alone.
+   (`bench_results/run_cpu_bench.bat`). (c) *Done (pt 15):* the `gpu_f32_bufs` warning is closed by
+   deleting the field and the upload behind it; the diffusion GPU path can re-add it the day it
+   consumes those buffers.
 10. **P-256 verification is 345.6 µs, and the levers are known.** Measured in release with the
    `--ignored` timing test in `tests/ecdsa_vectors.rs`. That is several times slower than OpenSSL and
    the reasons are not mysterious, in descending order of payoff: (a) the fixed-base multiply has no

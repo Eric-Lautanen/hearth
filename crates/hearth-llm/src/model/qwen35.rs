@@ -959,7 +959,7 @@ impl Qwen35Core {
         let dot = match entry.dtype {
             GgmlDType::PTQ1_0 => hearth_quant::dot_ptq1_0_q8_0_ptr,
             GgmlDType::PQ2_0 | GgmlDType::Q2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
-            GgmlDType::Q1_0 | GgmlDType::Q1_0_G128 => hearth_quant::dot_q1_0g128_q8_0_ptr,
+            GgmlDType::Q1_0 | GgmlDType::Q10G128 => hearth_quant::dot_q1_0g128_q8_0_ptr,
             GgmlDType::Q8_0 => hearth_quant::dot_q8_0_q8_0_ptr,
             other => {
                 return Err(format!(
@@ -995,7 +995,7 @@ impl Qwen35Core {
         let dot = match entry.dtype {
             GgmlDType::PTQ1_0 => hearth_quant::dot_ptq1_0_q8_0_ptr,
             GgmlDType::PQ2_0 | GgmlDType::Q2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
-            GgmlDType::Q1_0 | GgmlDType::Q1_0_G128 => hearth_quant::dot_q1_0g128_q8_0_ptr,
+            GgmlDType::Q1_0 | GgmlDType::Q10G128 => hearth_quant::dot_q1_0g128_q8_0_ptr,
             GgmlDType::Q8_0 => hearth_quant::dot_q8_0_q8_0_ptr,
             other => {
                 return Err(format!(

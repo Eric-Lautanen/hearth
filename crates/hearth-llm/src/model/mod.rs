@@ -23,10 +23,24 @@ use crate::config::ModelConfig;
 use crate::kvcache::{KVCache, KVStorage};
 use crate::ops;
 use crate::pool::ThreadPool;
-use hearth_compute::GpuCompute;
+use hearth_compute::{
+    CacheWriteBatchShape, CacheWriteShape, FlashAttnShape, FusedQkvBuffers, GpuCompute,
+    HeadNormShape, MlpBatchShape, MlpShape, NormShape, PrefillAttnShape, QkvBatchShape, QkvShape,
+    RopeConfig,
+};
 
+use matmul::BatchShape;
 use scratch::{BatchScratch, ForwardScratch, ForwardTimers};
 use tensor::TensorEntry;
+
+/// One token at one position: everything a single-token forward pass knows about the caller's
+/// loop. The two always travel together and always come from the same place — the decode loop's
+/// `(token, position)` pair — so they are one argument.
+#[derive(Debug, Clone, Copy)]
+struct DecodeStep {
+    token_id: u32,
+    pos: usize,
+}
 
 struct LayerTensorNames {
     attn_norm: String,
@@ -434,12 +448,9 @@ impl LlamaModel {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::needless_range_loop)]
     fn forward(
         &self,
-        token_ids: &[u32],
-        pos: usize,
+        step: DecodeStep,
         caches: &mut [KVCache],
         logits: &mut [f32],
         cancel: &AtomicBool,
@@ -460,7 +471,7 @@ impl LlamaModel {
         let nq = n_heads * head_dim;
         let nkv = n_kv_heads * head_dim;
         let seq_len = caches[0].current_len + 1;
-        let token_id = token_ids[0] as usize;
+        let token_id = step.token_id as usize;
 
         if sc.attn_scores.len() < seq_len {
             sc.attn_scores.resize(seq_len, 0.0f32);
@@ -495,7 +506,7 @@ impl LlamaModel {
 
         // FORWARD ALL LAYERS
         let mut has_qk_norm = false;
-        for layer in 0..n_layers {
+        for (layer, cache) in caches.iter_mut().enumerate().take(n_layers) {
             if cancel.load(Ordering::Relaxed) {
                 return Err("Cancelled".into());
             }
@@ -571,19 +582,21 @@ impl LlamaModel {
             let rope_dim = self.config.rope_dim as usize;
             for h in 0..n_heads {
                 let s = h * head_dim;
-                self.rope_cache.apply(&mut sc.q_heads[s..s + rope_dim], pos);
+                self.rope_cache
+                    .apply(&mut sc.q_heads[s..s + rope_dim], step.pos);
             }
             for h in 0..n_kv_heads {
                 let s = h * head_dim;
-                self.rope_cache.apply(&mut sc.k_heads[s..s + rope_dim], pos);
+                self.rope_cache
+                    .apply(&mut sc.k_heads[s..s + rope_dim], step.pos);
             }
             sc.timers.rope_us += t0.elapsed().as_micros();
 
             let t0 = std::time::Instant::now();
             for h in 0..n_kv_heads {
                 let s = h * head_dim;
-                caches[layer].write_kv(
-                    pos,
+                cache.write_kv(
+                    step.pos,
                     h,
                     &sc.k_heads[s..s + head_dim],
                     &sc.v_heads[s..s + head_dim],
@@ -596,7 +609,7 @@ impl LlamaModel {
             let t0 = std::time::Instant::now();
             let gpu_attn = if layer < self.gpu_layers && self.gpu_supports_model_dtypes() {
                 if let Some(ref gpu) = self.gpu {
-                    if !caches[layer].is_q8_0() {
+                    if !cache.is_q8_0() {
                         // Compact K/V from cache: [n_kv_heads x seq_len x head_dim]
                         let max_s = self.config.max_seq_len as usize;
                         let total_kv = n_kv_heads * seq_len * head_dim;
@@ -605,12 +618,10 @@ impl LlamaModel {
                         for kvh in 0..n_kv_heads {
                             let src_off = kvh * max_s * head_dim;
                             let dst_off = kvh * seq_len * head_dim;
-                            compact_k[dst_off..dst_off + seq_len * head_dim].copy_from_slice(
-                                &caches[layer].k[src_off..src_off + seq_len * head_dim],
-                            );
-                            compact_v[dst_off..dst_off + seq_len * head_dim].copy_from_slice(
-                                &caches[layer].v[src_off..src_off + seq_len * head_dim],
-                            );
+                            compact_k[dst_off..dst_off + seq_len * head_dim]
+                                .copy_from_slice(&cache.k[src_off..src_off + seq_len * head_dim]);
+                            compact_v[dst_off..dst_off + seq_len * head_dim]
+                                .copy_from_slice(&cache.v[src_off..src_off + seq_len * head_dim]);
                         }
                         let q_buf = gpu.upload_f32(&sc.q_heads[..nq], "q_attn");
                         // Combine K and V into one buffer for flash_attention (cache API)
@@ -620,14 +631,16 @@ impl LlamaModel {
                         if let Some(out_buf) = gpu.flash_attention(
                             &q_buf,
                             &kv_buf,
-                            0,
-                            (total_kv as u64) * 4,
-                            n_heads as u32,
-                            n_kv_heads as u32,
-                            head_dim as u32,
-                            seq_len as u32,
-                            seq_len as u32,
-                            pos as u32,
+                            FlashAttnShape {
+                                kv_offset: 0,
+                                kv_total_bytes: (total_kv as u64) * 4,
+                                n_heads: n_heads as u32,
+                                n_kv_heads: n_kv_heads as u32,
+                                head_dim: head_dim as u32,
+                                seq_len_q: seq_len as u32,
+                                seq_len_kv: seq_len as u32,
+                                pos: step.pos as u32,
+                            },
                         ) {
                             let out = gpu.readback_f32(&out_buf, nq);
                             sc.attn_out[..nq].copy_from_slice(&out[..nq]);
@@ -645,15 +658,15 @@ impl LlamaModel {
                 false
             };
             if !gpu_attn {
-                if caches[layer].is_q8_0() {
+                if cache.is_q8_0() {
                     let blocks_per_pos = head_dim.div_ceil(32);
                     let q8_row = blocks_per_pos * 34;
-                    let q8_stride = caches[layer].max_seq_len * q8_row;
+                    let q8_stride = cache.max_seq_len * q8_row;
                     for kvh in 0..n_kv_heads {
                         let head_off = kvh * q8_stride;
                         let head_len = seq_len * q8_row;
-                        let k_q8 = &caches[layer].k_q8[head_off..head_off + head_len];
-                        let v_q8 = &caches[layer].v_q8[head_off..head_off + head_len];
+                        let k_q8 = &cache.k_q8[head_off..head_off + head_len];
+                        let v_q8 = &cache.v_q8[head_off..head_off + head_len];
                         for r in 0..kv_repeat {
                             let qh = kvh * kv_repeat + r;
                             let qs = qh * head_dim;
@@ -675,8 +688,8 @@ impl LlamaModel {
                         let kvh = qh / kv_repeat;
                         let qs = qh * head_dim;
                         let os = qh * head_dim;
-                        let ks = caches[layer].k_slice(kvh, seq_len);
-                        let vs = caches[layer].v_slice(kvh, seq_len);
+                        let ks = cache.k_slice(kvh, seq_len);
+                        let vs = cache.v_slice(kvh, seq_len);
                         sc.norm_tmp[..head_dim].copy_from_slice(&sc.q_heads[qs..qs + head_dim]);
                         ops::attention(
                             &sc.norm_tmp[..head_dim],
@@ -846,19 +859,17 @@ impl LlamaModel {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    fn ensure_batch_size(
-        &self,
-        bs: &mut BatchScratch,
-        seq_len: usize,
-        d: usize,
-        nq: usize,
-        nkv: usize,
-        ffn_dim: usize,
-        head_dim: usize,
-        max_seq: usize,
-    ) {
+    /// Grow the batch scratch buffers until they can hold `seq_len` tokens.
+    ///
+    /// Every shape but the two arguments is read from `self.config`: they are properties of the
+    /// model, and each caller was deriving the same numbers from the same config before passing
+    /// them in, one parameter at a time.
+    fn ensure_batch_size(&self, bs: &mut BatchScratch, seq_len: usize, max_seq: usize) {
+        let d = self.config.d_model as usize;
+        let head_dim = self.config.head_dim as usize;
+        let nq = self.config.n_heads as usize * head_dim;
+        let nkv = self.config.n_kv_heads as usize * head_dim;
+        let ffn_dim = self.config.d_ffn as usize;
         let need = |v: &mut Vec<f32>, n: usize| {
             if v.len() < n {
                 v.resize(n, 0.0f32);
@@ -885,8 +896,6 @@ impl LlamaModel {
         }
     }
 
-    #[allow(dead_code)]
-    #[allow(clippy::needless_range_loop)]
     fn forward_batch(
         &self,
         prompt_ids: &[u32],
@@ -907,7 +916,7 @@ impl LlamaModel {
         let nkv = n_kv_heads * head_dim;
         let max_seq = self.config.max_seq_len as usize;
 
-        self.ensure_batch_size(bs, seq_len, d, nq, nkv, ffn_dim, head_dim, max_seq);
+        self.ensure_batch_size(bs, seq_len, max_seq);
 
         {
             let entry = self
@@ -932,7 +941,7 @@ impl LlamaModel {
             }
         }
 
-        for layer in 0..n_layers {
+        for (layer, cache) in caches.iter_mut().enumerate().take(n_layers) {
             if cancel.load(Ordering::Relaxed) {
                 return Err("Cancelled".into());
             }
@@ -964,9 +973,7 @@ impl LlamaModel {
                 &bs.residual[..seq_len * d],
                 &mut bs.q_buf[..seq_len * nq],
                 rb,
-                nq,
-                d,
-                seq_len,
+                BatchShape { n_cols: d, seq_len },
                 Some(&bs.batch_q8[..]),
             )?;
             self.matmul_batch(
@@ -974,9 +981,7 @@ impl LlamaModel {
                 &bs.residual[..seq_len * d],
                 &mut bs.k_buf[..seq_len * nkv],
                 rb,
-                nkv,
-                d,
-                seq_len,
+                BatchShape { n_cols: d, seq_len },
                 Some(&bs.batch_q8[..]),
             )?;
             self.matmul_batch(
@@ -984,9 +989,7 @@ impl LlamaModel {
                 &bs.residual[..seq_len * d],
                 &mut bs.v_buf[..seq_len * nkv],
                 rb,
-                nkv,
-                d,
-                seq_len,
+                BatchShape { n_cols: d, seq_len },
                 Some(&bs.batch_q8[..]),
             )?;
 
@@ -1052,7 +1055,7 @@ impl LlamaModel {
                 for h in 0..n_kv_heads {
                     let k_off = s * nkv + h * head_dim;
                     let v_off = s * nkv + h * head_dim;
-                    caches[layer].write_kv(
+                    cache.write_kv(
                         s,
                         h,
                         &bs.k_heads[k_off..k_off + head_dim],
@@ -1061,15 +1064,15 @@ impl LlamaModel {
                 }
             }
 
-            if caches[layer].is_q8_0() {
+            if cache.is_q8_0() {
                 let scratch_needed = self.pool.num_threads() * max_seq;
                 if bs.attn_scores.len() < scratch_needed {
                     bs.attn_scores.resize(scratch_needed, 0.0f32);
                 }
                 ops::attention_batch_q8_0_parallel(ops::AttnBatchQ8Params {
                     q_heads: &bs.q_heads[..seq_len * nq],
-                    k_q8: &caches[layer].k_q8,
-                    v_q8: &caches[layer].v_q8,
+                    k_q8: &cache.k_q8,
+                    v_q8: &cache.v_q8,
                     seq_len,
                     n_q_heads: n_heads,
                     n_kv_heads,
@@ -1086,8 +1089,8 @@ impl LlamaModel {
                 }
                 ops::attention_batch_parallel(ops::AttnBatchParams {
                     q_heads: &bs.q_heads[..seq_len * nq],
-                    k_cache: &caches[layer].k,
-                    v_cache: &caches[layer].v,
+                    k_cache: &cache.k,
+                    v_cache: &cache.v,
                     seq_len,
                     n_q_heads: n_heads,
                     n_kv_heads,
@@ -1115,9 +1118,10 @@ impl LlamaModel {
                 &bs.attn_out[..seq_len * nq],
                 &mut bs.q_buf[..seq_len * d],
                 rb,
-                d,
-                nq,
-                seq_len,
+                BatchShape {
+                    n_cols: nq,
+                    seq_len,
+                },
                 Some(&bs.batch_q8[..]),
             )?;
             for i in 0..seq_len * d {
@@ -1149,9 +1153,7 @@ impl LlamaModel {
                 &bs.residual[..seq_len * d],
                 &mut bs.gate[..seq_len * ffn_dim],
                 rb,
-                ffn_dim,
-                d,
-                seq_len,
+                BatchShape { n_cols: d, seq_len },
                 Some(&bs.batch_q8[..]),
             )?;
             self.matmul_batch(
@@ -1159,9 +1161,7 @@ impl LlamaModel {
                 &bs.residual[..seq_len * d],
                 &mut bs.up[..seq_len * ffn_dim],
                 rb,
-                ffn_dim,
-                d,
-                seq_len,
+                BatchShape { n_cols: d, seq_len },
                 Some(&bs.batch_q8[..]),
             )?;
             let fd_q8_needed = seq_len * (ffn_dim.div_ceil(32) * 34);
@@ -1183,9 +1183,10 @@ impl LlamaModel {
                 &bs.gate[..seq_len * ffn_dim],
                 &mut bs.q_buf[..seq_len * d],
                 rb,
-                d,
-                ffn_dim,
-                seq_len,
+                BatchShape {
+                    n_cols: ffn_dim,
+                    seq_len,
+                },
                 Some(&bs.batch_q8[..]),
             )?;
             for i in 0..seq_len * d {
@@ -1257,7 +1258,7 @@ impl LlamaModel {
             head_norm_tmp: Vec::new(),
         };
         let mut rb = self.row_buf.lock().unwrap().clone();
-        self.ensure_batch_size(&mut bs, seq_len, d, nq, nkv, ffn_dim, head_dim, max_seq);
+        self.ensure_batch_size(&mut bs, seq_len, max_seq);
 
         {
             let entry = self
@@ -1310,9 +1311,7 @@ impl LlamaModel {
                 &bs.residual[..seq_len * d],
                 &mut bs.q_buf[..seq_len * nq],
                 &mut rb,
-                nq,
-                d,
-                seq_len,
+                BatchShape { n_cols: d, seq_len },
                 Some(&bs.batch_q8[..]),
             )?;
             self.matmul_batch(
@@ -1320,9 +1319,7 @@ impl LlamaModel {
                 &bs.residual[..seq_len * d],
                 &mut bs.k_buf[..seq_len * nkv],
                 &mut rb,
-                nkv,
-                d,
-                seq_len,
+                BatchShape { n_cols: d, seq_len },
                 Some(&bs.batch_q8[..]),
             )?;
             self.matmul_batch(
@@ -1330,9 +1327,7 @@ impl LlamaModel {
                 &bs.residual[..seq_len * d],
                 &mut bs.v_buf[..seq_len * nkv],
                 &mut rb,
-                nkv,
-                d,
-                seq_len,
+                BatchShape { n_cols: d, seq_len },
                 Some(&bs.batch_q8[..]),
             )?;
 
@@ -1425,11 +1420,13 @@ impl LlamaModel {
                     &bs.q_heads[..seq_len * nq],
                     &cache.k,
                     &cache.v,
-                    seq_len,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    max_seq,
+                    ops::AttnBatchShape {
+                        seq_len,
+                        n_q_heads: n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_seq_len: max_seq,
+                    },
                     &mut bs.attn_out[..seq_len * nq],
                     &mut bs.attn_scores,
                 );
@@ -1451,9 +1448,10 @@ impl LlamaModel {
                 &bs.attn_out[..seq_len * nq],
                 &mut bs.q_buf[..seq_len * d],
                 &mut rb,
-                d,
-                nq,
-                seq_len,
+                BatchShape {
+                    n_cols: nq,
+                    seq_len,
+                },
                 Some(&bs.batch_q8[..]),
             )?;
             for i in 0..seq_len * d {
@@ -1484,9 +1482,7 @@ impl LlamaModel {
                 &bs.residual[..seq_len * d],
                 &mut bs.gate[..seq_len * ffn_dim],
                 &mut rb,
-                ffn_dim,
-                d,
-                seq_len,
+                BatchShape { n_cols: d, seq_len },
                 Some(&bs.batch_q8[..]),
             )?;
             self.matmul_batch(
@@ -1494,9 +1490,7 @@ impl LlamaModel {
                 &bs.residual[..seq_len * d],
                 &mut bs.up[..seq_len * ffn_dim],
                 &mut rb,
-                ffn_dim,
-                d,
-                seq_len,
+                BatchShape { n_cols: d, seq_len },
                 Some(&bs.batch_q8[..]),
             )?;
 
@@ -1519,9 +1513,10 @@ impl LlamaModel {
                 &bs.gate[..seq_len * ffn_dim],
                 &mut bs.q_buf[..seq_len * d],
                 &mut rb,
-                d,
-                ffn_dim,
-                seq_len,
+                BatchShape {
+                    n_cols: ffn_dim,
+                    seq_len,
+                },
                 Some(&bs.batch_q8[..]),
             )?;
             for i in 0..seq_len * d {
@@ -1550,19 +1545,6 @@ impl LlamaModel {
             .collect();
 
         Ok((hidden_states, pooled))
-    }
-
-    #[allow(dead_code)]
-    fn prefill_batch(
-        &self,
-        prompt_ids: &[u32],
-        caches: &mut [KVCache],
-        logits: &mut [f32],
-        cancel: &AtomicBool,
-        bs: &mut BatchScratch,
-        rb: &mut Vec<f32>,
-    ) -> Result<(), String> {
-        self.forward_batch(prompt_ids, caches, logits, cancel, bs, rb)
     }
 
     pub fn tokenizer(&self) -> &std::sync::Mutex<hearth_tokenizer::Tokenizer> {
@@ -1794,7 +1776,6 @@ impl LlamaModel {
             });
         }
 
-        #[allow(clippy::needless_range_loop)]
         for layer in 0..n_layers {
             if cancel.load(Ordering::Relaxed) {
                 return Err("Cancelled".into());
@@ -1834,16 +1815,20 @@ impl LlamaModel {
                 // Fallback: if non-Q1_0_G128 or fused_qkv unavailable, use separate matmuls
                 if qk_q != Ok(hearth_compute::QuantKind::Q1_0G128)
                     || !gpu.fused_qkv(
-                        &qw,
-                        &kw,
-                        &vw,
-                        &norm_tmp,
-                        &q_buf,
-                        &k_buf,
-                        &v_buf,
-                        nq as u32,
-                        (n_kv_heads * head_dim) as u32,
-                        d as u32,
+                        FusedQkvBuffers {
+                            qw: &qw,
+                            kw: &kw,
+                            vw: &vw,
+                            x: &norm_tmp,
+                            q_out: &q_buf,
+                            k_out: &k_buf,
+                            v_out: &v_buf,
+                        },
+                        QkvShape {
+                            m: nq as u32,
+                            n: (n_kv_heads * head_dim) as u32,
+                            k: d as u32,
+                        },
                     )
                 {
                     let wr = |i| self.tensors[&wnames[layer][i]].n_rows();
@@ -1900,29 +1885,33 @@ impl LlamaModel {
             // --- RoPE ---
             gpu.rope_combined(
                 &q_buf,
-                n_heads as u32,
-                head_dim as u32,
-                rope_dim as u32,
+                RopeConfig {
+                    n_heads: n_heads as u32,
+                    head_dim: head_dim as u32,
+                    rope_dim: rope_dim as u32,
+                    theta: rope_theta,
+                    freq_scale: rope_freq_scale,
+                    yarn_corr_low,
+                    yarn_corr_high,
+                    yarn_mscale,
+                    yarn_n_dims,
+                },
                 pos as u32,
-                rope_theta,
-                rope_freq_scale,
-                yarn_corr_low,
-                yarn_corr_high,
-                yarn_mscale,
-                yarn_n_dims,
             );
             gpu.rope_combined(
                 &k_buf,
-                n_kv_heads as u32,
-                head_dim as u32,
-                rope_dim as u32,
+                RopeConfig {
+                    n_heads: n_kv_heads as u32,
+                    head_dim: head_dim as u32,
+                    rope_dim: rope_dim as u32,
+                    theta: rope_theta,
+                    freq_scale: rope_freq_scale,
+                    yarn_corr_low,
+                    yarn_corr_high,
+                    yarn_mscale,
+                    yarn_n_dims,
+                },
                 pos as u32,
-                rope_theta,
-                rope_freq_scale,
-                yarn_corr_low,
-                yarn_corr_high,
-                yarn_mscale,
-                yarn_n_dims,
             );
 
             // KV cache write
@@ -1936,10 +1925,12 @@ impl LlamaModel {
                 &k_buf,
                 &v_buf,
                 layer_buf,
-                pos as u32,
-                n_kv_heads as u32,
-                head_dim as u32,
-                cache_stride as u32,
+                CacheWriteShape {
+                    pos: pos as u32,
+                    n_kv_heads: n_kv_heads as u32,
+                    head_dim: head_dim as u32,
+                    cache_stride: cache_stride as u32,
+                },
             );
 
             // Flash attention
@@ -1947,14 +1938,16 @@ impl LlamaModel {
                 .flash_attention(
                     &q_buf,
                     layer_buf,
-                    0,
-                    v_offset,
-                    n_heads as u32,
-                    n_kv_heads as u32,
-                    head_dim as u32,
-                    1,                   // seq_len_q = 1 for single-token decode
-                    cache_stride as u32, // seq_len_kv = cache stride for head indexing
-                    pos as u32,
+                    FlashAttnShape {
+                        kv_offset: 0,
+                        kv_total_bytes: v_offset,
+                        n_heads: n_heads as u32,
+                        n_kv_heads: n_kv_heads as u32,
+                        head_dim: head_dim as u32,
+                        seq_len_q: 1,                    // single-token decode
+                        seq_len_kv: cache_stride as u32, // cache stride drives head indexing
+                        pos: pos as u32,
+                    },
                 )
                 .ok_or_else(|| format!("flash_attention failed layer {}", layer))?;
 
@@ -2030,8 +2023,10 @@ impl LlamaModel {
                         &ffn_norm_tmp,
                         &gate_buf,
                         &up_buf,
-                        ffn_dim as u32,
-                        d as u32,
+                        MlpShape {
+                            m: ffn_dim as u32,
+                            n: d as u32,
+                        },
                     )
                 {
                     let gb = gpu
@@ -2310,10 +2305,12 @@ impl LlamaModel {
                 &hidden_buf,
                 &anb[layer],
                 &norm_tmp,
-                seq_len,
-                d,
-                rms_norm_eps,
-                post_norm,
+                NormShape {
+                    seq_len,
+                    d,
+                    eps: rms_norm_eps,
+                    post_norm,
+                },
             );
 
             // --- BATCH QKV ---
@@ -2344,7 +2341,21 @@ impl LlamaModel {
                 let qk_q = qk(0)?;
                 if qk_q == hearth_compute::QuantKind::Q1_0G128
                     && gpu.fused_qkv_batch(
-                        &qw, &kw, &vw, &norm_tmp, &q_buf, &k_buf, &v_buf, nq, nkv, d, seq_len,
+                        FusedQkvBuffers {
+                            qw: &qw,
+                            kw: &kw,
+                            vw: &vw,
+                            x: &norm_tmp,
+                            q_out: &q_buf,
+                            k_out: &k_buf,
+                            v_out: &v_buf,
+                        },
+                        QkvBatchShape {
+                            nq,
+                            nkv,
+                            k: d,
+                            seq_len,
+                        },
                     )
                 {
                     // Fused path succeeded — Q, K, V already written to buffers
@@ -2375,51 +2386,59 @@ impl LlamaModel {
                 gpu.head_rms_norm_batch(
                     &q_buf,
                     qnb_ref,
-                    n_heads,
-                    head_dim,
-                    seq_len,
-                    rms_norm_eps,
-                    post_norm,
+                    HeadNormShape {
+                        n_heads,
+                        head_dim,
+                        seq_len,
+                        eps: rms_norm_eps,
+                        post_norm,
+                    },
                 );
             }
             if let Some(ref knb_ref) = knb[layer] {
                 gpu.head_rms_norm_batch(
                     &k_buf,
                     knb_ref,
-                    n_kv_heads,
-                    head_dim,
-                    seq_len,
-                    rms_norm_eps,
-                    post_norm,
+                    HeadNormShape {
+                        n_heads: n_kv_heads,
+                        head_dim,
+                        seq_len,
+                        eps: rms_norm_eps,
+                        post_norm,
+                    },
                 );
             }
 
             // --- BATCH RoPE on Q and K ---
             gpu.rope_batch(
                 &q_buf,
-                n_heads,
-                head_dim,
-                rope_dim,
+                RopeConfig {
+                    n_heads,
+                    head_dim,
+                    rope_dim,
+                    theta: rope_theta,
+                    freq_scale: rope_freq_scale,
+                    yarn_corr_low,
+                    yarn_corr_high,
+                    yarn_mscale,
+                    yarn_n_dims,
+                },
                 seq_len,
-                rope_theta,
-                rope_freq_scale,
-                yarn_corr_low,
-                yarn_corr_high,
-                yarn_mscale,
-                yarn_n_dims,
             );
             gpu.rope_batch(
                 &k_buf,
-                n_kv_heads,
-                head_dim,
-                rope_dim,
+                RopeConfig {
+                    n_heads: n_kv_heads,
+                    head_dim,
+                    rope_dim,
+                    theta: rope_theta,
+                    freq_scale: rope_freq_scale,
+                    yarn_corr_low,
+                    yarn_corr_high,
+                    yarn_mscale,
+                    yarn_n_dims,
+                },
                 seq_len,
-                rope_theta,
-                rope_freq_scale,
-                yarn_corr_low,
-                yarn_corr_high,
-                yarn_mscale,
-                yarn_n_dims,
             );
 
             // --- BATCH KV CACHE WRITE ---
@@ -2428,10 +2447,12 @@ impl LlamaModel {
                 &k_buf,
                 &v_buf,
                 layer_buf,
-                seq_len,
-                n_kv_heads,
-                head_dim,
-                cache_stride,
+                CacheWriteBatchShape {
+                    seq_len,
+                    n_kv_heads,
+                    head_dim,
+                    cache_stride,
+                },
             );
 
             // --- FLASH ATTENTION PREFILL (causal) ---
@@ -2439,11 +2460,13 @@ impl LlamaModel {
                 .flash_attention_prefill(
                     &q_buf,
                     layer_buf,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    seq_len,
-                    cache_stride,
+                    PrefillAttnShape {
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        seq_len_q: seq_len,
+                        cache_stride,
+                    },
                 )
                 .ok_or_else(|| format!("flash_attention_prefill failed layer {}", layer))?;
             gpu.copy_buffer(&attn_out, &attn_out_buf);
@@ -2485,10 +2508,12 @@ impl LlamaModel {
                     &hidden_buf,
                     &fnb[layer],
                     &ffn_norm_tmp,
-                    seq_len,
-                    d,
-                    rms_norm_eps,
-                    post_norm,
+                    NormShape {
+                        seq_len,
+                        d,
+                        eps: rms_norm_eps,
+                        post_norm,
+                    },
                 );
 
                 // FFN gate + up (batch fused — one dispatch replaces 2 matmuls + 2 copies)
@@ -2504,9 +2529,11 @@ impl LlamaModel {
                         &ffn_norm_tmp,
                         &gate_buf,
                         &up_buf,
-                        ffn_dim,
-                        d,
-                        seq_len,
+                        MlpBatchShape {
+                            ffn_dim,
+                            k: d,
+                            seq_len,
+                        },
                     )
                 {
                     // Fused path succeeded
@@ -2632,23 +2659,6 @@ impl LlamaModel {
             ops::rms_norm_gemma(x, weight, eps, out);
         } else {
             ops::rms_norm(x, weight, eps, out);
-        }
-    }
-
-    #[allow(dead_code)]
-    fn norm_batch(
-        &self,
-        x: &[f32],
-        weight: &[f32],
-        eps: f32,
-        out: &mut [f32],
-        seq_len: usize,
-        dim: usize,
-    ) {
-        if self.config.post_norm {
-            ops::rms_norm_gemma_batch(x, weight, eps, out, seq_len, dim);
-        } else {
-            ops::rms_norm_batch(x, weight, eps, out, seq_len, dim);
         }
     }
 }
@@ -2790,8 +2800,10 @@ impl LlamaModel {
                 })
                 .collect();
             self.forward(
-                &[warmup_tok],
-                0,
+                DecodeStep {
+                    token_id: warmup_tok,
+                    pos: 0,
+                },
                 &mut warmup_caches,
                 warmup_logits,
                 cancel,
@@ -2848,8 +2860,10 @@ impl LlamaModel {
                     })?;
                 } else {
                     self.forward(
-                        &[tid],
-                        i,
+                        DecodeStep {
+                            token_id: tid,
+                            pos: i,
+                        },
                         &mut caches,
                         &mut logits,
                         cancel,
@@ -2949,8 +2963,10 @@ impl LlamaModel {
                 })?;
             } else {
                 self.forward(
-                    &[token],
-                    pos,
+                    DecodeStep {
+                        token_id: token,
+                        pos,
+                    },
                     &mut caches,
                     &mut logits,
                     cancel,
@@ -3093,8 +3109,10 @@ mod tests {
         let mut rb = cpu_model.row_buf.lock().unwrap();
         cpu_model
             .forward(
-                &[0u32],
-                0,
+                DecodeStep {
+                    token_id: 0,
+                    pos: 0,
+                },
                 &mut cpu_caches,
                 &mut logits_cpu,
                 &cancel,
@@ -3460,29 +3478,33 @@ mod tests {
         let gpu_k_rope = gpu.upload_f32(&gpu_k_hnorm, "k_rope_debug");
         gpu.rope_combined(
             &gpu_q_rope,
-            n_heads as u32,
-            head_dim as u32,
-            rope_dim as u32,
+            RopeConfig {
+                n_heads: n_heads as u32,
+                head_dim: head_dim as u32,
+                rope_dim: rope_dim as u32,
+                theta: rope_theta,
+                freq_scale: rope_freq_scale,
+                yarn_corr_low: 0.0,
+                yarn_corr_high: 0.0,
+                yarn_mscale: 1.0,
+                yarn_n_dims: 0.0,
+            },
             0,
-            rope_theta,
-            rope_freq_scale,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
         );
         gpu.rope_combined(
             &gpu_k_rope,
-            n_kv_heads as u32,
-            head_dim as u32,
-            rope_dim as u32,
+            RopeConfig {
+                n_heads: n_kv_heads as u32,
+                head_dim: head_dim as u32,
+                rope_dim: rope_dim as u32,
+                theta: rope_theta,
+                freq_scale: rope_freq_scale,
+                yarn_corr_low: 0.0,
+                yarn_corr_high: 0.0,
+                yarn_mscale: 1.0,
+                yarn_n_dims: 0.0,
+            },
             0,
-            rope_theta,
-            rope_freq_scale,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
         );
         let gpu_q_roped = gpu.readback_f32(&gpu_q_rope, nq);
         let gpu_k_roped = gpu.readback_f32(&gpu_k_rope, nkv);

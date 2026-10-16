@@ -85,10 +85,80 @@ rule violations instead of a wrong predicate.
   count was five (three `dead_code`, two `unused_unsafe`). Left in history rather than
   force-pushed over — the operator had just finished a history rewrite, and a second rewrite to
   fix a number in a message is a worse trade than this note.
-- **What remains of the same rule:** `hearth-llm` 13 (5 `dead_code`, 4 `needless_range_loop`,
-  3 `too_many_arguments`, 1 combined), `hearth-diffusion` 7, `hearth-compute` 4, `hearth-gguf` 1.
-  The `needless_range_loop` and `too_many_arguments` ones sit in matmul/ops hot paths, where the
-  honest fix (iterator forms, a struct for the arguments) needs a benchmark, not a rewrite.
+- **What remained of the same rule:** `hearth-llm` 13 (5 `dead_code`, 4 `needless_range_loop`,
+  3 `too_many_arguments`, 1 combined), `hearth-diffusion` 7, `hearth-compute` 4, `hearth-gguf` 1 —
+  all of them closed the same day, next entry.
+
+### Workspace allow-block sweep — every one removed, each fixed at its cause (buffy, 2026-10-16)
+
+Closes the rule instead of closing a crate: **zero `#[allow(...)]` and zero `#[expect(...)]` in the
+workspace**, and nothing silenced to get there. Started from the 25 sites the quant pass left
+(`hearth-llm` 13, `hearth-diffusion` 7, `hearth-compute` 4, `hearth-gguf` 1).
+
+- **`too_many_arguments`, 19 sites.** `hearth-compute`'s 15 dispatch methods take named `Copy` shape
+  structs ([args.rs](../crates/hearth-compute/src/args.rs)) while the *buffers* stay explicit — the
+  split is deliberate, since a struct that hides the buffers hides the aliasing that matters. Method
+  bodies are unchanged: each destructures its shape back into the old local names on the way in, so
+  the diff is a signature plus one line. Call sites now name their fields, which is what the lint was
+  really about (`seq_len_q` and `seq_len_kv` differed only by position).
+- **`ensure_batch_size` took seven shape arguments and needs two.** `d`, `nq`, `nkv`, `ffn_dim` and
+  `head_dim` are all `self.config` properties and both callers re-derived them; they are read where
+  they belong now. `matmul_batch`'s row count was never read at all — deleted, not turned into a new
+  hard error, since that would change behaviour on model families this box cannot test and the tensor
+  already knows its rows. `n_cols` stays: the body checks it against the tensor, which is what catches
+  a weight name mixed up.
+- **`GgmlDType` variants are UpperCamelCase** (`Q2K`, `IQ4NL`, `Q10G128`): the lint fires when a
+  *cased* letter sits next to an underscore, so `Q1_0`, `Q2_0`, `Q4_0_4_4` were never flagged and are
+  untouched. `name()` still returns the spec spellings (`"Q2_K"`, `"Q1_0_G128"`), so logs, the UI and
+  error messages are byte-identical; only identifiers moved, and the enum's doc comment says so.
+- **Both `needless_range_loop`s were the KV-cache batches:** `for layer in 0..n_layers` indexing
+  `caches[layer]` sixteen times became `iter_mut().enumerate().take(n_layers)`, with `layer` kept for
+  `layer_names` and the `blk.{layer}` name. Same machine code (iterating a slice is the same pointer
+  walk), six bounds checks a layer gone from the source. `forward` also lost a parameter by naming
+  its `(token, position)` pair: `DecodeStep`.
+- **Deleted rather than allowed:** the never-wired FLUX VAE scaffolding (`VaeDecoder` config stub plus
+  local copies of `ops::group_norm`/`resnet_block`/`upsample`, which duplicated `ops`) and
+  `GpuDevice`'s `instance`/`adapter` handles. Not just tidying: the diffusion constructor *stopped
+  uploading every BF16/F32 weight as f32*, which no forward path read — real VRAM and construction
+  time for nothing. `cpu_q1_0_dot` (an unused scalar reference) is now used: the fused gate/up test
+  cross-checks the shader against it instead of only against its own arithmetic.
+- **My own mistake, kept:** the first scripted pass over the 14 `matmul_batch` call sites was off by
+  one and deleted the row-buffer argument instead of the dead row count. One build caught it
+  (`expected &mut Vec<f32>, found usize`); the repair script put the argument back per enclosing
+  function (`rb` where it is a reference, `&mut rb` where it is a local) and both deleted-line counts
+  came out exact.
+- **Verified:** `cargo clippy --workspace --all-targets -- -D warnings` exit 0,
+  `cargo fmt --check` exit 0, `cargo check --workspace --all-targets` warning-free,
+  `cargo test --workspace -- --test-threads=1` green (42 quant, 170 tls, rest), release build clean.
+- **Benchmark: this sweep is neutral, and the sweep itself found the real regression.** The 6-model
+  mandate could not be run against the recorded baseline: the first attempts read 13-17 tok/s on
+  Bonsai-1.7B-Q1_0 where the 2026-10-15 sweep recorded 47.1, and back-to-back runs of the *same*
+  binary varied 25% (Taskmgr, Chrome, three other agents' apps and a second build were all live). So
+  it was replaced with an interleaved A/B that needs no idle box: three arms alternating, three
+  rounds, one model, 36.6 °C / 120% perf throughout.
+
+  | arm | r1 | r2 | r3 | mean |
+  |-----|----|----|----|------|
+  | previous binary (2026-10-16 00:12, `-C target-cpu=native`) | 48.54 | 44.44 | 41.81 | 44.9 |
+  | this sweep, built `-C target-cpu=native` | 42.12 | 44.72 | 43.40 | 43.4 |
+  | this sweep, the committed `x86-64-v2` baseline | 12.64 | 13.05 | 12.65 | 12.8 |
+
+  All three arms produced **byte-identical** text (`ed6e8cb4d000e460`, 50 tokens, temp 0). Two
+  conclusions, and the second is the one that matters: **the allow sweep costs nothing** (44.9 vs 43.4
+  mean, inside the 41.8-48.5 spread of the *same* arm), and **`26eab4b`'s `import x86-64-v2` baseline
+  costs 3.4× on the 1.7B Q1_0** — a single-variable comparison (same source, `RUSTFLAGS` override in a
+  side target dir, nothing else changed), not the 1-3% the commit message claims. The kernels are
+  unaffected because they are `#[target_feature]` behind runtime probes; what is lost is the
+  autovectorised f32 per-token work (rms_norm, silu, softmax, Q8 activation quantisation), which is a
+  large fraction of a 1.7B decode step. Reported to SparkOC in the room with the binaries left in
+  place (`target/buffy-ab/post-target`, `target/buffy-ab/native-target`, `target/release`); the
+  native-vs-baseline decision is theirs to make, and the 6-model mandate should be re-run on an idle
+  box once the baseline is settled.
+- **AGENTS.md now states the rule**, not just the practice: no `#[allow(...)]` anywhere, never a
+  "pre-existing" or "OK here" warning, the three-part gate, and a finding that cannot be fixed
+  without changing behaviour is a finding to report and measure. Two stale claims in that file were
+  corrected: `cargo test --test-threads=1 -p …` does not parse (and never did — cargo rejects it),
+  and "pre-existing clippy warnings in GPU stubs are OK" described a state that no longer exists.
 
 ### hearth-tls slice 20 — the verifier: the first thing in the crate that can accept (buffy, 2026-10-16)
 

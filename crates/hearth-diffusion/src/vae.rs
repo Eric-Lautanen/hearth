@@ -1,4 +1,10 @@
-use crate::ops;
+//! Latent → image decoding.
+//!
+//! Only the placeholder path below is wired up. A real FLUX VAE decoder needs Conv2d +
+//! GroupNorm + ResnetBlock + AttnBlock weights from the VAE GGUF, which this crate does not
+//! load yet; the half-written scaffolding for it (a `VaeDecoder` config stub and local copies of
+//! `group_norm`/`resnet_block`/`upsample`) was removed rather than left behind an allow attribute
+//! — it duplicated `crate::ops`, nothing called it, and it is in git history if it is wanted back.
 
 pub fn decode(
     latent: &[f32],
@@ -80,135 +86,4 @@ fn stub_decode(latent: &[f32], lh: usize, lw: usize, c: usize, h: usize, w: usiz
     }
 
     rgba
-}
-
-#[allow(dead_code)]
-pub struct VaeDecoder {
-    z_channels: usize,
-    ch: usize,
-    ch_mult: Vec<usize>,
-    num_res_blocks: usize,
-}
-
-impl VaeDecoder {
-    #[allow(dead_code)]
-    pub fn new(z_channels: usize) -> Self {
-        VaeDecoder {
-            z_channels,
-            ch: 128,
-            ch_mult: vec![1, 2, 4, 4],
-            num_res_blocks: 2,
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn group_norm(
-    x: &mut [f32],
-    weight: &[f32],
-    bias: &[f32],
-    n_groups: usize,
-    c: usize,
-    hw: usize,
-    eps: f32,
-) {
-    let c_per_group = c / n_groups;
-    for g in 0..n_groups {
-        let c_start = g * c_per_group;
-        let c_end = c_start + c_per_group;
-        let n_elem = c_per_group * hw;
-        let mean: f32 = x[c_start * hw..c_end * hw].iter().sum::<f32>() / n_elem as f32;
-        let var: f32 = x[c_start * hw..c_end * hw]
-            .iter()
-            .map(|&v| (v - mean).powi(2))
-            .sum::<f32>()
-            / n_elem as f32;
-        let inv_std = 1.0 / (var + eps).sqrt();
-        for ic in c_start..c_end {
-            for i in 0..hw {
-                let idx = ic * hw + i;
-                x[idx] = (x[idx] - mean) * inv_std * weight[ic] + bias[ic];
-            }
-        }
-    }
-}
-
-#[allow(dead_code)]
-struct ResnetBlockParams<'a> {
-    x: &'a [f32],
-    h: usize,
-    w: usize,
-    in_ch: usize,
-    out_ch: usize,
-    norm1_w: &'a [f32],
-    norm1_b: &'a [f32],
-    conv1_w: &'a [f32],
-    conv1_b: &'a [f32],
-    norm2_w: &'a [f32],
-    norm2_b: &'a [f32],
-    conv2_w: &'a [f32],
-    conv2_b: &'a [f32],
-    shortcut_w: Option<&'a [f32]>,
-    shortcut_b: Option<&'a [f32]>,
-}
-
-#[allow(dead_code)]
-fn resnet_block(p: ResnetBlockParams<'_>) -> Vec<f32> {
-    let ResnetBlockParams {
-        x,
-        h,
-        w,
-        in_ch,
-        out_ch,
-        norm1_w,
-        norm1_b,
-        conv1_w,
-        conv1_b,
-        norm2_w,
-        norm2_b,
-        conv2_w,
-        conv2_b,
-        shortcut_w,
-        shortcut_b,
-    } = p;
-    let hw = h * w;
-    let n_groups = 32;
-
-    // norm1 → SiLU → conv1
-    let mut h_out = x.to_vec();
-    group_norm(&mut h_out, norm1_w, norm1_b, n_groups, in_ch, hw, 1e-6);
-    for v in h_out.iter_mut() {
-        *v = *v / (1.0 + (-*v).exp());
-    }
-    h_out = ops::conv2d_3x3(&h_out, conv1_w, conv1_b, h, w, in_ch, out_ch);
-
-    // norm2 → SiLU → conv2
-    group_norm(&mut h_out, norm2_w, norm2_b, n_groups, out_ch, hw, 1e-6);
-    for v in h_out.iter_mut() {
-        *v = *v / (1.0 + (-*v).exp());
-    }
-    h_out = ops::conv2d_3x3(&h_out, conv2_w, conv2_b, h, w, out_ch, out_ch);
-
-    // Shortcut
-    let shortcut = if in_ch != out_ch {
-        if let Some(sw) = shortcut_w {
-            let sb = shortcut_b.unwrap_or(&[0.0f32; 0]);
-            ops::conv2d_1x1(x, sw, sb, h, w, in_ch, out_ch)
-        } else {
-            vec![0.0f32; hw * out_ch]
-        }
-    } else {
-        x.to_vec()
-    };
-
-    for i in 0..h_out.len() {
-        h_out[i] += shortcut[i];
-    }
-    h_out
-}
-
-#[allow(dead_code)]
-fn upsample(x: &[f32], h: usize, w: usize, c: usize, conv_w: &[f32], conv_b: &[f32]) -> Vec<f32> {
-    let up = ops::upsample_nearest_2x(x, h, w, c);
-    ops::conv2d_3x3(&up, conv_w, conv_b, h * 2, w * 2, c, c)
 }

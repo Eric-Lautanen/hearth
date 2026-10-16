@@ -350,7 +350,6 @@ pub fn softmax(x: &mut [f32]) {
     }
 }
 
-#[allow(clippy::needless_range_loop)]
 pub fn attention(
     q: &[f32],
     k_cache: &[f32],
@@ -511,19 +510,32 @@ pub fn rms_norm_q8_batch(
 /// scratch: temporary buffer of size [seq_len] per call
 ///
 /// Each query position `s` attends to positions `0..=s` (causal mask).
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+/// The shapes a batched attention pass needs, named so a call site cannot silently transpose
+/// `n_q_heads` and `n_kv_heads` in a positional list of four lookalike `usize`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttnBatchShape {
+    pub seq_len: usize,
+    pub n_q_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub max_seq_len: usize,
+}
+
 pub fn attention_batch(
     q_heads: &[f32],
     k_cache: &[f32],
     v_cache: &[f32],
-    seq_len: usize,
-    n_q_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    max_seq_len: usize,
+    shape: AttnBatchShape,
     out: &mut [f32],
     scratch: &mut [f32],
 ) {
+    let AttnBatchShape {
+        seq_len,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+    } = shape;
     let kv_repeat = n_q_heads / n_kv_heads;
     let d = n_q_heads * head_dim;
     out[..seq_len * d].fill(0.0f32);

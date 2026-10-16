@@ -17,7 +17,7 @@ fn parse_dtype(s: Option<String>) -> GgmlDType {
         Some("pq2_0") | Some("PQ2_0") => GgmlDType::PQ2_0,
         Some("q2_0") | Some("Q2_0") => GgmlDType::Q2_0,
         Some("q1_0") | Some("Q1_0") => GgmlDType::Q1_0,
-        Some("q1_0_g128") | Some("Q1_0_G128") => GgmlDType::Q1_0_G128,
+        Some("q1_0_g128") | Some("Q1_0_G128") => GgmlDType::Q10G128,
         _ => GgmlDType::PTQ1_0,
     }
 }

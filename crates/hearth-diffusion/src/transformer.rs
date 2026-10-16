@@ -1,7 +1,7 @@
 use crate::attention;
 use crate::ops;
 use crate::weights::ModelWeights;
-use hearth_compute::{GpuBuffer, GpuCompute, QuantKind};
+use hearth_compute::{BidirAttnShape, GpuBuffer, GpuCompute, QuantKind};
 use std::collections::HashMap;
 
 pub struct FluxConfig {
@@ -42,50 +42,28 @@ pub struct FluxTransformer {
     gpu: Option<GpuCompute>,
     /// GPU buffers for Q2_0 weights, uploaded once during construction.
     gpu_q2_bufs: HashMap<String, GpuBuffer>,
-    /// GPU buffers for BF16 weights converted to f32. Written during
-    /// construction but not yet consumed by any forward path (unfinished
-    /// GPU work, same as the dead_code-marked stubs in vae.rs).
-    #[allow(dead_code)]
-    gpu_f32_bufs: HashMap<String, GpuBuffer>,
 }
 
 impl FluxTransformer {
     pub fn new(cfg: FluxConfig, weights: ModelWeights) -> Self {
         let gpu = pollster::block_on(GpuCompute::new());
         let mut gpu_q2_bufs = HashMap::new();
-        let mut gpu_f32_bufs = HashMap::new();
 
         if let Some(ref g) = gpu {
             eprintln!("[hearth-diffusion] GPU available, uploading weights...");
-            // Upload all Q2_0 weights
+            // Upload the Q2_0 weights, which a forward path dispatches against. BF16 and F32
+            // weights are deliberately *not* uploaded: no forward path reads them yet, and
+            // uploading every BF16 tensor as f32 costs real VRAM and construction time for
+            // nothing. When a GPU path consumes them, upload them alongside it.
             for (name, tensor) in &weights.tensors {
-                match tensor {
-                    crate::weights::StoredTensor::Q2(q2) => {
-                        let buf = g.upload_bytes(&q2.data, &format!("diffusion:{}", name));
-                        gpu_q2_bufs.insert(name.clone(), buf);
-                    }
-                    crate::weights::StoredTensor::Bf16(bf16) => {
-                        // Convert BF16 → f32 on CPU, upload as f32 buffer.
-                        // as_chunks::<2> needs Rust 1.88+.
-                        let mut f32_data = Vec::with_capacity(bf16.data.len() / 2);
-                        let (chunks, _remainder) = bf16.data.as_chunks::<2>();
-                        for chunk in chunks {
-                            let raw = u16::from_le_bytes(*chunk);
-                            f32_data.push(f32::from_bits((raw as u32) << 16));
-                        }
-                        let buf = g.upload_f32(&f32_data, &format!("diffusion:{}", name));
-                        gpu_f32_bufs.insert(name.clone(), buf);
-                    }
-                    crate::weights::StoredTensor::F32(f32t) => {
-                        let buf = g.upload_f32(&f32t.data, &format!("diffusion:{}", name));
-                        gpu_f32_bufs.insert(name.clone(), buf);
-                    }
+                if let crate::weights::StoredTensor::Q2(q2) = tensor {
+                    let buf = g.upload_bytes(&q2.data, &format!("diffusion:{}", name));
+                    gpu_q2_bufs.insert(name.clone(), buf);
                 }
             }
             eprintln!(
-                "[hearth-diffusion] {} Q2_0 + {} f32 weights uploaded",
-                gpu_q2_bufs.len(),
-                gpu_f32_bufs.len()
+                "[hearth-diffusion] {} Q2_0 weights uploaded",
+                gpu_q2_bufs.len()
             );
         }
 
@@ -94,7 +72,6 @@ impl FluxTransformer {
             weights,
             gpu,
             gpu_q2_bufs,
-            gpu_f32_bufs,
         }
     }
 
@@ -757,10 +734,12 @@ impl FluxTransformer {
                 &q_buf,
                 &k_buf,
                 &v_buf,
-                n_heads as u32,
-                head_dim as u32,
-                batch as u32,
-                seq_len as u32,
+                BidirAttnShape {
+                    n_heads: n_heads as u32,
+                    head_dim: head_dim as u32,
+                    batch: batch as u32,
+                    seq_len: seq_len as u32,
+                },
             )
             .ok_or("GPU attention failed")?;
         Ok(gpu.readback_f32(&out_buf, q.len()))

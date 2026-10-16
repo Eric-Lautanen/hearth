@@ -1,8 +1,15 @@
+pub mod args;
 mod buffers;
 mod device;
 mod matmul;
 mod pipeline;
 mod shaders;
+
+pub use args::{
+    BidirAttnShape, CacheWriteBatchShape, CacheWriteShape, ConvShape, FlashAttnShape,
+    FusedQkvBuffers, GroupNormShape, HeadNormShape, MlpBatchShape, MlpShape, NormShape,
+    PrefillAttnShape, QkvBatchShape, QkvShape, RopeConfig,
+};
 
 use std::collections::HashMap;
 
@@ -33,10 +40,10 @@ impl QuantKind {
             GgmlDType::F16 => Some(QuantKind::F16),
             GgmlDType::Q4_0 => Some(QuantKind::Q4_0),
             GgmlDType::Q8_0 => Some(QuantKind::Q8_0),
-            GgmlDType::Q4_K => Some(QuantKind::Q4K),
+            GgmlDType::Q4K => Some(QuantKind::Q4K),
             GgmlDType::Q1_0 => Some(QuantKind::Q1_0),
             GgmlDType::Q2_0 => Some(QuantKind::Q2_0),
-            GgmlDType::Q1_0_G128 => Some(QuantKind::Q1_0G128),
+            GgmlDType::Q10G128 => Some(QuantKind::Q1_0G128),
             _ => None,
         }
     }
@@ -116,7 +123,6 @@ pub struct GpuCompute {
     readback_staging: std::sync::Mutex<Option<(wgpu::Buffer, u64)>>,
 }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
 impl GpuCompute {
     pub async fn new() -> Option<Self> {
         let dev = device::GpuDevice::new().await?;
@@ -502,21 +508,21 @@ impl GpuCompute {
 
     pub fn matmul_f16(
         &self,
-        w_buf: &GpuBuffer,
-        x_buf: &GpuBuffer,
-        m: u32,
-        n: u32,
-        k: u32,
+        _w_buf: &GpuBuffer,
+        _x_buf: &GpuBuffer,
+        _m: u32,
+        _n: u32,
+        _k: u32,
     ) -> Option<GpuBuffer> {
         None
     }
 
     pub fn mat_vec(
         &self,
-        w_buf: &GpuBuffer,
-        x_buf: &GpuBuffer,
-        m: u32,
-        n: u32,
+        _w_buf: &GpuBuffer,
+        _x_buf: &GpuBuffer,
+        _m: u32,
+        _n: u32,
     ) -> Option<Vec<f32>> {
         None
     }
@@ -525,15 +531,18 @@ impl GpuCompute {
         &self,
         q_buf: &GpuBuffer,
         kv_buf: &GpuBuffer,
-        kv_offset: u64,
-        kv_total_bytes: u64,
-        n_heads: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-        seq_len_q: u32,
-        seq_len_kv: u32,
-        pos: u32,
+        shape: FlashAttnShape,
     ) -> Option<GpuBuffer> {
+        let FlashAttnShape {
+            kv_offset: _kv_offset,
+            kv_total_bytes: _kv_total_bytes,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len_q,
+            seq_len_kv,
+            pos,
+        } = shape;
         let kv_repeat = n_heads / n_kv_heads;
         let num_kv = (pos + 1).min(seq_len_kv);
         let output_buf =
@@ -591,12 +600,15 @@ impl GpuCompute {
         &self,
         q_buf: &GpuBuffer,
         kv_buf: &GpuBuffer,
-        n_heads: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-        seq_len_q: u32,
-        cache_stride: u32,
+        shape: PrefillAttnShape,
     ) -> Option<GpuBuffer> {
+        let PrefillAttnShape {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len_q,
+            cache_stride,
+        } = shape;
         let kv_repeat = n_heads / n_kv_heads;
         let output_buf = self.create_storage_buffer(
             (seq_len_q * n_heads * head_dim) as u64 * 4,
@@ -660,11 +672,14 @@ impl GpuCompute {
         q_buf: &GpuBuffer,
         k_buf: &GpuBuffer,
         v_buf: &GpuBuffer,
-        n_heads: u32,
-        head_dim: u32,
-        batch: u32,
-        seq_len: u32,
+        shape: BidirAttnShape,
     ) -> Option<GpuBuffer> {
+        let BidirAttnShape {
+            n_heads,
+            head_dim,
+            batch,
+            seq_len,
+        } = shape;
         let output_buf = self.create_storage_buffer(
             (batch * n_heads * head_dim) as u64 * 4,
             "flash_attn_bidir_out",
@@ -757,11 +772,14 @@ impl GpuCompute {
         x_buf: &GpuBuffer,
         w_buf: &GpuBuffer,
         out_buf: &GpuBuffer,
-        seq_len: u32,
-        d: u32,
-        eps: f32,
-        post_norm: bool,
+        shape: NormShape,
     ) {
+        let NormShape {
+            seq_len,
+            d,
+            eps,
+            post_norm,
+        } = shape;
         let params = [d as f32, eps, if post_norm { 1.0 } else { 0.0 }, 0.0];
         let uniform =
             self.create_uniform_buffer(bytemuck::cast_slice(&params), "rms_norm_batch_params");
@@ -844,16 +862,14 @@ impl GpuCompute {
     /// Batch head RMS norm: dispatch (n_heads, seq_len, 1) workgroups.
     /// x_buf layout: [seq_len × n_heads × head_dim] f32 row-major, processed in-place.
     /// w_buf: [head_dim] f32 (shared weight for all heads).
-    pub fn head_rms_norm_batch(
-        &self,
-        x_buf: &GpuBuffer,
-        w_buf: &GpuBuffer,
-        n_heads: u32,
-        head_dim: u32,
-        seq_len: u32,
-        eps: f32,
-        post_norm: bool,
-    ) {
+    pub fn head_rms_norm_batch(&self, x_buf: &GpuBuffer, w_buf: &GpuBuffer, shape: HeadNormShape) {
+        let HeadNormShape {
+            n_heads,
+            head_dim,
+            seq_len,
+            eps,
+            post_norm,
+        } = shape;
         let params = [
             n_heads as f32,
             head_dim as f32,
@@ -892,20 +908,18 @@ impl GpuCompute {
         );
     }
 
-    pub fn rope_combined(
-        &self,
-        x_buf: &GpuBuffer,
-        n_heads: u32,
-        head_dim: u32,
-        rope_dim: u32,
-        pos: u32,
-        theta: f32,
-        freq_scale: f32,
-        yarn_corr_low: f32,
-        yarn_corr_high: f32,
-        yarn_mscale: f32,
-        yarn_n_dims: f32,
-    ) {
+    pub fn rope_combined(&self, x_buf: &GpuBuffer, config: RopeConfig, pos: u32) {
+        let RopeConfig {
+            n_heads,
+            head_dim,
+            rope_dim,
+            theta,
+            freq_scale,
+            yarn_corr_low,
+            yarn_corr_high,
+            yarn_mscale,
+            yarn_n_dims,
+        } = config;
         let params = [
             n_heads as f32,
             head_dim as f32,
@@ -948,20 +962,18 @@ impl GpuCompute {
 
     /// Batch RoPE: dispatch (n_heads, seq_len, 1) workgroups, each head-position pair.
     /// x_buf layout: [seq_len × n_heads × head_dim] f32 row-major, processed in-place.
-    pub fn rope_batch(
-        &self,
-        x_buf: &GpuBuffer,
-        n_heads: u32,
-        head_dim: u32,
-        rope_dim: u32,
-        seq_len: u32,
-        theta: f32,
-        freq_scale: f32,
-        yarn_corr_low: f32,
-        yarn_corr_high: f32,
-        yarn_mscale: f32,
-        yarn_n_dims: f32,
-    ) {
+    pub fn rope_batch(&self, x_buf: &GpuBuffer, config: RopeConfig, seq_len: u32) {
+        let RopeConfig {
+            n_heads,
+            head_dim,
+            rope_dim,
+            theta,
+            freq_scale,
+            yarn_corr_low,
+            yarn_corr_high,
+            yarn_mscale,
+            yarn_n_dims,
+        } = config;
         let params = [
             n_heads as f32,
             head_dim as f32,
@@ -1013,11 +1025,14 @@ impl GpuCompute {
         k_buf: &GpuBuffer,
         v_buf: &GpuBuffer,
         cache_buf: &GpuBuffer,
-        pos: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-        cache_stride: u32,
+        shape: CacheWriteShape,
     ) {
+        let CacheWriteShape {
+            pos,
+            n_kv_heads,
+            head_dim,
+            cache_stride,
+        } = shape;
         let params = [pos, n_kv_heads, head_dim, cache_stride];
         let uniform = self.create_uniform_buffer(bytemuck::cast_slice(&params), "kv_cache_params");
         let bind_group = self.device.device.create_bind_group(&BindGroupDescriptor {
@@ -1059,11 +1074,14 @@ impl GpuCompute {
         k_buf: &GpuBuffer,
         v_buf: &GpuBuffer,
         cache_buf: &GpuBuffer,
-        seq_len: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-        cache_stride: u32,
+        shape: CacheWriteBatchShape,
     ) {
+        let CacheWriteBatchShape {
+            seq_len,
+            n_kv_heads,
+            head_dim,
+            cache_stride,
+        } = shape;
         let params = [seq_len, n_kv_heads, head_dim, cache_stride];
         let uniform =
             self.create_uniform_buffer(bytemuck::cast_slice(&params), "kv_cache_batch_params");
@@ -1109,7 +1127,7 @@ impl GpuCompute {
         x_buf: &GpuBuffer,
         accum_buf: &GpuBuffer,
         m: u32,
-        k: u32,
+        _k: u32,
     ) -> bool {
         let pipeline = match self.matmul_pipelines.get_add_inplace(kind) {
             Some(p) => p,
@@ -1223,9 +1241,9 @@ impl GpuCompute {
         x_buf: &GpuBuffer,
         gate_out: &GpuBuffer,
         up_out: &GpuBuffer,
-        m: u32,
-        n: u32,
+        shape: MlpShape,
     ) -> bool {
+        let MlpShape { m, n: _n } = shape;
         let pipeline = match self.fused_gate_up_pipeline {
             Some(ref p) => p,
             None => return false,
@@ -1277,10 +1295,13 @@ impl GpuCompute {
         x_buf: &GpuBuffer,
         gate_out: &GpuBuffer,
         up_out: &GpuBuffer,
-        ffn_dim: u32,
-        k: u32,
-        seq_len: u32,
+        shape: MlpBatchShape,
     ) -> bool {
+        let MlpBatchShape {
+            ffn_dim,
+            k,
+            seq_len,
+        } = shape;
         let pipeline = match self.fused_gate_up_batch_pipeline {
             Some(ref p) => p,
             None => return false,
@@ -1340,19 +1361,17 @@ impl GpuCompute {
         true
     }
 
-    pub fn fused_qkv(
-        &self,
-        qw: &GpuBuffer,
-        kw: &GpuBuffer,
-        vw: &GpuBuffer,
-        x: &GpuBuffer,
-        q_out: &GpuBuffer,
-        k_out: &GpuBuffer,
-        v_out: &GpuBuffer,
-        m: u32,
-        n: u32,
-        k: u32,
-    ) -> bool {
+    pub fn fused_qkv(&self, buffers: FusedQkvBuffers<'_>, shape: QkvShape) -> bool {
+        let FusedQkvBuffers {
+            qw,
+            kw,
+            vw,
+            x,
+            q_out,
+            k_out,
+            v_out,
+        } = buffers;
+        let QkvShape { m, n, k: _k } = shape;
         let pipeline = match self.fused_qkv_pipeline {
             Some(ref p) => p,
             None => return false,
@@ -1417,20 +1436,22 @@ impl GpuCompute {
     /// q_out: [seq_len × nq] f32 row-major
     /// k_out: [seq_len × nkv] f32 row-major
     /// v_out: [seq_len × nkv] f32 row-major
-    pub fn fused_qkv_batch(
-        &self,
-        qw: &GpuBuffer,
-        kw: &GpuBuffer,
-        vw: &GpuBuffer,
-        x: &GpuBuffer,
-        q_out: &GpuBuffer,
-        k_out: &GpuBuffer,
-        v_out: &GpuBuffer,
-        nq: u32,
-        nkv: u32,
-        k: u32,
-        seq_len: u32,
-    ) -> bool {
+    pub fn fused_qkv_batch(&self, buffers: FusedQkvBuffers<'_>, shape: QkvBatchShape) -> bool {
+        let FusedQkvBuffers {
+            qw,
+            kw,
+            vw,
+            x,
+            q_out,
+            k_out,
+            v_out,
+        } = buffers;
+        let QkvBatchShape {
+            nq,
+            nkv,
+            k,
+            seq_len,
+        } = shape;
         let pipeline = match self.fused_qkv_batch_pipeline {
             Some(ref p) => p,
             None => return false,
@@ -1580,11 +1601,9 @@ impl GpuCompute {
         input: &GpuBuffer,
         weight: &GpuBuffer,
         bias: &GpuBuffer,
-        c_in: u32,
-        c_out: u32,
-        h: u32,
-        w: u32,
+        shape: ConvShape,
     ) -> GpuBuffer {
+        let ConvShape { c_in, c_out, h, w } = shape;
         let output = self.create_storage_buffer((c_out * h * w) as u64 * 4, "conv2d_out");
         let params = [c_in, c_out, h, w];
         let uniform = self.create_uniform_buffer(bytemuck::cast_slice(&params), "conv2d_params");
@@ -1635,11 +1654,14 @@ impl GpuCompute {
         x: &GpuBuffer,
         weight: &GpuBuffer,
         bias: &GpuBuffer,
-        c: u32,
-        hw: u32,
-        n_groups: u32,
-        eps: f32,
+        shape: GroupNormShape,
     ) {
+        let GroupNormShape {
+            c,
+            hw,
+            n_groups,
+            eps,
+        } = shape;
         let params = [c as f32, hw as f32, n_groups as f32, eps];
         let uniform =
             self.create_uniform_buffer(bytemuck::cast_slice(&params), "group_norm_params");
@@ -1717,7 +1739,6 @@ mod tests {
     }
 
     /// Compute expected dot product for a Q1_0G128 weight row: dequantize and dot with activation.
-    #[allow(dead_code)]
     fn cpu_q1_0_dot(row_data: &[u8], activation: &[f32]) -> f32 {
         assert!(row_data.len() >= 2);
         let blocks = row_data.len() / 18;
@@ -1998,7 +2019,14 @@ mod tests {
         let gate_out = gpu.create_storage_buffer((m as u64) * 4, "gate_out");
         let up_out = gpu.create_storage_buffer((m as u64) * 4, "up_out");
 
-        let ok = gpu.fused_gate_up(&gate_w, &up_w, &act_buf, &gate_out, &up_out, m, k);
+        let ok = gpu.fused_gate_up(
+            &gate_w,
+            &up_w,
+            &act_buf,
+            &gate_out,
+            &up_out,
+            MlpShape { m, n: k },
+        );
         assert!(ok, "fused_gate_up returned false");
 
         let gate_result = gpu.readback_f32(&gate_out, m as usize);
@@ -2022,6 +2050,28 @@ mod tests {
                 i,
                 up_result[i],
                 expected_up
+            );
+        }
+
+        // Cross-check the shader against the scalar dequantise-then-dot reference: the analytic
+        // expectations above only prove the shader is self-consistent, not that its dequantise
+        // agrees with what the format means.
+        for r in 0..m as usize {
+            let gate_ref = cpu_q1_0_dot(&gate_quant[r * 18..(r + 1) * 18], &act);
+            let up_ref = cpu_q1_0_dot(&up_quant[r * 18..(r + 1) * 18], &act);
+            assert!(
+                (gate_result[r] - gate_ref).abs() < 1e-3,
+                "gate[{}] = {} vs cpu reference {}",
+                r,
+                gate_result[r],
+                gate_ref
+            );
+            assert!(
+                (up_result[r] - up_ref).abs() < 1e-3,
+                "up[{}] = {} vs cpu reference {}",
+                r,
+                up_result[r],
+                up_ref
             );
         }
     }
@@ -2077,7 +2127,18 @@ mod tests {
         let k_out = gpu.create_storage_buffer((nkv as u64) * 4, "k_out");
         let v_out = gpu.create_storage_buffer((nkv as u64) * 4, "v_out");
 
-        let ok = gpu.fused_qkv(&qw, &kw, &vw, &act_buf, &q_out, &k_out, &v_out, nq, nkv, k);
+        let ok = gpu.fused_qkv(
+            FusedQkvBuffers {
+                qw: &qw,
+                kw: &kw,
+                vw: &vw,
+                x: &act_buf,
+                q_out: &q_out,
+                k_out: &k_out,
+                v_out: &v_out,
+            },
+            QkvShape { m: nq, n: nkv, k },
+        );
         assert!(ok, "fused_qkv returned false");
 
         let q_result = gpu.readback_f32(&q_out, nq as usize);

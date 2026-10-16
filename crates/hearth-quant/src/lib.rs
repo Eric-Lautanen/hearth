@@ -154,22 +154,22 @@ pub fn dequantize(dtype: GgmlDType, data: &[u8], out: &mut [f32]) -> Result<(), 
         GgmlDType::Q4_1 => q4_1::dequantize(data, out),
         GgmlDType::Q5_0 => q5_0::dequantize(data, out),
         GgmlDType::Q5_1 => q5_1::dequantize(data, out),
-        GgmlDType::Q4_K => q4_k::dequantize(data, out),
+        GgmlDType::Q4K => q4_k::dequantize(data, out),
         GgmlDType::Q2_0 => q2_0::dequantize(data, out),
         GgmlDType::PQ2_0 => pq2_0::dequantize(data, out),
         GgmlDType::PTQ1_0 => ptq1_0::dequantize(data, out),
-        GgmlDType::Q1_0 | GgmlDType::Q1_0_G128 => q1_0g128::dequantize(data, out),
-        GgmlDType::Q2_K => qk_quant::dequantize_q2_k(data, out),
-        GgmlDType::Q3_K => qk_quant::dequantize_q3_k(data, out),
-        GgmlDType::Q5_K => qk_quant::dequantize_q5_k(data, out),
-        GgmlDType::Q6_K => qk_quant::dequantize_q6_k(data, out),
+        GgmlDType::Q1_0 | GgmlDType::Q10G128 => q1_0g128::dequantize(data, out),
+        GgmlDType::Q2K => qk_quant::dequantize_q2_k(data, out),
+        GgmlDType::Q3K => qk_quant::dequantize_q3_k(data, out),
+        GgmlDType::Q5K => qk_quant::dequantize_q5_k(data, out),
+        GgmlDType::Q6K => qk_quant::dequantize_q6_k(data, out),
         GgmlDType::Q8_1 => {
             return Err(format!(
                 "Dequant for {} not yet implemented - try a Q8_0 or Q4_K model instead",
                 dtype.name()
             ));
         }
-        GgmlDType::Q8_K => {
+        GgmlDType::Q8K => {
             return Err(format!(
                 "Dequant for {} not yet implemented - try a Q8_0 or Q4_K model instead",
                 dtype.name()
@@ -359,7 +359,7 @@ pub fn selected_kernel(dtype: GgmlDType) -> Option<&'static str> {
     match dtype {
         GgmlDType::PTQ1_0 => Some(ptq1_0::kernel_name()),
         GgmlDType::Q2_0 | GgmlDType::PQ2_0 => Some(q2_0::kernel_name()),
-        GgmlDType::Q1_0 | GgmlDType::Q1_0_G128 => Some(q1_0g128::kernel_name()),
+        GgmlDType::Q1_0 | GgmlDType::Q10G128 => Some(q1_0g128::kernel_name()),
         _ => None,
     }
 }
@@ -542,7 +542,7 @@ mod cpu_decode {
             GgmlDType::PQ2_0,
             GgmlDType::Q2_0,
             GgmlDType::Q1_0,
-            GgmlDType::Q1_0_G128,
+            GgmlDType::Q10G128,
         ] {
             let name = selected_kernel(dtype);
             assert!(name.is_some(), "{dtype:?} reports no kernel");

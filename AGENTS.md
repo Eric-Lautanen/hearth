@@ -2,7 +2,33 @@
 
 > **Date**: 2026-10-15 — collaborative build. No reference repo, no competition. Hearth is the source of truth. Make everything better: faster inference, solid professional UI, clean repo/docs.
 
-***ALWAYS*** keep bug reports updated and compilation errors and warnings clean. NEVER USE allow blocks! Commit and push as you go, trailer-free — the operator lifted the old no-push rule: never leave work only in the working tree.
+***ALWAYS*** keep bug reports updated and compilation errors and warnings clean. Commit and push as you go, trailer-free — the operator lifted the old no-push rule: never leave work only in the working tree.
+
+### No `#[allow(...)]` — anywhere, ever
+
+**NEVER** add `#[allow(...)]`, and remove the ones that exist. Clippy and `rustfmt` are always
+clean and every finding is fixed **at its cause** — never silenced, never downgraded, never left
+as a warning that is "pre-existing" or "OK here". This is not a style preference: every attribute
+that has been removed from this repo so far was hiding something real — a gate that could never
+be true, dead code, an `unsafe` that was only redundant in *some* build configurations, a
+parameter nobody read. `#[expect(...)]` is not a substitute; it is the same suppression with a
+shorter shelf life.
+
+- Fix the **cause**. Each lint has an honest answer: code that only tests use is `#[cfg(test)]`;
+  unreachable code is deleted, since git keeps it; a redundant `unsafe` is a small wrapper away
+  from being required in every build configuration; `too_many_arguments` is a missing struct;
+  `needless_range_loop` is a `zip`/`enumerate` (and if the indexed form really is faster, say so
+  with the measurement instead of the attribute).
+- If a lint genuinely cannot be fixed without changing behaviour, that is a **finding to report and
+  measure**, not an attribute to add: write it down with the number that justifies keeping the
+  current form.
+- The gate is always all three, clean: `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo fmt --check`, and a build with no warnings (`cargo check --workspace --all-targets`).
+  Never silence one to make another pass.
+- "Correct" means the behaviour is unchanged and the fix is the smallest honest one — a named
+  shape instead of eight positional numbers, `enumerate()` instead of indexing, deletion of code
+  nothing reaches. If a finding cannot be fixed without changing behaviour, that is a finding to
+  report and measure, never an attribute to add.
 
 ## Collaboration plan (active)
 
@@ -87,7 +113,7 @@ Running anything in parallel on this 8C/16T CPU causes thermal throttling and SM
 ```powershell
 cargo clean if need be
 cargo check/build --release
-cargo test --test-threads=1 -p hearth-quant
+cargo test -p hearth-quant -- --test-threads=1
 cargo fmt
 ```
 
@@ -161,8 +187,10 @@ After quant kernel changes:
 cargo check -p hearth-quant
 cargo clippy -p hearth-quant -- -D warnings
 cargo fmt --check
-cargo test --test-threads=1 -p hearth-quant
+cargo test -p hearth-quant -- --test-threads=1
 cargo build --release
 ```
-After any LLM change also check `cargo check -p hearth-llm` (pre-existing clippy warnings in GPU stubs are OK).
+After any LLM change also check `cargo check -p hearth-llm`. There is no accepted-warning list:
+the clippy findings that used to live in the GPU stubs were fixed, not allowed, and the workspace
+is clean of them (`cargo clippy --workspace --all-targets -- -D warnings` passes).
 After any UI change: `cargo check -p hearth-ui` + `cargo fmt --check` + run `hearth-ui --no-browser` and hit `/`, `/api/models`, `/api/downloads`.

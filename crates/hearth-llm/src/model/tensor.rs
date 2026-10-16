@@ -77,9 +77,4 @@ impl TensorEntry {
         let end = (start + row_bytes).min(self.data().len());
         &self.data()[start..end]
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn can_batch(&self) -> bool {
-        self.shape.len() >= 2 && self.shape[0] > 1
-    }
 }

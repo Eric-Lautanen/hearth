@@ -5,6 +5,19 @@ use rayon::prelude::*;
 
 use super::LlamaModel;
 
+/// The shape of a batched matmul: how wide the weight's rows are, and how many tokens are being
+/// pushed through it together.
+///
+/// `n_cols` is a caller-side expectation that the body checks against the tensor's own column
+/// count — that check is what catches a caller that reached for the wrong weight — and `seq_len`
+/// is the token count the output rows are sliced by. The weight's row count is *not* here: the
+/// body derives it from the tensor, and it used to arrive as an argument nobody read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchShape {
+    pub n_cols: usize,
+    pub seq_len: usize,
+}
+
 /// Parameters for the fused gate+up matmul. Grouped so the call stays
 /// under the argument-count lint; field order matches the old signature.
 pub(crate) struct FusedMatmul2Params<'a> {
@@ -184,7 +197,7 @@ impl LlamaModel {
                     dot_fn: hearth_quant::dot_ptq1_0_q8_0_ptr,
                 });
             }
-            GgmlDType::Q1_0_G128 => {
+            GgmlDType::Q10G128 => {
                 let x_q8_data;
                 let q8 = match x_q8 {
                     Some(d) => d,
@@ -254,7 +267,7 @@ impl LlamaModel {
                     dot_fn: hearth_quant::dot_q8_0_q8_0_ptr,
                 });
             }
-            GgmlDType::Q4_K => {
+            GgmlDType::Q4K => {
                 let rows: Vec<usize> = (0..n_rows).collect();
                 let result: Vec<f32> = rows
                     .par_iter()
@@ -317,7 +330,7 @@ impl LlamaModel {
                     .collect();
                 out[..n_rows].copy_from_slice(&result);
             }
-            GgmlDType::Q6_K => {
+            GgmlDType::Q6K => {
                 let rows: Vec<usize> = (0..n_rows).collect();
                 let result: Vec<f32> = rows
                     .par_iter()
@@ -402,8 +415,8 @@ impl LlamaModel {
         let n_rows_b = entry_b.n_rows();
 
         match entry_a.dtype {
-            GgmlDType::Q1_0_G128 | GgmlDType::Q1_0 => {
-                if !matches!(entry_b.dtype, GgmlDType::Q1_0_G128 | GgmlDType::Q1_0) {
+            GgmlDType::Q10G128 | GgmlDType::Q1_0 => {
+                if !matches!(entry_b.dtype, GgmlDType::Q10G128 | GgmlDType::Q1_0) {
                     return Err(format!(
                         "Fused matmul dtype mismatch: {} {:?} vs {} {:?}",
                         weight_a, entry_a.dtype, weight_b, entry_b.dtype
@@ -494,9 +507,9 @@ impl LlamaModel {
         let nr_v = ev.n_rows();
 
         match eq.dtype {
-            GgmlDType::Q1_0_G128 | GgmlDType::Q1_0 => {
-                if !matches!(ek.dtype, GgmlDType::Q1_0_G128 | GgmlDType::Q1_0)
-                    || !matches!(ev.dtype, GgmlDType::Q1_0_G128 | GgmlDType::Q1_0)
+            GgmlDType::Q10G128 | GgmlDType::Q1_0 => {
+                if !matches!(ek.dtype, GgmlDType::Q10G128 | GgmlDType::Q1_0)
+                    || !matches!(ev.dtype, GgmlDType::Q10G128 | GgmlDType::Q1_0)
                 {
                     return Err("QKV fused dtype mismatch".into());
                 }
@@ -559,18 +572,21 @@ impl LlamaModel {
         q8
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Batched (prefill) matmul against a quantized weight.
+    ///
+    /// The weight's row count comes from the tensor, not from the caller: it used to arrive as an
+    /// argument that the body never read. `n_cols` *is* checked against the tensor below, which is
+    /// what catches a caller that mixed up two weight names.
     pub(crate) fn matmul_batch(
         &self,
         weight_name: &str,
         input: &[f32],
         out: &mut [f32],
         row_buf: &mut Vec<f32>,
-        _n_rows: usize,
-        n_cols: usize,
-        seq_len: usize,
+        shape: BatchShape,
         x_q8: Option<&[u8]>,
     ) -> Result<(), String> {
+        let BatchShape { n_cols, seq_len } = shape;
         let entry = self
             .tensors
             .get(weight_name)
@@ -593,7 +609,7 @@ impl LlamaModel {
                 | GgmlDType::PQ2_0
                 | GgmlDType::PTQ1_0
                 | GgmlDType::Q1_0
-                | GgmlDType::Q1_0_G128
+                | GgmlDType::Q10G128
         ) {
             let q8_size = k.div_ceil(32) * 34;
             let dot_fn = match entry.dtype {
@@ -605,9 +621,7 @@ impl LlamaModel {
             // Bit-identical to two `dot_fn` calls, so only prefill is affected.
             let dot_fn2: Option<crate::pool::DotFn2> = match entry.dtype {
                 GgmlDType::Q2_0 | GgmlDType::PQ2_0 => Some(hearth_quant::dot_q2_0_q8_0x2_ptr),
-                GgmlDType::Q1_0 | GgmlDType::Q1_0_G128 => {
-                    Some(hearth_quant::dot_q1_0g128_q8_0x2_ptr)
-                }
+                GgmlDType::Q1_0 | GgmlDType::Q10G128 => Some(hearth_quant::dot_q1_0g128_q8_0x2_ptr),
                 // PTQ1_0 deliberately stays None here. A paired PTQ1_0 kernel
                 // exists (`hearth_quant::dot_ptq1_0_q8_0x2_ptr`, bit-identical to
                 // two single calls), but this is the *dense* batch path and every
