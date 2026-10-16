@@ -184,10 +184,12 @@ def expectations(cert):
 
     ca = False
     path_len = None
+    has_basic_constraints = False
     for extension in cert.extensions:
         if isinstance(extension.value, x509.BasicConstraints):
             ca = extension.value.ca
             path_len = extension.value.path_length
+            has_basic_constraints = True
 
     cn = [a.value for a in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)]
     issuer_cn = [a.value for a in cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)]
@@ -198,6 +200,7 @@ def expectations(cert):
         "not_before": int(cert.not_valid_before_utc.timestamp()),
         "not_after": int(cert.not_valid_after_utc.timestamp()),
         "is_ca": ca,
+        "has_basic_constraints": has_basic_constraints,
         "path_len": path_len,
         "key_usage": key_usage_mask(usage) if usage else None,
         "san_dns": names,
@@ -233,6 +236,8 @@ def main():
     weak_anchor_key = rsa_key(20261102, bits=1024)
     leaf_of_expired_key = rsa_key(20261103)
     leaf_of_weak_key = rsa_key(20261104)
+    non_ca_signer_key = rsa_key(20261201)
+    leaf_of_non_ca_key = rsa_key(20261202)
 
     def usage(**flags):
         """A `KeyUsage` with only the named bits set."""
@@ -708,6 +713,43 @@ def main():
         .sign(weak_anchor_key, hashes.SHA256())
     )
 
+    # A certificate whose issuer marked it **not** a CA, which nevertheless claims
+    # `keyCertSign` and signs a certificate of its own. As an anchor it is refused for
+    # that contradiction; in a chain it is refused as an issuer. `SELF_SIGNED_EC`, which
+    # carries no extensions at all, is the control in the other direction: a pin with no
+    # `basicConstraints` to contradict it is accepted.
+    non_ca_signer = (
+        x509.CertificateBuilder()
+        .subject_name(name("Hearth Test Non-CA Signer"))
+        .issuer_name(root.subject)
+        .public_key(non_ca_signer_key.public_key())
+        .serial_number(0x30)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True, key_cert_sign=True), critical=True)
+        .sign(root_key, hashes.SHA256())
+    )
+
+    leaf_of_non_ca_signer = (
+        x509.CertificateBuilder()
+        .subject_name(name("non-ca-signer.example"))
+        .issuer_name(non_ca_signer.subject)
+        .public_key(leaf_of_non_ca_key.public_key())
+        .serial_number(0x31)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime.datetime(2027, 1, 1, tzinfo=UTC))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("non-ca-signer.example")]), critical=False
+        )
+        .sign(non_ca_signer_key, hashes.SHA256())
+    )
+
     # A leaf whose unknown extension is marked **critical**. RFC 5280 requires a
     # reader that does not understand a critical extension to reject the
     # certificate, so this one must not parse.
@@ -753,6 +795,8 @@ def main():
         ("LEAF_OF_EXPIRED_ANCHOR", leaf_of_expired_anchor),
         ("WEAK_ANCHOR", weak_anchor),
         ("LEAF_OF_WEAK_ANCHOR", leaf_of_weak_anchor),
+        ("NON_CA_SIGNER", non_ca_signer),
+        ("LEAF_OF_NON_CA_SIGNER", leaf_of_non_ca_signer),
     ]
 
     # `//` rather than `//!`: this file is pulled in with `include!`, so an inner
@@ -790,6 +834,10 @@ def main():
         out.append("            not_before: %d," % want["not_before"])
         out.append("            not_after: %d," % want["not_after"])
         out.append("            is_ca: %s," % ("true" if want["is_ca"] else "false"))
+        out.append(
+            "            has_basic_constraints: %s,"
+            % ("true" if want["has_basic_constraints"] else "false")
+        )
         out.append(
             "            path_len: %s,"
             % ("None" if want["path_len"] is None else "Some(%d)" % want["path_len"])

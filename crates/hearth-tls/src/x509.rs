@@ -230,6 +230,7 @@ pub struct Certificate<'a> {
     not_after: UnixTime,
     public_key: PublicKey<'a>,
     is_ca: bool,
+    has_basic_constraints: bool,
     path_len: Option<u32>,
     key_usage: Option<KeyUsage>,
     extended_key_usage: Vec<Oid<'a>>,
@@ -352,6 +353,7 @@ impl<'a> Certificate<'a> {
             not_after,
             public_key,
             is_ca: extensions.is_ca,
+            has_basic_constraints: extensions.has_basic_constraints,
             path_len: extensions.path_len,
             key_usage: extensions.key_usage,
             extended_key_usage: extensions.extended_key_usage,
@@ -410,8 +412,18 @@ impl<'a> Certificate<'a> {
     }
 
     /// Whether `basicConstraints` asserts `cA`.
+    ///
+    /// False both when the extension says `cA: FALSE` and when it is absent entirely,
+    /// which is why [`Certificate::has_basic_constraints`] exists: a chain link must be a
+    /// CA either way, while an anchor is the caller's own pin and a bare pin (or a
+    /// v1-style certificate) has no extension to contradict.
     pub fn is_ca(&self) -> bool {
         self.is_ca
+    }
+
+    /// Whether the certificate carries a `basicConstraints` extension at all.
+    pub fn has_basic_constraints(&self) -> bool {
+        self.has_basic_constraints
     }
 
     /// `pathLenConstraint`, when the certificate has one.
@@ -451,6 +463,7 @@ impl<'a> Certificate<'a> {
 struct Extensions<'a> {
     seen: Vec<Oid<'a>>,
     is_ca: bool,
+    has_basic_constraints: bool,
     path_len: Option<u32>,
     key_usage: Option<KeyUsage>,
     extended_key_usage: Vec<Oid<'a>>,
@@ -482,6 +495,7 @@ impl<'a> Extensions<'a> {
                 oids::BASIC_CONSTRAINTS => {
                     let (is_ca, path_len) = basic_constraints(value)?;
                     result.is_ca = is_ca;
+                    result.has_basic_constraints = true;
                     result.path_len = path_len;
                 }
                 oids::KEY_USAGE => result.key_usage = Some(key_usage(value)?),

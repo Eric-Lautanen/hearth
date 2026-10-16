@@ -38,6 +38,39 @@ raw reruns gave 9.54 and 14.31 tok/s, coherent text, exit 0, so it was never a c
 tracked `target/release` binary is byte-size identical to the from-scratch HEAD build, confirming it
 does contain `f3c18d4` despite an mtime 10 minutes older than that commit.
 
+### hearth-tls slice 14 — the anchor's `basicConstraints`, and the documentation defect it exposed (buffy, 2026-10-16)
+
+SparkOC's review (#93) settled the asymmetry reported at the end of slice 13: close it, with
+`basicConstraints` **present** requiring `cA: TRUE` and **absent** allowed, since a bare pin or a v1-style
+certificate has no extension to lie with and refusing it would break the pinning the anchor docs allow.
+Implemented in `check_anchor_is_ca`, with two refinements the fixtures forced.
+
+- **The rule as first written broke a test, and the test was right.** `SELF_SIGNED_PSS` is `cA: FALSE`
+  **present** and is pinned as its own anchor by `every_suite_verifies_as_a_chain_link`. Refusing that would
+  mean a caller cannot pin a self-signed server certificate. The distinction the rule needed: an anchor that
+  *is* the certificate it verifies is an **identity pin** — it proves its own identity rather than claiming
+  a right to issue — so the exemption is `anchor.der() == verified.der()`, which the name check above can
+  only have matched while that certificate is self-issued. It cannot be walked out of: the same certificate
+  used to authenticate anything else is refused, at the anchor and as a chain link. OpenSSL behaves the same
+  way — a self-signed cert in the trust store verifies itself, a non-CA used as an issuer is "invalid CA
+  certificate" (error 24).
+- **`is_ca` could not express the rule.** It is false both for a stated `cA: FALSE` and for an absent
+  extension, so `Certificate` gained `has_basic_constraints()` (`x509.rs` tracks it in the extensions pass),
+  the generator records it per fixture, and the automatic parse test compares it — which pins the absent
+  case on `SELF_SIGNED_EC`, the certificate with no extensions at all.
+- **Two new certificates (24 total)**: `NON_CA_SIGNER` (its issuer marked it non-CA, it claims
+  `keyCertSign` anyway, and it signs a child) and that child. The test asserts the signature really verifies,
+  so the `basicConstraints` claim is the only defect.
+- **Reachability run again**: neutering the check turns the refusal `Ok(())`. Separately, the identity-pin
+  half was proven by accident at first — the check without the exemption breaks a pre-existing test — and
+  then pinned deliberately by `pinning_a_certificate_is_an_identity_and_not_an_issuance`.
+- **A documentation defect fixed, which is the part worth remembering.** `chain.rs`'s "the two rules that
+  are read out of a CA certificate" section still said `keyCertSign` "is **not** required of an anchor" —
+  false since slice 12, when the check moved onto the anchor, and nothing failed, because no test reads a
+  doc comment. It now enumerates three rules and states what each site requires.
+- **214 checks green** on both paths (212 before), clippy `-D warnings`, fmt, `cargo doc` zero warnings,
+  workspace check exit 0. No inference code touched, so the benchmark mandate did not apply.
+
 ### hearth-tls slice 13 — the anchor's own window and key size, and two tests that had assumed a 2048-bit world (buffy, 2026-10-16)
 
 `chain.rs` was covered everywhere except two call sites, and they were the same shape: the *anchor's* own

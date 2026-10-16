@@ -22,7 +22,8 @@
 //!    own `signatureAlgorithm` names.
 //! 4. **The anchor.** The last certificate's issuer name must be the subject name
 //!    of one of the caller's anchors, **and** its signature must verify with that
-//!    anchor's key.
+//!    anchor's key. The anchor is then held to the rules below itself — the CA
+//!    statements, its own validity window and its own key size.
 //!
 //! Structure before links is deliberate: a chain of the wrong shape is refused for
 //! its shape, before any public-key operation is done on hostile input.
@@ -47,7 +48,20 @@
 //! - **No `extendedKeyUsage` policy on issuers**, no `policyConstraints`, no
 //!   `inhibitAnyPolicy`, no name constraints.
 //!
-//! # The two rules that are read out of a CA certificate
+//! # The three rules that are read out of a CA certificate
+//!
+//! `basicConstraints` must assert `cA` of every certificate that issues another one.
+//! A chain link has to **state** it, so an absent extension is refused there; an anchor
+//! only has to avoid **contradicting** it, so a stated `cA: FALSE` is refused while the
+//! absence is allowed — a pinned certificate with no extension to contradict it is a
+//! legitimate pin, and the same certificate pinned as its own anchor is proving its
+//! identity rather than issuing anything.
+//!
+//! `keyUsage.keyCertSign` is required of any certificate whose `keyUsage` extension is
+//! present and whose key is used to verify a certificate signature — the anchor
+//! included, since that is exactly what it is doing. A certificate that states it may
+//! not sign certificates has no business being an issuer, whatever its
+//! `basicConstraints` says; the absence of `keyUsage` is not a refusal.
 //!
 //! `pathLenConstraint` (RFC 5280 §4.2.1.9) caps how many *intermediate* certificates
 //! may follow a CA towards the leaf, so it bounds what a sub-CA can delegate. A
@@ -56,13 +70,6 @@
 //! enforced on every CA in the presented chain *and* on the anchor, and where the
 //! anchor is itself the last certificate of the chain, that certificate is not
 //! counted against its own limit.
-//!
-//! `keyUsage.keyCertSign` is required of any issuer whose `keyUsage` extension is
-//! present: a certificate that does not assert the right to sign certificates has no
-//! business being one, whatever its `basicConstraints` says. It is **not** required
-//! of an anchor, because an anchor's authority comes from the caller: a pinned
-//! self-signed *leaf* certificate is a legitimate thing to trust and is how a
-//! deployment pins one key.
 //!
 //! Every check that *is* here is fatal on failure: there is no tolerant mode, no
 //! flag and no environment variable that turns one off.
@@ -171,6 +178,10 @@ pub enum ChainError {
     /// certificate: a CA certificate cannot be used as an end entity.
     CaUsedAsLeaf,
     /// A certificate that must be a CA is not one.
+    ///
+    /// For a chain link, `cA` must be asserted, so an absent `basicConstraints` is this
+    /// error too; for an anchor, only a stated `cA: FALSE` is, because a pin may carry no
+    /// extension at all (see [`check_anchor_is_ca`]).
     NotACa(Position),
     /// A certificate has a `keyUsage` extension without `keyCertSign`, so it does
     /// not assert the right to sign certificates.
@@ -450,6 +461,40 @@ fn intermediates_below(chain: &[Certificate<'_>], index: usize) -> usize {
         .count()
 }
 
+/// An anchor that *states* it is not a CA may not verify a signature on **another**
+/// certificate.
+///
+/// The same argument as [`check_key_cert_sign`] — the anchor's key is being used to verify
+/// a certificate signature, so it is acting as a CA and should claim to be one — with two
+/// deliberate differences from the rule the chain links get.
+///
+/// The first is the **absence**: an anchor may carry no `basicConstraints` at all and is
+/// then accepted, while a chain link has to assert it. A link arrives from the wire and
+/// must state that it may issue certificates; an anchor is the caller's own pin, and a
+/// bare pinned certificate (or a v1-style one) has no extension to contradict, so refusing
+/// it would break pinning to fix nothing.
+///
+/// The second is the **identity pin**: when the anchor is the very certificate it is
+/// verifying — which the caller can only have reached by presenting that certificate as
+/// its own chain, and which the name check above can only have matched while the
+/// certificate is self-issued — the link is not an issuance at all. Nobody is claiming the
+/// right to sign anything: the certificate is proving its own identity, which is what
+/// pinning a self-signed server certificate means. Such a certificate still cannot
+/// authenticate any other certificate, because any real subordinate link is a chain
+/// position and `NotACa` refuses it there. This is also the behaviour OpenSSL has, and it
+/// is what makes "pin the server's own certificate" work.
+fn check_anchor_is_ca(
+    anchor: &Certificate<'_>,
+    verified: &Certificate<'_>,
+    at: Position,
+) -> Result<(), ChainError> {
+    let identity_pin = anchor.der() == verified.der();
+    if anchor.has_basic_constraints() && !anchor.is_ca() && !identity_pin {
+        return Err(ChainError::NotACa(at));
+    }
+    Ok(())
+}
+
 /// A CA whose `keyUsage` extension is present must claim `keyCertSign`.
 ///
 /// RFC 5280 §4.2.1.9: without the bit, the key "MUST NOT be used to verify
@@ -593,6 +638,10 @@ pub fn verify_chain(
             continue;
         }
         let at = Position::Anchor(index);
+        if let Err(error) = check_anchor_is_ca(anchor, last, at) {
+            failure = Some(error);
+            continue;
+        }
         if let Err(error) = check_key_cert_sign(anchor, at) {
             failure = Some(error);
             continue;

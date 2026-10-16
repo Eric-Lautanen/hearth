@@ -337,23 +337,23 @@ const SELF_SIGNED_PSS_DER_HEX: &str = "\
     a00f300d060960864801650304020105 \
     00a11c301a06092a864886f70d010108 \
     300d06096086480165030402010500a2 \
-    0302012003820101002e7eb8c8abdfbb \
-    0e996bb21921c152d34e09b5b67eae9f \
-    933b97ae2e7f513ea3620f80cc40d0fb \
-    94ab20fe56535d5c6f3c97ad16685c27 \
-    5a5d641c0c9894be6665429658f339e6 \
-    4de9fba53d47751ccee7b19690156505 \
-    41e6e86b8090f35be1c5e5e0ccc6e407 \
-    3dc3bcddab64b84b5681160da7612ff8 \
-    30ea9042d8a5f33360a0bd9661659bb6 \
-    d47d9da79d3136c06dd7850043e60f2b \
-    4c42e8fce0ea275c53c06b45f1921e44 \
-    083e70c17f7529abdaf227994f02c583 \
-    b50a0720d1bd3bd167823ef4260396b2 \
-    3f0ab56b4578ddabf4fcfaacb20db73e \
-    89ffc83db286c25ecbe2a4c5fcd3ad26 \
-    59c4ed4238be7b3ac5b706fbc34c0926 \
-    47df088e55ea16ff38";
+    030201200382010100014655ff79595a \
+    8723dc60068e2f1df39c6e139fd3e9d2 \
+    98bf724c558c483e0b8ad5689afe4ba0 \
+    742e3f8a4decffcbde98d4a0c697c376 \
+    78203758b22fefa62cda2cb59ea67b6e \
+    9f204d4c30725273e183f914ea86f999 \
+    dd3aae3d3a2881fa2540ea6a542b25f8 \
+    36f260b641cb371eaf84fc4a370d809a \
+    e7838375c2e0eac07f7529c672908009 \
+    435198f67431d685bd1eadd205be5b79 \
+    a5ac29a76c0b06088c2728098c02c45a \
+    65568b7acc39bd19b90ef915590e76aa \
+    82250d0e0b82a2a8169770e98cfec5e8 \
+    9100acc9e170fdc9bbff0dc963f3c69b \
+    27b1ddf24d871b5f9bc59b5ab22cf3da \
+    aad6d1c2ede95a323a7a180ce0ce71b0 \
+    b1b037f02fa2932ecb";
 
 const SELF_SIGNED_EC_DER_HEX: &str = "\
     3082012c3081d3a00302010202010530 \
@@ -370,11 +370,11 @@ const SELF_SIGNED_EC_DER_HEX: &str = "\
     27fd8842b82a3c83ecdc4bdf6a127b19 \
     a1e45d97156f12892b872beb322d51ae \
     6b74f42964944f0641a3300a06082a86 \
-    48ce3d0403020348003045022100dbfb \
-    2c776f929923db0b578a2d026ec088da \
-    850e560a81c33d7ba57a56d3d61b0220 \
-    0baaa739770ee6a2ab4ee3458b60ae67 \
-    383c5cdb46083b071ebd03f3eaf14a26";
+    48ce3d04030203480030450220694b3a \
+    fb6cec84db3f55ad33c9775ea604038e \
+    63920ba980d4be473a0618cf57022100 \
+    dcb43c2fc909400eb0d19e5d84ca1a14 \
+    4b5c172f42270cfe5c9baeaf3489202f";
 
 const LEAF_UNKNOWN_CRITICAL_DER_HEX: &str = "\
     30820300308201e8a003020102020106 \
@@ -1048,6 +1048,107 @@ const LEAF_OF_WEAK_ANCHOR_DER_HEX: &str = "\
     c36e09ec83c1fb269029ea0263c53d5a \
     e05ff5";
 
+const NON_CA_SIGNER_DER_HEX: &str = "\
+    308202dd308201c5a003020102020130 \
+    300d06092a864886f70d01010b050030 \
+    1e311c301a06035504030c1348656172 \
+    7468205465737420526f6f7420434130 \
+    1e170d3236303130313030303030305a \
+    170d3237303130313030303030305a30 \
+    243122302006035504030c1948656172 \
+    74682054657374204e6f6e2d43412053 \
+    69676e657230820122300d06092a8648 \
+    86f70d01010105000382010f00308201 \
+    0a0282010100eb6fd66a7f22f7e8a18f \
+    9416a66900f73b5d235c44744ef50737 \
+    2340387663c5959fba96fe185fc371f7 \
+    21e2787bcb39206f463f454a233ded8a \
+    6bbb952586e60c761ed8268766374403 \
+    368adfe395aa36a6c5a5be7360dac0da \
+    22ba4448bec6f86213790f612569122f \
+    f5639b76ee1e3ff7b2e0eeea8676a7ab \
+    5d698f18b010d58ed838b3020e23af0c \
+    b94fc1c15c4af019acf948a422fd825f \
+    c17a9c5122e94770bec36a570cbba4c5 \
+    4542803d7d1db9a4cfa3cfe6cc9369bc \
+    4ccec92b2023905c9225b11f56928592 \
+    075f13faaf5faa4fe60b01876f704dde \
+    18f9f3d75fdebfca9eccff4bb264a145 \
+    32fb02c49219d948ace10216e4a14c22 \
+    8f4c00aefa970203010001a320301e30 \
+    0c0603551d130101ff04023000300e06 \
+    03551d0f0101ff040403020284300d06 \
+    092a864886f70d01010b050003820101 \
+    00a54cdb28d0488d45ca57e977a1fcea \
+    6586f2a1e60a50049b98d2d17d9c2def \
+    bee8a3581524a8540d642a34597930c8 \
+    8deb37736a55f21a84c50b9568b82a14 \
+    56f277f9420bab5b903a79808edd8671 \
+    fef6f5fd4738646280a413a34ea56de5 \
+    f4f925b6bb304def3d797e60e5412d21 \
+    6ce44ba99ee830ceb114ca6c02f14395 \
+    d011e3b884678c17e1884030d1bb9d2c \
+    84c6dc89262e5c2c71ab1f708b61debe \
+    454faf694c4473ceeb68aa820fbf9398 \
+    8d52145ebd5fa7b5346d3cbe7adab7f2 \
+    208f024f9b9799e8bf94e5ee41e25071 \
+    2dc950faf50579f3840e48072898687a \
+    0ec0d9187667a0de15bf6bbfa1b5f4ae \
+    74c8ffe891de37c0de641057fadd203c \
+    15";
+
+const LEAF_OF_NON_CA_SIGNER_DER_HEX: &str = "\
+    30820316308201fea003020102020131 \
+    300d06092a864886f70d01010b050030 \
+    243122302006035504030c1948656172 \
+    74682054657374204e6f6e2d43412053 \
+    69676e6572301e170d32363031303130 \
+    30303030305a170d3237303130313030 \
+    303030305a3020311e301c0603550403 \
+    0c156e6f6e2d63612d7369676e65722e \
+    6578616d706c6530820122300d06092a \
+    864886f70d01010105000382010f0030 \
+    82010a0282010100992a7521ad3ccfa0 \
+    8a5aa128bfacba3ac95b6c7a6cd7e08c \
+    0dba575c9e53d398a7bc307c98a91607 \
+    547a403138f7be38a7f76201136bcce9 \
+    63f1e103236f56c95e0f365a54463295 \
+    07cd6620dc72e20a34f3a205806c0f2b \
+    4b930bb23ede00780976c46e6a29d041 \
+    2a05ae637494f911ba3fcd26ced94f23 \
+    c1a67c09887202209afc5ca80c8bb1cc \
+    b3ce3f60d8a87971ff76c6f6ee374a9c \
+    5839dc79b84bc2174ad62dc9c5cfff7b \
+    0b517a2e877af29bc20d8c6dafbec916 \
+    0aead72d8d0056a27b7c08cc195e928a \
+    8618ff2f0f0c465ec2fb1b43eaa0577d \
+    ea81805024e326670b0588dd91f85f2a \
+    899d4c60da083ee705ee2c9621adfee6 \
+    cb94f819af1c9d190203010001a35730 \
+    55300c0603551d130101ff0402300030 \
+    0e0603551d0f0101ff04040302078030 \
+    130603551d25040c300a06082b060105 \
+    0507030130200603551d110419301782 \
+    156e6f6e2d63612d7369676e65722e65 \
+    78616d706c65300d06092a864886f70d \
+    01010b0500038201010090ea2dd138bf \
+    0db2003238b524963da5950091c021c6 \
+    2591076646fac01e93949166a421b8bf \
+    979b11f8a4c00c560294e2d44587c57b \
+    406f6f53f1dff26ca0374e1fe249a222 \
+    3007854efe091327a784d4448245db11 \
+    f9359f9905ec2834ecc009f3d9b96ce3 \
+    5e5621b7378b0dd5fc53bbdc5db0a065 \
+    d6f7bb00f13bca81e5eb471889626b2e \
+    212b770f128694f85265d051d408320b \
+    8dbf7139fc7199cdd89611a4d721fa27 \
+    fae0cc632247e79c0cda5701be357e5e \
+    149a87e8791ee09867a448287488a65d \
+    7a615fca924f472a55b764d934932c93 \
+    72fb411461fc75ab134278e9aeb45e4a \
+    2c889434e6856c2a9829ee5df62bc4ea \
+    a64564067bbe690f6b79";
+
 /// What OpenSSL's parser says about each fixture above.
 const EXPECTATIONS: &[(&str, Expectation)] = &[
     (
@@ -1062,6 +1163,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1577836800,
             not_after: 2208988800,
             is_ca: true,
+            has_basic_constraints: true,
             path_len: Some(1),
             key_usage: Some(0x060),
             san_dns: &[],
@@ -1081,6 +1183,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1609459200,
             not_after: 2177452800,
             is_ca: true,
+            has_basic_constraints: true,
             path_len: Some(0),
             key_usage: Some(0x060),
             san_dns: &[],
@@ -1100,6 +1203,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: Some(0x005),
             san_dns: &["models.example", "*.cdn.example"],
@@ -1119,6 +1223,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 2537654400,
             not_after: 2853273600,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: None,
             san_dns: &[],
@@ -1138,6 +1243,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: Some(0x005),
             san_dns: &["client.example"],
@@ -1157,6 +1263,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: Some(0x004),
             san_dns: &["no-sign.example"],
@@ -1176,6 +1283,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1772323200,
             not_after: 2087942400,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: None,
             san_dns: &[],
@@ -1195,6 +1303,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1772323200,
             not_after: 2087942400,
             is_ca: false,
+            has_basic_constraints: false,
             path_len: None,
             key_usage: None,
             san_dns: &[],
@@ -1214,6 +1323,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: None,
             san_dns: &["critical.example"],
@@ -1233,6 +1343,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1577836800,
             not_after: 2208988800,
             is_ca: true,
+            has_basic_constraints: true,
             path_len: Some(1),
             key_usage: Some(0x060),
             san_dns: &[],
@@ -1252,6 +1363,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: true,
+            has_basic_constraints: true,
             path_len: Some(1),
             key_usage: Some(0x060),
             san_dns: &[],
@@ -1271,6 +1383,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: true,
+            has_basic_constraints: true,
             path_len: Some(0),
             key_usage: Some(0x060),
             san_dns: &[],
@@ -1290,6 +1403,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: true,
+            has_basic_constraints: true,
             path_len: Some(0),
             key_usage: Some(0x060),
             san_dns: &[],
@@ -1309,6 +1423,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: Some(0x001),
             san_dns: &["sub.example"],
@@ -1328,6 +1443,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: true,
+            has_basic_constraints: true,
             path_len: Some(0),
             key_usage: Some(0x041),
             san_dns: &[],
@@ -1347,6 +1463,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: Some(0x001),
             san_dns: &["no-sign-ca.example"],
@@ -1366,6 +1483,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: true,
+            has_basic_constraints: true,
             path_len: Some(0),
             key_usage: Some(0x060),
             san_dns: &[],
@@ -1385,6 +1503,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: Some(0x001),
             san_dns: &["sub-strict.example"],
@@ -1404,6 +1523,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1420070400,
             not_after: 1577836800,
             is_ca: true,
+            has_basic_constraints: true,
             path_len: Some(0),
             key_usage: Some(0x060),
             san_dns: &[],
@@ -1423,6 +1543,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: Some(0x001),
             san_dns: &["expired-anchor.example"],
@@ -1442,6 +1563,7 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1577836800,
             not_after: 2208988800,
             is_ca: true,
+            has_basic_constraints: true,
             path_len: Some(0),
             key_usage: Some(0x060),
             san_dns: &[],
@@ -1461,11 +1583,52 @@ const EXPECTATIONS: &[(&str, Expectation)] = &[
             not_before: 1767225600,
             not_after: 1798761600,
             is_ca: false,
+            has_basic_constraints: true,
             path_len: None,
             key_usage: Some(0x001),
             san_dns: &["weak-anchor.example"],
             signature_algorithm: "1.2.840.113549.1.1.11",
             key: Key::Rsa { modulus: "b37207e074b60b6cb22313eefb8d0851295be2d2485447623580fbae4d9efacb0a32e924f820c53670f2cf300f272ea031efe07e6c69e671fc08b7d399828e1dca3a5839be34bd35e0ec7dc33b0969143ffc7022a98f044cb0ffb2d777bdf9d1d0b29506decd7cd8f4f6377207e83b722168549e0b262561d34a6d4d2972685790c9950317afd2800ac65f7411d7374992581f2e993e4bce0aa37549c8e53985da59ead64b145db040cd89f314b75ee67bb1572e4ca9dac43290f23067dbe90d761eb7d9c97603ce80bb9c54f68a16b8376fa8c61335b64f9131423e88f74811e273e038ce2ba18c580255659163965d1b14d78fd80f9381eb3e04299e819f6b", exponent: 65537 },
+        },
+    ),
+    (
+        "NON_CA_SIGNER",
+        Expectation {
+            der_len: 737,
+            signature_len: 256,
+            version: 3,
+            subject_cn: "Hearth Test Non-CA Signer",
+            issuer_cn: "Hearth Test Root CA",
+            serial_hex: "30",
+            not_before: 1767225600,
+            not_after: 1798761600,
+            is_ca: false,
+            has_basic_constraints: true,
+            path_len: None,
+            key_usage: Some(0x021),
+            san_dns: &[],
+            signature_algorithm: "1.2.840.113549.1.1.11",
+            key: Key::Rsa { modulus: "eb6fd66a7f22f7e8a18f9416a66900f73b5d235c44744ef507372340387663c5959fba96fe185fc371f721e2787bcb39206f463f454a233ded8a6bbb952586e60c761ed8268766374403368adfe395aa36a6c5a5be7360dac0da22ba4448bec6f86213790f612569122ff5639b76ee1e3ff7b2e0eeea8676a7ab5d698f18b010d58ed838b3020e23af0cb94fc1c15c4af019acf948a422fd825fc17a9c5122e94770bec36a570cbba4c54542803d7d1db9a4cfa3cfe6cc9369bc4ccec92b2023905c9225b11f56928592075f13faaf5faa4fe60b01876f704dde18f9f3d75fdebfca9eccff4bb264a14532fb02c49219d948ace10216e4a14c228f4c00aefa97", exponent: 65537 },
+        },
+    ),
+    (
+        "LEAF_OF_NON_CA_SIGNER",
+        Expectation {
+            der_len: 794,
+            signature_len: 256,
+            version: 3,
+            subject_cn: "non-ca-signer.example",
+            issuer_cn: "Hearth Test Non-CA Signer",
+            serial_hex: "31",
+            not_before: 1767225600,
+            not_after: 1798761600,
+            is_ca: false,
+            has_basic_constraints: true,
+            path_len: None,
+            key_usage: Some(0x001),
+            san_dns: &["non-ca-signer.example"],
+            signature_algorithm: "1.2.840.113549.1.1.11",
+            key: Key::Rsa { modulus: "992a7521ad3ccfa08a5aa128bfacba3ac95b6c7a6cd7e08c0dba575c9e53d398a7bc307c98a91607547a403138f7be38a7f76201136bcce963f1e103236f56c95e0f365a5446329507cd6620dc72e20a34f3a205806c0f2b4b930bb23ede00780976c46e6a29d0412a05ae637494f911ba3fcd26ced94f23c1a67c09887202209afc5ca80c8bb1ccb3ce3f60d8a87971ff76c6f6ee374a9c5839dc79b84bc2174ad62dc9c5cfff7b0b517a2e877af29bc20d8c6dafbec9160aead72d8d0056a27b7c08cc195e928a8618ff2f0f0c465ec2fb1b43eaa0577dea81805024e326670b0588dd91f85f2a899d4c60da083ee705ee2c9621adfee6cb94f819af1c9d19", exponent: 65537 },
         },
     ),
 ];
