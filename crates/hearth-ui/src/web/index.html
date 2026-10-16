@@ -1402,13 +1402,18 @@ function finishStream(ev) {
   // think control tags into the visible answer.
   let text = finalText, reason = finalReason;
   if (!reason) {
+    // Split only when there is content on BOTH sides: reasoning before the
+    // tag and an answer after it. A tag trailing the answer with nothing
+    // after it is just a stray artifact — splitting there would bury a good
+    // answer inside a collapsed drawer while showing an empty bubble.
     const closes = [...text.matchAll(/<\/thinks?>/g)];
     if (closes.length > 0) {
       const last = closes[closes.length - 1];
       const maybeThink = text.slice(0, last.index).replace(/<thinks?>/g, "").trim();
-      if (maybeThink) {
+      const after = text.slice(last.index + last[0].length).trim();
+      if (maybeThink && after) {
         reason = maybeThink;
-        text = text.slice(last.index + last[0].length).trim();
+        text = after;
       }
     }
   }
