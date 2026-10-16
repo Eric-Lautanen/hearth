@@ -252,15 +252,19 @@ fn send_cmd(value: &Json) {
 
 fn spawn_service(ctx: Arc<AppCtx>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
-    // hearth-ui.exe sits in target/{debug,release}/ next to hearth-chat-cli.exe.
+    // hearth-ui sits in target/{debug,release}/ next to hearth-chat-cli.
+    #[cfg(target_os = "windows")]
+    let cli_name = "hearth-chat-cli.exe";
+    #[cfg(not(target_os = "windows"))]
+    let cli_name = "hearth-chat-cli";
     let cli = exe
         .parent()
-        .map(|p| p.join("hearth-chat-cli.exe"))
-        .unwrap_or_else(|| std::path::PathBuf::from("hearth-chat-cli.exe"));
+        .map(|p| p.join(cli_name))
+        .unwrap_or_else(|| std::path::PathBuf::from(cli_name));
 
     if !cli.exists() {
         return Err(format!(
-            "hearth-chat-cli.exe not found next to hearth-ui.exe (expected {}). \
+            "hearth-chat-cli binary not found next to hearth-ui (expected {}). \
              Build the workspace with: cargo build --release",
             cli.display()
         ));
