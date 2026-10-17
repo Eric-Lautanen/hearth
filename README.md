@@ -82,6 +82,25 @@ instead of buffering a reply. Raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER
 | Q8_0             | 8         | 32    | Portable + fusion   |
 | F16 / F32        | —         | —     | matrixmultiply sgemm |
 
+## Install
+
+Prebuilt releases are on the [releases page](https://github.com/Eric-Lautanen/hearth/releases),
+with `SHA256SUMS` beside them. One file per platform:
+
+| Platform | File | Notes |
+| --- | --- | --- |
+| Windows | `hearth-vX.Y.Z-windows-x86_64.msi` | Per-user, no admin prompt: installs to `%LOCALAPPDATA%\Programs\Hearth`, adds a Start-menu folder, an optional Desktop shortcut, an Add/Remove Programs entry, and can launch the app when setup finishes. |
+| Windows | `hearth-vX.Y.Z-windows-x86_64.zip` | Portable: unzip anywhere and double-click `hearth-ui.exe`. |
+| Linux | `hearth-vX.Y.Z-linux-x86_64.tar.gz` | Also `-linux-aarch64` for ARM64. Extract and run `./hearth-ui`; the archive also carries `hearth.desktop` and `hearth.svg` if you want a menu entry. |
+| macOS | `hearth-vX.Y.Z-macos-arm64.zip` | Also `-macos-x86_64` for Intel. Contains `Hearth.app` — unsigned, so a first launch needs right-click → **Open**. |
+
+Uninstalling deliberately leaves `models\` alone, because it is the one directory
+meant to grow after installation: the app downloads its own models (download icon,
+top-right), so nothing has to be fetched by hand. Installing puts down two files,
+`hearth-ui` and `hearth-chat-cli`, and they must sit together. No console window
+appears on Windows — `hearth-ui` is a GUI-subsystem binary and gives the helper
+processes it spawns no window either.
+
 ## Quick start
 
 **Prerequisites:** [Rust](https://rustup.rs) 1.88+ · an x86_64 CPU with AVX2 + FMA +
