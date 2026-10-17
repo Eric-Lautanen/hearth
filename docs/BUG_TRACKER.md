@@ -1,9 +1,9 @@
 # Hearth Performance Tracker — CPU Final State → GPU Planning
 
 ## System
-AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 10 workers (`min(logical, physical + physical/4)`, see the first entry). Ref: llama.cpp-prism.
+AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the first entry for why they differ. Ref: llama.cpp-prism.
 
-### The Q2_0 dispatch preferred a kernel 47% slower per thread — and the worker count had to follow the kernel (SparkOC, 2026-10-16 late)
+### The Q2_0 dispatch preferred a kernel 47% slower per thread, and the worker count follows the prefill (SparkOC, 2026-10-16 late)
 
 Fourth instance of the missing-declaration class, and the first where the consequence was a dispatch
 *order* rather than a dead kernel. `dot_q2_0_q8_0_ptr` preferred the 512-bit VNNI arm, with a comment
@@ -35,38 +35,66 @@ AVX-512F also has the AVX2, FMA and F16C that arm needs). On this box both gates
 (Intel) is unmeasured — the 512-bit arm keeps the slot it was written for, and that is the one
 question the calibration runner below is the answer to.**
 
-**The kernel and the worker count are one decision.** The LUT kernel decodes through a per-block
-table in L1, and when SMT siblings share a core that table competes with the weight stream, so a
-pool that oversubscribes the physical cores pays about 2x for it. Sweep of the hybrid
-`Ternary-Bonsai-2-4B-PQ2_0` (one run per point, then mirrored groups for 8 and 10):
+**The kernel and the worker count are one decision — but which decision depends on the *prefill*.**
+The hybrid `Ternary-Bonsai-2-4B-PQ2_0` sweep, one run per point then mirrored groups for 8 and 10,
+with the LUT kernel it now dispatches:
 
 | workers | 4 | 6 | 8 | 10 | 12 |
 | --- | --- | --- | --- | --- | --- |
-| LUT kernel | 4.98 | 6.38 | 7.1–7.4 | **7.7–7.9** | 4.3–4.9 |
-| VNNI kernel | — | — | 6.2 | — | 7.1–7.6 |
+| decode tok/s | 4.98 | 6.38 | 7.1–7.4 | **7.7–7.9** | 4.3–4.9 |
+| 109-token prefill ms | — | — | 13940 | **13346** | — |
 
-so the fast kernel's optimum moved *up* from the old rule (physical cores) to about a quarter past
-it, while 12 (1.5x) falls off the cliff either way. That is now one rule for both paths:
-`pool::default_worker_count()` = `min(logical, physical + physical/4)` = 10 here, with the hybrid
-keeping ¾-of-logical for `PTQ1_0`, which has no fast kernel and measures 6.7 at 12 against 5.9 at 8.
+so that path wants a quarter past physical, and that is what it takes: its prefill is token-by-token,
+which is the *stable* single-token path. The dense path does **not**, and the first version of this
+change got that wrong — it moved `default_worker_count()` to the same quarter-past count, which
+regressed dense prefill up to 2.4x while it helped decode. The dense prefill is *batched*
+(`matmul_batch` → `batched_rows_chunk`, plus `flash_attention_prefill`), and that path is unreliable
+once the workers outnumber the physical cores:
+
+| model, 109-token prompt | 8 workers | 9 workers | 10 workers |
+| --- | --- | --- | --- |
+| dense 8B Q2_0 | 9011, 8973, 9158 | 12999, 8320, 13256, 19933, 8439 | 19841, 20854 |
+| dense 4B Q2_0 | 4746, 4825 | 4561, 4560 | 9847, 10153 |
+| dense 8B Q1_0 | 6448, 6394 | 6030, 5967 | 12557, 11768 |
+
+Eight runs alternating 8 and 9 workers on the 8B Q2_0 give a **2.4x spread at 9 on identical
+invocations** (8320 to 19933 ms) against a tight 8 (9011/8973/9158). That is not a slope to tune
+around, it is a stability problem, and the boundary moves with the model (4B Q2_0 is still fine at 9
+and falls at 10; 8B Q2_0 is already unstable at 9), so the honest rule stays at the physical count
+until the cause is known. The first hypothesis to test is the pool's spin-then-yield wait stealing a
+core from a worker while the batched chunk runs (`docs/RESUME.md`).
+
+The single-token path *is* stable above physical and does want more — dense 4B Q2_0 decode 13.4 tok/s
+at 10, 12.9 at 9, 11.7 at 8; dense 8B Q2_0 7.0 at 9 against 6.5 at 8 — so the count that serves both
+passes is the physical one. The three rules, all measured:
+
+- dense: `physical` (batched prefill, capped where it is stable).
+- hybrid `Q2_0`/`PQ2_0`: `min(logical, physical + physical/4)` = 10 (token-by-token prefill only).
+- hybrid `PTQ1_0`: ¾-of-logical = 12 (no fast kernel; it hides the pool's barrier behind threads —
+  6.7 tok/s at 12 against 5.9 at 8).
 
 End to end, mirrored (before = VNNI Q2_0 dispatch + 8 dense / 12 hybrid workers; after = LUT + the
-new counts):
+rules above), decode then a 109-token prefill. The first pass of this table was taken with the
+quarter-past dense count, and it is what exposed the regression — its 8B Q2_0 prefill read 21856 ms
+against 10060. With the count back at physical, the same row is:
 
-| model | before | after | Δ |
-| --- | --- | --- | --- |
-| Bonsai-1.7B-Q1_0 | 47.05 | 49.22 | +4.6% |
-| Ternary-Bonsai-1.7B-Q2_0 | 19.38 | 28.04 | **+44.6%** |
-| Bonsai-4B-Q1_0 | 21.50 | 23.61 | +9.8% |
-| Ternary-Bonsai-4B-Q2_0 | 8.68 | 12.72 | **+46.6%** |
-| Bonsai-8B-Q1_0 | 12.38 | 13.37 | +8.0% |
-| Ternary-Bonsai-8B-Q2_0 | 4.93 | 7.35 | **+49.1%** |
-| hybrid 4B PQ2_0 | 7.54 | 8.21 | +8.8% |
-| hybrid 4B PTQ1_0 | 7.19 | 7.07 | −1.7% (path byte-identical: noise) |
+| model | decode before → after | prefill before → after |
+| --- | --- | --- |
+| Bonsai-1.7B-Q1_0 | 43.14 → 43.23 (+0.2%) | 1364 → 1375 ms (+0.8%) |
+| Ternary-Bonsai-1.7B-Q2_0 | 20.63 → 27.14 (+31.6%) | 2082 → 1972 ms (−5.3%) |
+| Bonsai-4B-Q1_0 | 21.14 → 21.98 (+4.0%) | 3548 → 3590 ms (+1.2%) |
+| Ternary-Bonsai-4B-Q2_0 | 9.00 → 11.81 (+31.2%) | 5273 → 4901 ms (−7.0%) |
+| Bonsai-8B-Q1_0 | 12.57 → 12.77 (+1.6%) | 6660 → 6818 ms (+2.4%) |
+| Ternary-Bonsai-8B-Q2_0 | 4.84 → 6.34 (+31.0%) | 9792 → 9370 ms (−4.3%) |
+| hybrid 4B PQ2_0 | 7.13 → 8.34 (+17.1%) | 15541 → 13433 ms (−13.6%) |
+| hybrid 4B PTQ1_0 | 7.14 → 7.49 (+4.9%) | 15882 → 15642 ms (−1.5%) |
 
-The Q1_0 rows move on the worker count alone (their kernel is unchanged from the previous commit);
-the Q2_0 rows are kernel plus count. `kernel_name()` reports `avx2_lut` for both paths, so the
-`[kernel]` banner and the service's `kernels` JSON stay honest without a per-path variant.
+The Q1_0 rows are the control — kernel *and* count unchanged from the previous commit, so their ±4%
+is this box's noise band. The dense Q2_0 rows are the kernel alone (the count is back at 8): +31%
+decode, −4 to −7% prefill. The hybrid `PQ2_0` row is kernel plus count (12 → 10). The hybrid `PTQ1_0`
+row is unchanged in both, so its +4.9%/−1.5% is noise as well. `kernel_name()` reports `avx2_lut` for
+both paths, so the `[kernel]` banner and the service's `kernels` JSON stay honest without a per-path
+variant.
 
 **Baseline invariance, measured.** The dispatch change was re-checked at the weak baseline, because
 the arm it makes the default (the Q2_0 LUT kernel) had read 3x slower at `x86-64-v2` before its f16c
@@ -97,8 +125,11 @@ benchmark, so the static guard stays the gate and this is the measurement it sta
 
 Lesson, four times in one day: **a dispatch order is a measurement, and a measurement of a body that
 cannot inline is not a measurement of the body that ships.** The guard now covers the test target as
-well as the library (see the entry below), and the coupling above is what the calibration runner
-exists to remove (`docs/RESUME.md`).
+well as the library (see the entry below). The worker-count half of this entry is a second lesson:
+**a count tuned on decode alone is not tuned**, because the dense prefill is a different code path
+(batched) with a different and model-dependent stability boundary — and the first version of this
+change cost 2.4x on the 8B before mirrored *prefill* runs caught it. Both axes belong in the
+calibration runner (`docs/RESUME.md`).
 
 ### The kernel-baseline guard only built the library, so a test-only kernel was never checked (SparkOC, 2026-10-16 late)
 

@@ -110,12 +110,14 @@ pub fn default_worker_count() -> usize {
 /// optimum: the weight format decides it as much as the path does, because the
 /// kernel and the count are one decision.
 ///
-/// `Q2_0`/`PQ2_0` dispatch to the AVX2 LUT kernel, which is the fastest arm per
-/// thread but decodes through a per-block table in L1 — when SMT siblings share a
-/// core that table competes with the weight stream, so oversubscribing it costs
-/// about 2x and this format takes the dense rule. `PTQ1_0` has no such kernel and
-/// goes the other way: it hides the pool's barrier behind more threads (measured
-/// 6.7 tok/s at 12 workers against 5.9 at 8 on Ternary-Bonsai-2-4B-PTQ1_0).
+/// `Q2_0`/`PQ2_0` take the quarter past physical: the LUT kernel is the fastest arm
+/// per thread, and the hybrid's token-by-token prefill gives it the *stable*
+/// single-token path rather than the dense path's batched one — that distinction is
+/// the whole rule, and [`dense_worker_count_for`] has the measurements for it.
+/// Measured on Ternary-Bonsai-2-4B-PQ2_0: decode 8.5 tok/s at 10 workers against
+/// 7.9 at 8, 109-token prefill 13346 ms against 13940. `PTQ1_0` has no fast kernel
+/// and goes the other way: it hides the pool's barrier behind more threads
+/// (measured 6.7 tok/s at 12 workers against 5.9 at 8).
 ///
 /// Honors `HEARTH_THREADS` first, then [`hybrid_worker_count_for`].
 pub(crate) fn hybrid_worker_count(has_q2_weights: bool) -> usize {
@@ -129,27 +131,37 @@ pub(crate) fn hybrid_worker_count(has_q2_weights: bool) -> usize {
 /// The dense path's policy, with the core counts passed in so the rule can be
 /// checked for machines this one is not.
 ///
-/// A quarter past the physical count: the dots are memory-bandwidth bound, so SMT
-/// siblings steal bandwidth from each other, but the main thread is serial while
-/// the workers run (it quantizes the activations and drives the block), so a few
-/// spare threads keep the matmuls saturated. The loss past that is a cliff rather
-/// than a slope, which is why the rule stops well short of the logical count.
+/// The *physical* count - not the quarter the hybrid path uses - because the dense
+/// prefill is **batched** (`matmul_batch` into `batched_rows_chunk`, plus
+/// `flash_attention_prefill`) and that path is unreliable once the workers outnumber
+/// the physical cores. Measured on an 8C/16T box, dense 8B Q2_0, 109-token prompt,
+/// eight runs alternating 8 and 9 workers: at 8 the time is tight (9011, 8973, 9158
+/// ms) and at 9 it is not (12999, 8320, 13256, 19933, 8439) - a 2.4x spread on
+/// identical invocations, with a slow tail past even the 10-worker figure (19841,
+/// 20854). Dense 4B Q2_0 and 8B Q1_0 show the same loss with a tighter boundary
+/// (4B Q2_0: 4560 ms at 9 against 9847 at 10 and 10153 at 12; 8B Q1_0: 5998 at 9
+/// against 12162 at 10, and 33.1 s against 74.7 s for a 541-token prompt).
 ///
-/// Re-measured on an 8C/16T box after the Q1_0 VNNI and Q2_0 LUT dispatches landed
-/// (both kernels are 6-47% faster, so the old physical-core optimum had moved):
-/// dense 8B Q1_0 reads 13.0 tok/s at 10 workers against 11.3 at 8, dense 1.7B Q1_0
-/// 49.3 against 46.9, dense 4B Q2_0 12.5 against 11.2, while 12 workers collapses
-/// to 5.8.
+/// The single-token path is stable and faster there - dense 4B Q2_0 decode 13.4
+/// tok/s at 10, 12.9 at 9, 11.7 at 8; dense 8B Q2_0 7.0 at 9 against 6.5 at 8 - so
+/// the count is a real trade and the conservative side of it is the physical count,
+/// until the batched path's instability is understood. The hybrids keep the quarter:
+/// their prefill is token-by-token, so they only ever run the stable path.
 fn dense_worker_count_for(logical: usize, physical: usize) -> usize {
-    // A machine without SMT has no spare threads to add.
-    (physical + physical / 4).min(logical)
+    physical.min(logical)
 }
 
-/// The hybrid path's policy, with the core counts passed in for the same reason:
-/// the format picks the rule, and only `PTQ1_0` takes the higher count.
+/// The hybrid path's policy, with the core counts passed in for the same reason.
+///
+/// `Q2_0`/`PQ2_0` take the quarter past physical: the hybrid's prefill is
+/// token-by-token, so it has the single-token path's appetite for threads and none
+/// of the batched path's instability (hybrid 4B PQ2_0, 109-token prompt: 13346 ms
+/// at 10 against 13940 at 8, decode 8.5 tok/s against 7.9, both tight across
+/// repeats). `PTQ1_0` has no fast kernel and goes the other way, hiding the pool's
+/// barrier behind more threads (6.7 tok/s at 12 against 5.9 at 8).
 fn hybrid_worker_count_for(logical: usize, physical: usize, has_q2_weights: bool) -> usize {
     if has_q2_weights {
-        dense_worker_count_for(logical, physical)
+        (physical + physical / 4).min(logical)
     } else if logical > 8 {
         // Three quarters of the logical count, with a floor of eight.
         (logical * 3 / 4).max(8)
@@ -647,20 +659,23 @@ mod tests {
         assert!(hybrid_worker_count(false) >= 1);
     }
 
-    /// The dense rule is a quarter past physical and never past logical: a machine
-    /// without SMT has no spare threads to add.
+    /// The dense rule is the physical count and never past logical: the batched
+    /// prefill path is unreliable once the workers outnumber the physical cores
+    /// (measured 2.4x spread at 9 workers against a tight 8 on dense 8B Q2_0), so
+    /// the dense rule adds no spare thread.
     #[test]
-    fn dense_count_is_a_quarter_past_physical() {
-        assert_eq!(dense_worker_count_for(16, 8), 10);
-        assert_eq!(dense_worker_count_for(32, 16), 20);
+    fn dense_count_is_the_physical_count() {
+        assert_eq!(dense_worker_count_for(16, 8), 8);
+        assert_eq!(dense_worker_count_for(32, 16), 16);
         assert_eq!(dense_worker_count_for(8, 8), 8);
         assert_eq!(dense_worker_count_for(4, 4), 4);
         assert_eq!(dense_worker_count_for(2, 1), 1);
     }
 
     /// The hybrid rule follows the *kernel*, not the path: `Q2_0`/`PQ2_0` weights
-    /// take the dense rule because the LUT kernel is hurt by oversubscription, and
-    /// `PTQ1_0` keeps three quarters of the logical count.
+    /// take the quarter-past count because the hybrid prefill is token-by-token (so
+    /// it never runs the batched path the dense rule is capped for), and `PTQ1_0`
+    /// keeps three quarters of the logical count.
     #[test]
     fn hybrid_count_follows_the_kernel() {
         assert_eq!(hybrid_worker_count_for(16, 8, true), 10);

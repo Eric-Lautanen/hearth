@@ -6,17 +6,21 @@
 > on the strength of a `benchk` table taken *before* the AVX2 LUT kernel's declarations were fixed
 > (256 → 167 instructions in the change log). Re-measured on real weights at the v3 baseline we ship,
 > `avx2_lut` reads **2.56–2.57 GB/s against 1.74–1.76** for the VNNI pair, on every tensor of two
-> models, with the two arms that are the same function agreeing within 1%. The 512-bit arm went back
-> behind `crate::avx512_full_width` (the gate PTQ1_0 already uses; the earlier entry had removed it),
-> so a full-width AVX-512 part is the one case this measurement does not cover. Fixing the order
-> exposed a coupling the old per-path counts had hidden: **the kernel and the worker count are one decision** —
-> the LUT kernel's L1 table loses ~2x when SMT siblings share a core, so the fast kernel's optimum
-> moved from physical cores to about a quarter past them (10 here; 12 collapses to 5.8), and the
-> hybrid's ¾-of-logical was an artifact of the slow kernel it was measured against. One rule now:
-> `min(logical, physical + physical/4)`, with the hybrid keeping ¾-of-logical for `PTQ1_0`, which has
-> no fast kernel to be hurt by oversubscription. End to end, mirrored: **Q2_0 +44.6 / +46.6 / +49.1%**
-> (1.7B/4B/8B), Q1_0 +4.6 / +9.8 / +8.0% (the count alone), hybrid PQ2_0 +8.8%, hybrid PTQ1_0
-> unchanged. Also: the `kernel-baseline` CI job now builds the *test* target too, because a
+> models, with the two arms that are the same function agreeing within 1%; the 512-bit arm went back
+> behind `crate::avx512_full_width` (the gate PTQ1_0 already uses), so a full-width AVX-512 part is
+> the one case this measurement does not cover. End to end that is **+31% decode and −4 to −7%
+> prefill on all three dense Q2_0 models**, with the Q1_0 rows as an unchanged control. The *count*
+> half of the change was wrong on the first attempt and the mirror caught it: the dense prefill is a
+> **batched** path (`matmul_batch` → `batched_rows_chunk`, plus `flash_attention_prefill`) and it is
+> *unreliable* once the workers outnumber the physical cores — eight runs alternating 8 and 9 workers
+> on dense 8B Q2_0, 109-token prompt, gave a **2.4x spread at 9 on identical invocations** (8320 to
+> 19933 ms) against a tight 8 (9011/8973/9158), and the boundary moves with the model (4B Q2_0 is
+> still fine at 9 and falls at 10). So the dense rule stays at `physical`, while the hybrids — whose
+> prefill is token-by-token, i.e. the *stable* single-token path — keep the counts their kernels want:
+> `min(logical, physical + physical/4)` = 10 for `Q2_0`/`PQ2_0` and ¾-of-logical = 12 for `PTQ1_0`.
+> The single-token path *is* stable above physical and does want more (dense 4B Q2_0 decode 13.4
+> tok/s at 10 against 11.7 at 8), so **a count tuned on decode alone is not tuned** — that is the
+> finding to carry. Also: the `kernel-baseline` CI job now builds the *test* target too, because a
 > `#[cfg(test)]` kernel is one the library build never sees — which is exactly where the Q1_0 VNNI
 > kernel hid.
 
@@ -27,8 +31,8 @@
 > 12; hybrid `Ternary-Bonsai-2-4B-PQ2_0` 5.2 → 6.4 at 8) and neutral at the default. That **closes**
 > the carry-over item that wanted the dispatching thread to take a chunk instead of waiting: the
 > remaining cliff is memory bandwidth and SMT sharing, not a starved worker, so the per-path counts
-> stand. *(pt 18: they did not — the cliff is kernel-dependent, and both counts moved once the kernels
-> got faster.)* (2) **aarch64 became a gated platform, and it had never been built.** One
+> stand. *(pt 18: the hybrid's did — only its `Q2_0`/`PQ2_0` count moved to the quarter; the dense
+> count stayed at physical because the batched prefill is unstable above it.)* (2) **aarch64 became a gated platform, and it had never been built.** One
 > `cargo check --target aarch64-unknown-linux-gnu --workspace --all-targets` showed `hearth-tls` did
 > not compile there at all — AES-NI and PCLMUL calls reached from branches gated only on the runtime
 > probe, naming modules that exist only on x86_64 — and `hearth-quant` had six dead-code warnings
@@ -55,19 +59,26 @@
    timing is not). The two shapes that suit NEON best are the `Q2V_U8` LUT dot — `vqtbl` is a table
    lookup in one instruction, which is exactly what that kernel is — and the f32 glue in
    `hearth-llm/src/ops.rs`.
-2. **The worker count follows the kernel; re-measure both together, never one alone.** As of pt 18 the
-   dense path *and* the hybrid's `Q2_0`/`PQ2_0` weights use `min(logical, physical + physical/4)` (10
-   here), and the hybrid's `PTQ1_0` keeps ¾-of-logical (12: measured 6.7 against 5.9 at 8). The two
-   rules disagree because the kernels do — `q1_0g128` VNNI and `q2_0` LUT are 6–47% faster than the
-   arms they replaced, and a fast kernel is *hurt* by oversubscription (12 workers on the LUT kernel
-   reads 5.8 tok/s against 12.5 at 10) while a slow one hides the pool's barrier behind more threads.
-   So any future kernel change owes a count sweep with it, and any count change owes an interleaved
-   pair: the earlier "dense wants 8, hybrid wants 12" rule was correct for the kernels it was measured
-   against and wrong for the ones that shipped. `HEARTH_THREADS` still overrides everything.
+2. **The worker count follows the *path* — and, on the hybrid, the kernel.** As of pt 18: dense =
+   `physical` (8 here) because the dense prefill is batched and unstable above the physical count;
+   hybrid `Q2_0`/`PQ2_0` = `min(logical, physical + physical/4)` (10, measured 8.5 tok/s decode and
+   13346 ms prefill against 7.9 / 13940 at 8); hybrid `PTQ1_0` = ¾-of-logical (12, 6.7 tok/s against
+   5.9 at 8). The first version of the pt-18 change moved the dense count to the quarter as well and
+   cost **2.4x on dense 8B Q2_0 prefill** (10060 → 21856 ms) while it *helped* decode — the sweep that
+   exposed it was prefill, not decode. So: **any kernel change owes a count sweep on *both* passes,
+   and any count change owes an interleaved pair on both passes.** The open question is *why* the
+   batched path destabilises above physical. First hypothesis to test: the pool's spin-then-yield wait
+   (`wait_for_workers` spins `SPIN_BUDGET` then yields, pt 17) steals a core from a worker while a long
+   batched chunk runs — run dense 8B Q2_0's 109-token prefill at 9 workers with the spin budget set to
+   zero and see whether the 2.4x spread collapses. If it does, the fix is a per-dispatch decision
+   (spin for short single-token waits, yield immediately for batched ones) and the dense count can then
+   be re-swept; if it does not, the next suspects are `batched_rows_chunk`'s tile walk
+   (`tile_size = 1048576 / row_bytes`, one L2-sized tile per worker) and `flash_attention_prefill`.
+   `HEARTH_THREADS` still overrides everything.
 3. **The `benchk`-driven per-CPU calibration runner is still the unfinished half of Goal 1, and pt 18
-   says what it has to model.** It is no longer just "pick the winning kernel per dtype": the kernel
-   and the worker count are one decision (item 2), so the record has to be a (kernel, count) pair per
-   dtype per path, and it has to *refuse* to switch on a difference inside the noise band. `benchk`
+   says what it has to model.** It is no longer just "pick the winning kernel per dtype": the worker
+   count is one decision *per path* (item 2), so the record has to be a (kernel, count) pair per dtype
+   per path — and it has to *refuse* to switch on a difference inside the noise band. `benchk`
    already prints every arm's GB/s and the CPUID decode, with a 300 ms warm-up per arm and a minimum of
    two passes; what it does not do is persist a winner, sweep the count, or refuse. The hazard is real
    and was misread once: a v3 run that ranked `avx2_lut` 2.51 ahead of `vnni512x2` 1.70 was dismissed
@@ -77,11 +88,13 @@
    `NAME=TARGET_DIR` pairs, runs `benchk` twice per baseline, and reports *arm drift* and *dispatch
    drift* separately — validated by catching both on the pre-change artifacts in `target/buffy-ab/`.
    What remains is the count axis and persisting a winner.
-4. **Closed in pt 18: the Q2_0 rows were not noise — the dispatch was choosing the slower kernel, and
-   the thread count had been tuned to it.** They are now *above* the 2026-10-15 chart
-   (+44.6/+46.6/+49.1%), so the "~36% under, assume noise" reading is retired. The lesson to keep:
-   three sweeps of the same regression looked like drift because the explanation ("machine state plus
-   the thread count") was plausible, and the measurement that would have falsified it — the kernel arms
+4. **Closed in pt 18: the Q2_0 rows were not noise — the dispatch was choosing the slower kernel.**
+   With the kernel fixed and the count back at physical they read **+31% decode and −4 to −7% prefill**
+   on all three dense Q2_0 models (mirrored, with the Q1_0 rows as an unchanged control). The "count
+   alone bought +45%+" reading was wrong and is retired: that measurement used a short prompt, i.e.
+   decode only, and the same count cost 2.4x on prefill (item 2). The lesson to keep: three sweeps of
+   the same regression looked like drift because the explanation ("machine state plus the thread
+   count") was plausible, and the measurement that would have falsified it — the kernel arms
    themselves, on real weights — was in `benchk` the whole time.
 5. **Goal 2 is essentially closed; one cosmetic item is left.** The downloader is implemented and
    verified live (`GET /api/downloads` returns the catalog with per-model `state`/`downloaded_bytes`
