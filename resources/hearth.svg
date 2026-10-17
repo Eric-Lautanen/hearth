@@ -6,7 +6,12 @@
     </linearGradient>
   </defs>
   <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#g)"/>
-  <g transform="translate(8,6) scale(2)" fill="#fff">
+  <!-- The flame path spans (5.5,2)-(18.5,21.7) in its own units, so its centre is
+       (12,11.85). Scaling by 2 about that centre and translating it to the tile
+       centre (32,32) lands it at x 19-45, y 12.3-51.7: 15 units of padding
+       either side of the 56-unit tile, and 8.3 above and below. A flame is
+       taller than it is wide, so the unequal padding is what centres it. -->
+  <g transform="translate(32,32) scale(2) translate(-12,-11.85)" fill="#fff">
     <path d="M12 2c1 4-2.5 5.5-2.5 9a2.5 2.5 0 0 0 5 .5C15.5 9 14 7.5 14 7.5c2.5 1.5 4.5 4.2 4.5 7.7A6.5 6.5 0 0 1 12 21.7a6.5 6.5 0 0 1-6.5-6.5C5.5 9.5 10 6 12 2Z"/>
   </g>
 </svg>

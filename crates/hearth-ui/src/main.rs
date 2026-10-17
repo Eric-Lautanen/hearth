@@ -1321,6 +1321,11 @@ fn handle_client(ctx: Arc<AppCtx>, stream: TcpStream) {
                     web::INDEX_HTML.as_bytes(),
                 );
             }
+            // The browser tab icon: the same SVG the desktop entry and the
+            // macOS bundle install, served straight from the binary.
+            ("GET", "/favicon.svg") => {
+                http_response(&mut stream, "200 OK", "image/svg+xml", web::FAVICON_SVG);
+            }
             ("GET", "/api/models") => handle_models(&ctx, &mut stream),
             ("GET", "/api/downloads") => handle_downloads(&ctx, &mut stream),
             ("POST", "/api/downloads/start") => handle_dl_start(&ctx, &req, &mut stream),
