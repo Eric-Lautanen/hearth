@@ -3,6 +3,72 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Release machinery, the Windows MSI, and four defects only an install finds (SparkOC, 2026-10-17)
+
+Shipped the release path for v0.2.0: versions bumped 0.1.0 → 0.2.0 across the nine
+crates and `resources/Info.plist`, `CHANGELOG.md` written, and
+`.github/workflows/release.yml` builds on five runners (windows-latest,
+ubuntu-latest, ubuntu-24.04-arm, macos-13, macos-14). Each builds, smoke-tests the
+binary (`/`, `/api/models`, `/api/downloads` over loopback), packages (Windows zip
++ MSI, Linux tarball + `.desktop`, macOS `.app`), signs when the signing secrets
+exist; a tag push publishes with `SHA256SUMS`, and `workflow_dispatch` builds and
+uploads the same artifacts and stops before publishing.
+
+`hearth-ui` is now a GUI-subsystem binary and gives every child it spawns
+(`CREATE_NO_WINDOW`) no console window, so double-clicking shows no console at all
+— verified by `MainWindowHandle` 0 for both `hearth-ui.exe` and
+`hearth-chat-cli.exe` while the server answers, and stderr still reaches a
+redirected or Terminal launch.
+
+The MSI (`packaging/windows/hearth.wxs`, WiX 7) is per-user with a two-page wizard
+(desktop-shortcut and launch-on-finish choices), a Start-menu folder, an ARP row
+with icon and URL, and hand-written inclusive `Upgrade` rows so a reinstall of the
+same version replaces rather than stacks. Four defects, each found by installing
+and each fixed at its cause:
+
+1. **Setup failed with 1603 inside `LaunchConditions`.** The condition was
+   `Installed OR VersionNT >= 1000`, and this machine reports `VersionNT=603` and
+   `WindowsBuild=9600` for every MSI this packaging shape produces — the editor's
+   *shipped, working* installer logs exactly the same, so it is not this package.
+   A condition on an emulated OS property can never be true, so it was removed;
+   the honest floor is Windows Installer 5.0, which `InstallerVersion="500"`
+   declares (verified in the Summary Information: page count pid 14 = 500) and the
+   engine enforces.
+2. **`models/README.txt` installed beside the executables.** A `File` installs into
+   its *component's* directory, and that component was parented to `INSTALLFOLDER`
+   — a real break, since the app walks up from its own exe looking for `models/`.
+   A nested `<Directory Id="ModelsFolder">` fixes it.
+3. **The empty `models/` shell survived uninstall**, which in turn kept
+   `Programs\Hearth` alive. `RemoveFolder` on `ModelsFolder` (empty-only removal)
+   makes both cases right: with a downloaded model the folder *and* the file stay,
+   without one nothing is left.
+4. **The upload glob would have shipped the `.wixpdb`**, the debug database WiX
+   drops beside the MSI. The workflow now lists the three artifact extensions
+   explicitly.
+
+Verification: `scripts/msi-query.ps1` prints the tables and runs 14 checks, now
+with a non-zero exit so it works as a gate. The `RemoveFolder` table cannot be read
+back at all — every query spelling returns `OpenView,Sql`, and `_Tables.Name` comes
+back empty — so the built authoring is checked with `wix msi decompile`, which
+shows all three `On="uninstall"` rows. Installed and uninstalled repeatedly with
+`/qn`: correct tree, two Start-menu entries plus the Desktop shortcut, one ARP row,
+a *second build* of the same version still one ARP row, and no elevation prompt
+either way. One measured oddity, documented rather than "fixed": the ARP row is
+registered under `HKLM` while the payload and shortcuts stay in the profile (a
+property of `ALLUSERS=2`; MSI's own log still classifies the install as per-user).
+
+**Benchmark note — the six-model sweep is noisy on this box right now.** Final
+binary, 50 tokens, temp 0, one model at a time, after warm-up: 1.7B Q1_0 49.26,
+1.7B Q2_0 25.39, 4B Q1_0 22.71, 4B Q2_0 11.41, 8B Q1_0 12.85, 8B Q2_0 6.07
+(baselines 46.7 / 23.6 / 23.6 / 12.2 / 13.0 / 6.2). The 1.7B rows came out *above*
+baseline and two 4B rows below, so the shortfall was re-measured: 4B Q2_0 read
+11.41, 10.22, 10.58 on three runs (±10%) and 4B Q1_0 read 22.71, 18.84, 20.83
+(±20%), while an instrumented run measured the CLI at **666% of one core where 8
+busy workers need ~800%** — the box, not the code. Nothing in the measured path
+changed this session (`hearth-llm`/`hearth-quant` untouched; only `hearth-ui`
+sources and version strings differ from HEAD), so there is no change to revert.
+**Re-baseline the table on a quiet machine before trusting any A/B.**
+
 ### Goal 2 refresh: the icon was 2.3 units high, the UI had no favicon, and the README's table was a kernel behind (SparkOC, 2026-10-17)
 
 Three user-facing gaps closed in one pass, none of them near a hot path.

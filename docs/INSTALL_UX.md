@@ -25,16 +25,26 @@
 All three ship the same two binaries plus an empty `models/` dir (the
 downloader fills it) and the README. No admin rights needed anywhere.
 
-### Windows — zip (v1), installer later
+### Windows — zip **and MSI**, both shipping
 
-- `Hearth-win64.zip`: `hearth-ui.exe`, `hearth-chat-cli.exe`, `models/`,
-  `README.md`. User unzips anywhere and double-clicks `hearth-ui.exe`.
-- Known wart, documented not hidden: double-click shows a console window
-  beside the browser. Options, in order: (a) ship as-is for v1, console
-  shows load errors which users otherwise could never see; (b) later, a
-  `windows_subsystem` GUI build that logs to `%APPDATA%\hearth\hearth-ui.log`
-  instead of stdout. Do (a) first — silent failures are worse than a window.
-- Future: Inno Setup script, per-user install, Start Menu shortcut.
+- `hearth-v0.2.0-windows-x86_64.zip`: `hearth-ui.exe`, `hearth-chat-cli.exe`,
+  `models/README.txt`, `README.md`, both licenses. Unzip anywhere and
+  double-click `hearth-ui.exe`.
+- `hearth-v0.2.0-windows-x86_64.msi` (`packaging/windows/hearth.wxs`): the same
+  payload, per-user (`%LOCALAPPDATA%\Programs\Hearth`) with no UAC prompt, a
+  Start-menu folder, an optional Desktop shortcut, an Add/Remove Programs entry,
+  and a launch-on-finish checkbox. Built and verified end to end on Windows 11 —
+  `packaging/windows/README.md` lists the checks and the measured results.
+- The console window is gone, because option (b) turned out to be cheap.
+  `hearth-ui.exe` is a GUI-subsystem binary and every child it spawns — the
+  engine service, `curl`, the browser opener — is created with
+  `CREATE_NO_WINDOW`. Verified: `MainWindowHandle` is 0 for both
+  `hearth-ui.exe` and `hearth-chat-cli.exe` while the server answers. The reason
+  option (a) came first was the fear of silent failures, and that does not
+  materialise: stderr still reaches a redirected or Terminal launch, and
+  `cargo test -p hearth-ui` is unaffected.
+- Per-user install without elevation is what makes the MSI the same promise as
+  the zip, so the two can be mixed without the user noticing.
 
 ### macOS — `.app` bundle via script
 
@@ -77,13 +87,23 @@ downloader fills it) and the README. No admin rights needed anywhere.
 
 ## Work list (in order)
 
-1. `scripts/package-macos.sh` + `Info.plist` template. ✅ written (`scripts/`,
-   `resources/`), needs a Mac to verify.
-2. `hearth.desktop` + icon SVG + Linux install notes in README. ✅ written,
-   needs a Linux box to verify.
+1. `scripts/package-macos.sh` + `Info.plist` template. ✅ written
+   (`scripts/package-macos.sh`, `resources/Info.plist`, `resources/hearth.icns`);
+   the build is exercised by the release workflow, the launch needs a Mac.
+2. `hearth.desktop` + icon SVG + Linux install notes. ✅ written
+   (`resources/hearth.desktop`, `resources/hearth.svg`, packaged into the Linux
+   tarball by the release workflow), needs a Linux box to verify the launch.
 3. Windows zip layout doc (one paragraph in README) + console-vs-GUI call.
    ✅ **Verified 2026-10-16**: both release exes copied to a foreign dir,
    launched with `HEARTH_MODELS_DIR` set — service spawned, `/api/models`
    listed all 14, clean shutdown, no repo paths involved.
 4. Per-OS verify matrix: launch → tab → close tab → process gone, for each.
-5. Later: Inno Setup, signing/notarization, single-instance lock.
+   ✅ **Windows done 2026-10-17**, for both shapes: MSI install → run from
+   `%LOCALAPPDATA%\Programs\Hearth` → `/`, `/api/models`, `/api/downloads` all
+   200 → no visible window → uninstall leaves nothing (or leaves `models\` when
+   it holds a download). macOS and Linux stay CI-only until a box is available.
+5. Windows MSI (this replaced "future: Inno Setup"). ✅ **Done 2026-10-17**:
+   WiX 7, `packaging/windows/hearth.wxs`. WiX carries the upgrade identity, the
+   ARP row and the per-user story that Inno Setup would have needed hand-rolled.
+6. Later: **signing/notarization** (the workflow already has the hooks; they
+   no-op without secrets), single-instance lock, a Linux `install.sh`.
