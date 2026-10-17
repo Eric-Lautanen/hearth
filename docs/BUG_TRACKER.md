@@ -154,6 +154,84 @@ workspace**, and nothing silenced to get there. Started from the 25 sites the qu
   place (`target/buffy-ab/post-target`, `target/buffy-ab/native-target`, `target/release`); the
   native-vs-baseline decision is theirs to make, and the 6-model mandate should be re-run on an idle
   box once the baseline is settled.
+
+### The `x86-64-v2` baseline cost 3.4× — because the kernels did not declare FMA and F16C (buffy, 2026-10-16)
+
+**A note on how this entry got here.** Its first version called the committed baseline the problem and
+`x86-64-v3` the answer. That was the interim reading, and it was wrong in the way that matters: v3
+"recovered" the speed only because it puts FMA and F16C in the *baseline*, which supplies by accident
+what the kernel attributes should have stated. Raising the flag would have hidden a real defect in
+this crate behind a portability claim nobody could keep. `x86-64-v2` stays.
+
+The symptom, end-to-end, 50 tokens, temp 0, same box, same prompts, the **same generated text** in all
+arms (portable baseline before the fix → after the fix, still `x86-64-v2` → `x86-64-v3` → native):
+
+| Bonsai-1.7B-Q1_0 | v2 before | v2 after | v3 after | native |
+|---|---|---|---|---|
+| tok/s, repeated runs | 13.61 / 13.92 / 13.89 | **43.03 / 43.48** | 45.37 / 44.96 / 40.13 | 50.56 / 51.12 |
+
+The other two models this touches were measured and do **not** resolve on today's box: the same
+binary read 10.67 and 12.70 tok/s on the 4B in consecutive runs (v3: 10.21, 12.52 — overlapping), and
+9.55 against 19.23 on Ternary-1.7B-Q2_0, against a *before* figure that was steady at 15.17 / 15.54.
+Two agents were benchmarking on this machine; only the 1.7B Q1_0 pair is far enough above the noise
+floor (3×) to read. Re-run those two on an idle box before quoting them.
+
+**Correction, because the working tree moved under this measurement.** `.cargo/config.toml` was
+switched to `x86-64-v3` by SparkOC at 19:54, on the strength of this entry's *earlier* reading. Every
+`v2` figure above was therefore re-taken with `RUSTFLAGS="-C target-cpu=x86-64-v2"` overriding that
+file (`target/buffy-ab/v2fix-target`), and the first version of this table called a 50.05/50.86 run
+"v2 after" when it had in fact been built at v3. The kernel-level numbers did not move when re-taken
+(2.75 / 2.80 GB/s at v2, 3.11 at v3), so the mechanism is unchanged — but the conclusion changed
+shape: **the fix removes the 3.4×, not the baseline.**
+
+**The mechanism, from the emitted assembly rather than from theory.** Stage timings first put the loss
+in the five matmul stages (ffn_gate_up 4,852 → 32,266 µs at v2), not in the f32 glue (`qkv_quant`,
+`rms_norm`, `silu_mul` all within 1–2×). The bare kernel agreed — same source, same CPUID decode, same
+reported `avx2` dispatch, **0.52 GB/s against 3.12** — so the selection was right and the code behind
+it compiled worse. `--emit=asm` said why:
+
+| `dot_q1_0g128_q8_0_ptr_avx2` | v2 before | v2, declarations only | v2, + helper | v3 / native |
+|---|---|---|---|---|
+| instructions per row | 511 | 500 | **112** | 100 |
+| out-of-line calls | 15 (`_mm256_fmadd_ps` ×5, `f16_to_f32_x86_f16c` ×5, probe ×5) | probe ×5 | **0** | 0 |
+| `benchk` GB/s (1.7B Q1_0) | 0.52 / 0.52 | 1.76 | **2.75 / 2.80** | 3.11 / 3.12 |
+
+Two separate omissions, both the same class of bug:
+
+1. **`fma` and `f16c` were missing from every kernel that used them.** A body compiled with
+   `#[target_feature(enable = "avx2")]` alone cannot inline `_mm256_fmadd_ps` or `half`'s f16
+   conversion, because those callees need features this function never claimed: each use became a
+   call, 15 of them per row with 16 `vzeroupper`s around them. Declaring them recovered 0.52 → 1.76.
+2. **`half`'s runtime-probed `to_f32` inlined both arms.** With `f16c` now declared, the probe and
+   *its software fallback* inline into the block loop; the register pressure that costs is worth more
+   than the conversion. `crate::f16_bits_to_f32` (one `vcvtph2ps`, F16C declared on the caller) took
+   1.76 → 2.83. Only 35 sites inside declared kernels changed; every other conversion in the crate
+   keeps `half`'s runtime probe, so a CPU without F16C still runs — that is the whole point of the
+   baseline.
+
+Same treatment for Q2_0 (`dot_q2_0_q8_0_lut_avx2` 256 → 167 instructions) and for **PTQ1_0**
+(`dot_ptq1_0_q8_0x2_avx2` 464 → 301, F16C only — it uses no FMA), which covers the Ternary-Bonsai-2
+family. The AVX-512 arms were already fine: LLVM's `avx512f` implies FMA and F16C, which the v2
+assembly confirmed before anything was changed (no out-of-line calls there at all).
+
+**Three things the fix also put straight.** (a) The gates now name all three features, so dispatch and
+`kernel_name()` still read one predicate per file — `avx2_kernel_available()`,
+`avx2_lut_available()`, `ptq1_0::avx2_available()` — and the feature-report test restates the same
+rule. (b) That closes a latent SIGILL: the old `avx2`-only gate let a body execute FMA on a CPU that
+reported AVX2 without FMA (a masked CPUID under a VM is the realistic case). (c) The three unannotated
+256-bit `hsum` helpers were given their own `avx2` attribute — a true statement about their bodies,
+with no measured effect; recorded here so nobody re-derives it as the cause.
+
+**The durable lesson:** the `#[target_feature]` list must name every feature the body executes. A
+tree of AVX2 kernels compiled at a baseline without AVX2-FMA-F16C loses 2–6× *silently* — the startup
+banner keeps reporting `avx2`, because the banner describes the CPU, not the code that was build.
+
+- **Directional only:** small-tensor rows (3.34 MB) vary run to run, and `vnni256` reads slow at every
+  baseline (0.55–0.59) because dispatch does not select it on Zen 4. Not a live path.
+- **Every perf number recorded before today was taken with `target-cpu=native`.** The baseline now
+  costs ~1% rather than 3.4×, so the older tables are comparable again — but the box was busy today,
+  so re-run the 6-model sweep on an idle one before treating any row as a baseline.
+
 - **AGENTS.md now states the rule**, not just the practice: no `#[allow(...)]` anywhere, never a
   "pre-existing" or "OK here" warning, the three-part gate, and a finding that cannot be fixed
   without changing behaviour is a finding to report and measure. Two stale claims in that file were

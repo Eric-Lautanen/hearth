@@ -300,15 +300,43 @@
    *Still open, and now the biggest number in this file:* (b) what the release build promises.
    `.cargo/config.toml` is now **`x86-64-v2`** (SparkOC, 26eab4b) after auditing that every
    AVX2/AVX-512 path sits behind a runtime probe, so only autovectorised code is affected. **Measured
-   the same day: that baseline costs 3.4× on Bonsai-1.7B-Q1_0** (43.4 → 12.8 tok/s mean of three
-   interleaved rounds; the old native binary read 44.9 with byte-identical output — full table in
-   BUG_TRACKER under the allow sweep). The commit claims 1-3%; on the flagship 1.7B pair it is not.
-   **Next session, in this order:** (1) re-run the interleaved A/B per model, including at least one
-   dense Q2_0 and the 27B, using the binaries left in `target/buffy-ab/`; (2) try `x86-64-v3` — the
-   loss is in the autovectorised f32 per-token work, and v3 keeps AVX2; (3) only then decide what
-   v0.x promises, and make the README's SSE4.1-minimum claim match the decision. Do not treat the
-   6-model baseline table as comparable until the flag is settled: every number taken with v2 is on a
-   different machine model than the ones recorded before it.
+   the same day: that baseline cost 3.4× on Bonsai-1.7B-Q1_0** (43.4 → 12.8 tok/s mean of three
+   interleaved rounds; the old native binary read 44.9 with byte-identical output). The commit claims
+   1-3%; on the flagship 1.7B pair it was not — and the audit behind the commit was right about what
+   it checked (the *dispatch* is runtime-probed everywhere) and wrong about what that implies, because
+   a kernel can be reached correctly and still run slowly. That distinction is the whole entry below.
+   **Solved at the cause, and the flag does not need to change — closed 2026-10-16.** The loss was
+   never the baseline: it was kernels that used FMA and F16C without declaring them, so at any
+   baseline lacking those features every `_mm256_fmadd_ps` and every f16 scale conversion became an
+   out-of-line call (511 instructions per row against 100, 16 `vzeroupper`s per row). Declaring
+   `fma`/`f16c` on the kernels and converting f16 scales with a declared-`f16c`
+   `crate::f16_bits_to_f32` (instead of `half`'s runtime-probed `to_f32`, which inlines both of its
+   arms into the block loop) took the *unchanged* `x86-64-v2` baseline from **13.6–13.9 to 43.0–43.5
+   tok/s on Bonsai-1.7B-Q1_0** (v3 at the same source: 45.0–45.4; native: 50.6–51.1), with the same
+   generated text in every arm. Below the kernel level the thing to read is the assembly, not the
+   clock: 511 instructions per row with 15 out-of-line calls became 112 with none. The remaining
+   `v2`-vs-`v3` difference is a preference about minimum CPU (SSE4.2 2011 vs Haswell 2013), not a
+   regression — the 3.4× is gone at either baseline. Full tables and the assembly evidence are in
+   BUG_TRACKER under "the `x86-64-v2` baseline cost 3.4×". **SparkOC moved `.cargo/config.toml` to
+   `x86-64-v3` at 19:54 today on the strength of this entry's earlier reading** — it is their file and
+   either baseline is now defensible, but read that entry before treating v3 as *required*: it would
+   have hidden this defect rather than fixed it, and the 4B/Q2_0 pairs could not be separated from
+   box noise today (the same binary read 10.67 and 12.70 tok/s back to back).
+   **Next session, in this order:** (1) re-run the 6-model sweep on a *quiet* box and put the numbers
+   back in the tables — today's box was busy (two agents benchmarking; one binary spanned 2× across
+   consecutive runs), so the 4B and Q2_0 pairs are still unmeasured, and the rows recorded before
+   today are native while the committed baseline is now v3; (2) hold the rule that
+   made this findable: **a kernel's `#[target_feature]` list must name every feature its body
+   executes, and the dispatch gate must name the same set** — the three per-file predicates
+   (`q1_0g128::avx2_kernel_available`, `q2_0::avx2_lut_available`, `ptq1_0::avx2_available`) and the
+   feature-report test are where that rule now lives, and any new format or kernel arm has to join
+   them; (3) audit what *else* in the workspace trusts the build's baseline for more than SSE4.2
+   (hearth-llm's `wide`-based ops are the obvious place to look) — the stage timings say the f32 glue
+   is fine at v2 today, but that is the same reasoning that missed this bug, so check the emitted
+   assembly rather than the timing when in doubt. `cargo rustc -p hearth-quant --release --
+   --emit=asm` plus a scan for `callq` to `*fmadd*`/`*f16_to_f32*`/`*dpbusd*` inside an annotated
+   kernel is the whole method: three scripts' worth of it is in `target/buffy-ab/`
+   (`cmp_asm.py`, `scan2.py`, `rewrite_f16.py`).
    *Harness notes:* `cargo run --release -p hearth-llm --example benchk -- <model.gguf> <dtype>`
    prints the CPUID decode and every variant's GB/s; **`benchk … | head` exits 101** (SIGPIPE) so
    redirect to a file or use `tail` when the exit status is the verdict; and **cold runs are ~2×

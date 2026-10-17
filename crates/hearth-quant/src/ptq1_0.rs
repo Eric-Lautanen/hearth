@@ -206,6 +206,13 @@ pub fn kernel_name() -> &'static str {
 static AVX2_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
 
 /// Cached AVX2 capability probe (2 = unknown, 1 = yes, 0 = no).
+///
+/// F16C is part of the question because the AVX2 kernels convert an f16 scale per block: with
+/// `f16c` undeclared the conversion cannot be inlined and the same source called out to
+/// `f16_to_f32_x86_f16c` twice per row at `x86-64-v2` (353 instructions against 301 for
+/// `dot_ptq1_0_q8_0_avx2`, 464 against 301 for the paired-token kernel). Probing it here
+/// keeps the kernel's declaration and the gate the same statement — `half` used to probe it
+/// per conversion, and a kernel that declares `f16c` no longer goes through that probe.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn avx2_available() -> bool {
@@ -214,7 +221,8 @@ fn avx2_available() -> bool {
     if v < 2 {
         return v == 1;
     }
-    let ok = std::arch::is_x86_feature_detected!("avx2");
+    let ok =
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("f16c");
     AVX2_STATE.store(if ok { 1 } else { 0 }, Ordering::Relaxed);
     ok
 }
@@ -245,7 +253,10 @@ pub unsafe fn dot_ptq1_0_q8_0_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usiz
 
     for b in 0..blocks {
         let bo = b * BLOCK_BYTES;
-        let scale = f16::from_le_bytes([*w_ptr.add(bo + 26), *w_ptr.add(bo + 27)]).to_f32();
+        let scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(bo + 26),
+            *w_ptr.add(bo + 27),
+        ]));
 
         // 24 qs bytes, zero-extended into 32 u16 lanes.
         let raw = _mm256_maskz_loadu_epi8(0x00FF_FFFFu32 as __mmask32, w_ptr.add(bo) as *const i8);
@@ -276,7 +287,10 @@ pub unsafe fn dot_ptq1_0_q8_0_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usiz
         let mut acc = _mm512_setzero_ps();
         for s in 0..4 {
             let a_off = (b * 4 + s) * 34;
-            let a_scale = f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+            let a_scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off),
+                *a_ptr.add(a_off + 1),
+            ]));
             let w16 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(wp.add(s * 32) as *const __m256i));
             let a16 =
                 _mm512_cvtepi8_epi16(_mm256_loadu_si256(a_ptr.add(a_off + 2) as *const __m256i));
@@ -305,6 +319,7 @@ pub unsafe fn dot_ptq1_0_q8_0_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usiz
 /// Same contract as the scalar version.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "f16c")]
 pub unsafe fn dot_ptq1_0_q8_0_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     use std::arch::x86_64::*;
     let blocks = n / BLOCK_SIZE;
@@ -320,7 +335,10 @@ pub unsafe fn dot_ptq1_0_q8_0_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize)
 
     for b in 0..blocks {
         let bo = b * BLOCK_BYTES;
-        let scale = f16::from_le_bytes([*w_ptr.add(bo + 26), *w_ptr.add(bo + 27)]).to_f32();
+        let scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(bo + 26),
+            *w_ptr.add(bo + 27),
+        ]));
 
         // Decode the 24 qs bytes: 16-byte stage (elements 0..80, stride 16 per
         // trit slot) and 8-byte stage (elements 80..120, stride 8).
@@ -361,7 +379,10 @@ pub unsafe fn dot_ptq1_0_q8_0_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize)
         let mut acc = _mm256_setzero_ps();
         for s in 0..4 {
             let a_off = (b * 4 + s) * 34;
-            let a_scale = f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+            let a_scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off),
+                *a_ptr.add(a_off + 1),
+            ]));
             let w32 = _mm256_loadu_si256(wp.add(s * 32) as *const __m256i);
             let a32 = _mm256_loadu_si256(a_ptr.add(a_off + 2) as *const __m256i);
             let wl = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w32));
@@ -401,6 +422,7 @@ pub unsafe fn dot_ptq1_0_q8_0_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize)
 /// n/32*34 bytes; the caller must confirm AVX2 is present.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "f16c")]
 pub unsafe fn dot_ptq1_0_q8_0x2_avx2(
     w_ptr: *const u8,
     a0_ptr: *const u8,
@@ -421,7 +443,10 @@ pub unsafe fn dot_ptq1_0_q8_0x2_avx2(
 
     for b in 0..blocks {
         let bo = b * BLOCK_BYTES;
-        let scale = f16::from_le_bytes([*w_ptr.add(bo + 26), *w_ptr.add(bo + 27)]).to_f32();
+        let scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(bo + 26),
+            *w_ptr.add(bo + 27),
+        ]));
 
         // ---- decode the block once (verbatim from the single-token kernel) ----
         // 16-byte stage (elements 0..80, stride 16 per trit slot) and 8-byte
@@ -463,8 +488,10 @@ pub unsafe fn dot_ptq1_0_q8_0x2_avx2(
         for (t, a_ptr) in [a0_ptr, a1_ptr].into_iter().enumerate() {
             for s in 0..4 {
                 let a_off = (b * 4 + s) * 34;
-                let a_scale =
-                    f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+                let a_scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+                    *a_ptr.add(a_off),
+                    *a_ptr.add(a_off + 1),
+                ]));
                 let w32 = _mm256_loadu_si256(wp.add(s * 32) as *const __m256i);
                 let a32 = _mm256_loadu_si256(a_ptr.add(a_off + 2) as *const __m256i);
                 let wl = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w32));

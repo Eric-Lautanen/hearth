@@ -125,15 +125,20 @@ pub fn dot_q1_0(weight_row: &[u8], vec: &[f32], n: usize) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "f16c")]
 unsafe fn dot_q1_0_q8_0_avx2(weight_row: &[u8], act_data: &[u8], n: usize) -> f32 {
     let q1_blocks = n / 32;
     let mut sum = 0.0f32;
     for b in 0..q1_blocks {
         let bo = b * 6;
-        let w_scale: f32 = f16::from_le_bytes([weight_row[bo], weight_row[bo + 1]]).to_f32();
+        let w_scale: f32 =
+            crate::f16_bits_to_f32(u16::from_le_bytes([weight_row[bo], weight_row[bo + 1]]));
         let codes = &weight_row[bo + 2..bo + 6];
         let a_start = b * 34;
-        let a_scale: f32 = f16::from_le_bytes([act_data[a_start], act_data[a_start + 1]]).to_f32();
+        let a_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+            act_data[a_start],
+            act_data[a_start + 1],
+        ]));
         let a_vals = &act_data[a_start + 2..a_start + 34];
 
         let mut acc = _mm256_setzero_si256();
@@ -169,7 +174,7 @@ unsafe fn dot_q1_0_q8_0_avx2(weight_row: &[u8], act_data: &[u8], n: usize) -> f3
 pub fn dot_q1_0_q8_0(weight_row: &[u8], act_data: &[u8], n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if avx2_kernel_available() {
             return unsafe { dot_q1_0_q8_0_avx2(weight_row, act_data, n) };
         }
     }
@@ -237,8 +242,14 @@ pub fn dot_q1_0g128_f32(weight_row: &[u8], vec: &[f32], n: usize) -> f32 {
 /// Uses _mm256_shuffle_epi8 + bit masks for sign expansion (no LUT),
 /// _mm256_maddubs_epi16 for 32-element dot product, and FMA accumulation.
 /// Mirrors ggml_vec_dot_q1_0_q8_0 AVX2 path from llama.cpp.
+///
+/// `fma` and `f16c` are declared because the body executes both, and the declaration is what
+/// lets the compiler inline them instead of calling out once per use. See
+/// [`avx2_kernel_available`] for the measurement and the matching predicate.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "fma")]
+#[target_feature(enable = "f16c")]
 unsafe fn dot_q1_0g128_q8_0_ptr_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     use core::ptr::read_unaligned;
     let q1_blocks = n / 128;
@@ -259,7 +270,10 @@ unsafe fn dot_q1_0g128_q8_0_ptr_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usiz
 
     for b in 0..q1_blocks {
         let w_off = b * 18;
-        let w_scale: f32 = f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32();
+        let w_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(w_off),
+            *w_ptr.add(w_off + 1),
+        ]));
         let w_bits = w_ptr.add(w_off + 2);
 
         let qs0 = read_unaligned(w_bits as *const u32);
@@ -272,8 +286,10 @@ unsafe fn dot_q1_0g128_q8_0_ptr_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usiz
         // K=0
         {
             let a_off = (b * 4) * 34;
-            let a_scale: f32 =
-                f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+            let a_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off),
+                *a_ptr.add(a_off + 1),
+            ]));
             let a_vals = a_ptr.add(a_off + 2);
             let qy = _mm256_loadu_si256(a_vals as *const __m256i);
             let sm = _mm256_cmpeq_epi8(
@@ -291,8 +307,10 @@ unsafe fn dot_q1_0g128_q8_0_ptr_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usiz
         // K=1
         {
             let a_off = (b * 4 + 1) * 34;
-            let a_scale: f32 =
-                f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+            let a_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off),
+                *a_ptr.add(a_off + 1),
+            ]));
             let a_vals = a_ptr.add(a_off + 2);
             let qy = _mm256_loadu_si256(a_vals as *const __m256i);
             let sm = _mm256_cmpeq_epi8(
@@ -310,8 +328,10 @@ unsafe fn dot_q1_0g128_q8_0_ptr_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usiz
         // K=2
         {
             let a_off = (b * 4 + 2) * 34;
-            let a_scale: f32 =
-                f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+            let a_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off),
+                *a_ptr.add(a_off + 1),
+            ]));
             let a_vals = a_ptr.add(a_off + 2);
             let qy = _mm256_loadu_si256(a_vals as *const __m256i);
             let sm = _mm256_cmpeq_epi8(
@@ -329,8 +349,10 @@ unsafe fn dot_q1_0g128_q8_0_ptr_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usiz
         // K=3
         {
             let a_off = (b * 4 + 3) * 34;
-            let a_scale: f32 =
-                f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+            let a_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off),
+                *a_ptr.add(a_off + 1),
+            ]));
             let a_vals = a_ptr.add(a_off + 2);
             let qy = _mm256_loadu_si256(a_vals as *const __m256i);
             let sm = _mm256_cmpeq_epi8(
@@ -367,6 +389,8 @@ unsafe fn dot_q1_0g128_q8_0_ptr_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usiz
 /// w_ptr valid for n/128*18 bytes; a0_ptr and a1_ptr each valid for n/32*34 bytes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "fma")]
+#[target_feature(enable = "f16c")]
 unsafe fn dot_q1_0g128_q8_0x2_ptr_avx2(
     w_ptr: *const u8,
     a0_ptr: *const u8,
@@ -393,7 +417,10 @@ unsafe fn dot_q1_0g128_q8_0x2_ptr_avx2(
 
     for b in 0..q1_blocks {
         let w_off = b * 18;
-        let w_scale: f32 = f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32();
+        let w_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(w_off),
+            *w_ptr.add(w_off + 1),
+        ]));
         let w_bits = w_ptr.add(w_off + 2);
 
         let qs0 = read_unaligned(w_bits as *const u32);
@@ -427,10 +454,14 @@ unsafe fn dot_q1_0g128_q8_0x2_ptr_avx2(
             let sy1 = _mm256_sub_epi8(_mm256_xor_si256(qy1, sm), sm);
             let s1 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy1), ones_16);
 
-            let a0_scale: f32 =
-                f16::from_le_bytes([*a0_ptr.add(a_off), *a0_ptr.add(a_off + 1)]).to_f32();
-            let a1_scale: f32 =
-                f16::from_le_bytes([*a1_ptr.add(a_off), *a1_ptr.add(a_off + 1)]).to_f32();
+            let a0_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a0_ptr.add(a_off),
+                *a0_ptr.add(a_off + 1),
+            ]));
+            let a1_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a1_ptr.add(a_off),
+                *a1_ptr.add(a_off + 1),
+            ]));
             acc_block0 =
                 _mm256_fmadd_ps(_mm256_set1_ps(a0_scale), _mm256_cvtepi32_ps(s0), acc_block0);
             acc_block1 =
@@ -458,7 +489,7 @@ pub unsafe fn dot_q1_0g128_q8_0x2_ptr(
 ) -> (f32, f32) {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if avx2_kernel_available() {
             return dot_q1_0g128_q8_0x2_ptr_avx2(w_ptr, a0_ptr, a1_ptr, n);
         }
     }
@@ -503,7 +534,10 @@ unsafe fn dot_q1_0g128_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: u
 
     for b in 0..q1_blocks {
         let w_off = b * 18;
-        let w_scale: f32 = f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32();
+        let w_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(w_off),
+            *w_ptr.add(w_off + 1),
+        ]));
         let w_bits = w_ptr.add(w_off + 2);
 
         let qs0 = core::ptr::read_unaligned(w_bits as *const u32);
@@ -516,8 +550,10 @@ unsafe fn dot_q1_0g128_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: u
         let qs_arr = [qs0, qs1, qs2, qs3];
         for (sub, &qs) in qs_arr.iter().enumerate() {
             let a_off = (b * 4 + sub) * 34;
-            let a_scale: f32 =
-                f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+            let a_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off),
+                *a_ptr.add(a_off + 1),
+            ]));
             let a_vals = a_ptr.add(a_off + 2);
 
             // SIMD bit expansion (same as shuffle kernel)
@@ -567,7 +603,10 @@ unsafe fn dot_q1_0g128_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8,
 
     for b in 0..q1_blocks {
         let w_off = b * 18;
-        let w_scale = f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32();
+        let w_scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(w_off),
+            *w_ptr.add(w_off + 1),
+        ]));
         let w_bits = w_ptr.add(w_off + 2);
 
         let mut acc_block_lo = _mm256_setzero_ps();
@@ -579,10 +618,14 @@ unsafe fn dot_q1_0g128_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8,
 
             let a_off_0 = (b * 4 + sub0) * 34;
             let a_off_1 = (b * 4 + sub1) * 34;
-            let a_scale_0 =
-                f16::from_le_bytes([*a_ptr.add(a_off_0), *a_ptr.add(a_off_0 + 1)]).to_f32();
-            let a_scale_1 =
-                f16::from_le_bytes([*a_ptr.add(a_off_1), *a_ptr.add(a_off_1 + 1)]).to_f32();
+            let a_scale_0 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off_0),
+                *a_ptr.add(a_off_0 + 1),
+            ]));
+            let a_scale_1 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off_1),
+                *a_ptr.add(a_off_1 + 1),
+            ]));
             let a_vals_0 = a_ptr.add(a_off_0 + 2);
             let a_vals_1 = a_ptr.add(a_off_1 + 2);
 
@@ -640,7 +683,14 @@ unsafe fn hsum_128i(v: __m128i) -> i32 {
 }
 
 /// AVX2 horizontal sum of 8 × i32 in __m256i
+///
+/// Carries its own `target_feature(enable = "avx2")` rather than relying on the caller's or on the
+/// build's baseline to enable it: the body is 256-bit code, and saying so is what makes it the same
+/// code in every build configuration. Every caller already enables `avx2` or `avx512f`. Measured
+/// effect on the `x86-64-v2` baseline: none (0.52 GB/s before and after, `benchk … q1_0`) — the
+/// baseline's cost came from the *undeclared FMA and F16C*, see [`avx2_kernel_available`].
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn hsum_256i_avx2(v: __m256i) -> i32 {
     let lo = _mm256_castsi256_si128(v);
@@ -649,7 +699,11 @@ unsafe fn hsum_256i_avx2(v: __m256i) -> i32 {
 }
 
 /// Horizontal sum of 8 × f32 in __m256
+///
+/// Same source-truth reason as [`hsum_256i_avx2`]: the body is 256-bit, so it says so. See that
+/// function's note for what the `x86-64-v2` baseline's cost actually was.
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn hsum_float_8(v: __m256) -> f32 {
     let hi = _mm256_extractf128_ps(v, 1);
@@ -663,20 +717,25 @@ unsafe fn hsum_float_8(v: __m256) -> f32 {
 /// AVX2-optimized dot product: Q1_0_G128 weight × Q8_0 activation.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "f16c")]
 unsafe fn dot_q1_0g128_q8_0_avx2(weight_row: &[u8], act_data: &[u8], n: usize) -> f32 {
     let q1_blocks = n / 128;
     let mut sum = 0.0f32;
     for b in 0..q1_blocks {
         let w_start = b * 18;
-        let w_scale: f32 =
-            f16::from_le_bytes([weight_row[w_start], weight_row[w_start + 1]]).to_f32();
+        let w_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+            weight_row[w_start],
+            weight_row[w_start + 1],
+        ]));
         let w_bits = &weight_row[w_start + 2..w_start + 18];
 
         let mut block_acc = 0.0f32;
         for q8_sub in 0..4 {
             let a_start = (b * 4 + q8_sub) * 34;
-            let a_scale: f32 =
-                f16::from_le_bytes([act_data[a_start], act_data[a_start + 1]]).to_f32();
+            let a_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                act_data[a_start],
+                act_data[a_start + 1],
+            ]));
             let a_vals = &act_data[a_start + 2..a_start + 34];
             let bits_sub = &w_bits[q8_sub * 4..q8_sub * 4 + 4];
 
@@ -754,16 +813,20 @@ unsafe fn dot_q1_0g128_q8_0_ptr_sse41(w_ptr: *const u8, a_ptr: *const u8, n: usi
 /// Raw-pointer AVX2 for Q1_0 (32-element blocks, 6 bytes/block)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "f16c")]
 unsafe fn dot_q1_0_q8_0_ptr_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     let q1_blocks = n / 32;
     let mut sum = 0.0f32;
     for b in 0..q1_blocks {
         let bo = b * 6;
-        let w_scale: f32 = f16::from_le_bytes([*w_ptr.add(bo), *w_ptr.add(bo + 1)]).to_f32();
+        let w_scale: f32 =
+            crate::f16_bits_to_f32(u16::from_le_bytes([*w_ptr.add(bo), *w_ptr.add(bo + 1)]));
         let codes = w_ptr.add(bo + 2);
         let a_start = b * 34;
-        let a_scale: f32 =
-            f16::from_le_bytes([*a_ptr.add(a_start), *a_ptr.add(a_start + 1)]).to_f32();
+        let a_scale: f32 = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *a_ptr.add(a_start),
+            *a_ptr.add(a_start + 1),
+        ]));
         let a_vals = a_ptr.add(a_start + 2);
 
         let mut acc = _mm256_setzero_si256();
@@ -832,7 +895,7 @@ unsafe fn dot_q1_0_q8_0_ptr_sse41(w_ptr: *const u8, a_ptr: *const u8, n: usize) 
 pub unsafe fn dot_q1_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if avx2_kernel_available() {
             dot_q1_0_q8_0_ptr_avx2(w_ptr, a_ptr, n)
         } else {
             dot_q1_0_q8_0_ptr_sse41(w_ptr, a_ptr, n)
@@ -870,6 +933,27 @@ pub unsafe fn dot_q1_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
     }
 }
 
+/// Whether the AVX2 kernels in this file may be entered on this machine.
+///
+/// `avx2` alone is not the question their bodies ask. Three of them execute FMA
+/// instructions and all of them convert f16 scales, and a `#[target_feature]` declaration is
+/// what decides whether those intrinsics can be inlined: without `fma`/`f16c` named, each
+/// one becomes an out-of-line call under a baseline that lacks the feature. Measured on
+/// Bonsai-1.7B-Q1_0 with `benchk`, the same source at `x86-64-v2` against `x86-64-v3`:
+/// `dot_q1_0g128_q8_0_ptr_avx2` was 511 instructions per row against 100, calling
+/// `_mm256_fmadd_ps` five times and `f16_to_f32_x86_f16c` five times per row, and read
+/// **0.52 GB/s against 3.11**. The strictest kernel in the file sets the bar for all of
+/// them: every CPU that has AVX2 has FMA3 and F16C, so one predicate is one rule.
+///
+/// See `docs/BUG_TRACKER.md`, "the `x86-64-v2` baseline is not free".
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn avx2_kernel_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c")
+}
+
 /// Name of the kernel [`dot_q1_0g128_q8_0_ptr`] selects on this machine.
 ///
 /// Reports the choice without duplicating the predicates, so a benchmark or a
@@ -878,7 +962,7 @@ pub unsafe fn dot_q1_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
 pub fn kernel_name() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if avx2_kernel_available() {
             "avx2"
         } else {
             "sse41"
@@ -899,7 +983,7 @@ pub fn kernel_name() -> &'static str {
 pub unsafe fn dot_q1_0g128_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if avx2_kernel_available() {
             dot_q1_0g128_q8_0_ptr_avx2(w_ptr, a_ptr, n)
         } else {
             dot_q1_0g128_q8_0_ptr_sse41(w_ptr, a_ptr, n)
@@ -986,7 +1070,7 @@ fn dot_q1_0g128_q8_0_sse41(weight_row: &[u8], act_data: &[u8], n: usize) -> f32 
 pub fn dot_q1_0g128_q8_0(weight_row: &[u8], act_data: &[u8], n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if avx2_kernel_available() {
             return unsafe { dot_q1_0g128_q8_0_avx2(weight_row, act_data, n) };
         }
     }
@@ -1048,7 +1132,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn bench_shuffle_kernel() {
-        if !std::arch::is_x86_feature_detected!("avx2") {
+        if !avx2_kernel_available() {
             eprintln!("Skipping AVX2 benchmark (no AVX2)");
             return;
         }

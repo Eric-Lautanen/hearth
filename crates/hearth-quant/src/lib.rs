@@ -42,6 +42,27 @@ pub(crate) fn avx512_full_width() -> bool {
     ok
 }
 
+/// One f16 scale → f32, for kernels that declare `f16c` themselves.
+///
+/// `half`'s `to_f32` is feature-detected at runtime, which is the right thing for code that
+/// has to run anywhere. Inside a kernel that already declares `f16c` it is the wrong thing:
+/// the runtime probe and *both* of its arms inline into the block loop, and the register
+/// pressure that costs is larger than the conversion itself. Measured on Bonsai-1.7B-Q1_0 at
+/// `x86-64-v2` (`benchk`): 0.52 GB/s with `half` and no declaration, 1.76 with the
+/// declaration alone, 3.06 with this — against 3.11 at `x86-64-v3`, where `half` lowers to
+/// the same single instruction anyway. See `docs/BUG_TRACKER.md`.
+///
+/// # Safety
+/// The calling function must declare `#[target_feature(enable = "f16c")]`; this executes
+/// `vcvtph2ps`, which is a hard requirement wherever it is reached.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "f16c")]
+pub(crate) unsafe fn f16_bits_to_f32(bits: u16) -> f32 {
+    use core::arch::x86_64::{_mm_cvtph_ps, _mm_cvtsi32_si128, _mm_cvtss_f32};
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(i32::from(bits))))
+}
+
 /// AMD family 19h (Zen 3 / Zen 4). The only AVX-512 part in it is Zen 4, whose
 /// 512-bit datapath is two 256-bit halves.
 pub(crate) const AMD_FAMILY_SPLIT_AVX512: u8 = 0x19;

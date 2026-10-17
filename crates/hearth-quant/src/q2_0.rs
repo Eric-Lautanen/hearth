@@ -114,7 +114,12 @@ unsafe fn hsum_128i(v: __m128i) -> i32 {
 }
 
 /// Horizontal sum of 8 × f32 in __m256 → f32
+///
+/// The attribute states what the body already needs — 256-bit code — instead of inheriting it from
+/// the build's baseline. Every caller enables `avx2` or `avx512f`. It did not change the measured
+/// `x86-64-v2` numbers; the baseline's real cost is measured in `docs/BUG_TRACKER.md`.
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn hsum_float_8(v: __m256) -> f32 {
     let hi = _mm256_extractf128_ps(v, 1);
@@ -150,14 +155,20 @@ pub unsafe fn dot_q2_0_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: u
 
     for b in 0..blocks {
         let w_off = b * BLOCK_BYTES;
-        let w_scale = f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32();
+        let w_scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(w_off),
+            *w_ptr.add(w_off + 1),
+        ]));
         let qs = w_ptr.add(w_off + 2);
 
         let mut acc_block = _mm256_setzero_ps();
 
         for sub in 0..4 {
             let a_off = (b * 4 + sub) * 34;
-            let a_scale = f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32();
+            let a_scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off),
+                *a_ptr.add(a_off + 1),
+            ]));
             let a_vals = a_ptr.add(a_off + 2);
             let qs_sub = qs.add(sub * 8);
 
@@ -208,7 +219,10 @@ pub unsafe fn dot_q2_0_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8,
 
     for b in 0..blocks {
         let w_off = b * BLOCK_BYTES;
-        let w_scale = f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32();
+        let w_scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(w_off),
+            *w_ptr.add(w_off + 1),
+        ]));
         let qs = w_ptr.add(w_off + 2);
 
         let mut acc_block_lo = _mm256_setzero_ps();
@@ -220,10 +234,14 @@ pub unsafe fn dot_q2_0_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8,
 
             let a_off_0 = (b * 4 + sub0) * 34;
             let a_off_1 = (b * 4 + sub1) * 34;
-            let a_scale_0 =
-                f16::from_le_bytes([*a_ptr.add(a_off_0), *a_ptr.add(a_off_0 + 1)]).to_f32();
-            let a_scale_1 =
-                f16::from_le_bytes([*a_ptr.add(a_off_1), *a_ptr.add(a_off_1 + 1)]).to_f32();
+            let a_scale_0 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off_0),
+                *a_ptr.add(a_off_0 + 1),
+            ]));
+            let a_scale_1 = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off_1),
+                *a_ptr.add(a_off_1 + 1),
+            ]));
             let a_vals_0 = a_ptr.add(a_off_0 + 2);
             let a_vals_1 = a_ptr.add(a_off_1 + 2);
 
@@ -277,24 +295,29 @@ pub unsafe fn dot_q2_0_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8,
 ///
 /// # Safety
 /// `w_ptr` must be valid for `n/128*34` bytes and `a_ptr` for `n/32*34` bytes;
-/// the caller must confirm AVX2 is present.
+/// the caller must confirm AVX2, FMA and F16C are present — see [`avx2_lut_available`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "fma")]
+#[target_feature(enable = "f16c")]
 pub unsafe fn dot_q2_0_q8_0_lut_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     let blocks = n / BLOCK_SIZE;
     let mut acc_global = _mm256_setzero_ps();
     for b in 0..blocks {
         let w_off = b * BLOCK_BYTES;
-        let w_scale =
-            _mm256_set1_ps(f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32());
+        let w_scale = _mm256_set1_ps(crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(w_off),
+            *w_ptr.add(w_off + 1),
+        ])));
         let qs = w_ptr.add(w_off + 2);
 
         let mut acc_block = _mm256_setzero_ps();
         for sub in 0..4 {
             let a_off = (b * 4 + sub) * 34;
-            let a_scale = _mm256_set1_ps(
-                f16::from_le_bytes([*a_ptr.add(a_off), *a_ptr.add(a_off + 1)]).to_f32(),
-            );
+            let a_scale = _mm256_set1_ps(crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off),
+                *a_ptr.add(a_off + 1),
+            ])));
             let a_vals = a_ptr.add(a_off + 2);
             let qs_sub = qs.add(sub * 8);
 
@@ -375,6 +398,8 @@ pub unsafe fn dot_q2_0_q8_0_lut_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usiz
 /// identical to the single-token kernel.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "fma")]
+#[target_feature(enable = "f16c")]
 unsafe fn dot_q2_0_q8_0x2_lut_avx2(
     w_ptr: *const u8,
     a0_ptr: *const u8,
@@ -386,20 +411,24 @@ unsafe fn dot_q2_0_q8_0x2_lut_avx2(
     let mut acc1 = _mm256_setzero_ps();
     for b in 0..blocks {
         let w_off = b * BLOCK_BYTES;
-        let w_scale =
-            _mm256_set1_ps(f16::from_le_bytes([*w_ptr.add(w_off), *w_ptr.add(w_off + 1)]).to_f32());
+        let w_scale = _mm256_set1_ps(crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(w_off),
+            *w_ptr.add(w_off + 1),
+        ])));
         let qs = w_ptr.add(w_off + 2);
 
         let mut acc_block0 = _mm256_setzero_ps();
         let mut acc_block1 = _mm256_setzero_ps();
         for sub in 0..4 {
             let a_off = (b * 4 + sub) * 34;
-            let a0_scale = _mm256_set1_ps(
-                f16::from_le_bytes([*a0_ptr.add(a_off), *a0_ptr.add(a_off + 1)]).to_f32(),
-            );
-            let a1_scale = _mm256_set1_ps(
-                f16::from_le_bytes([*a1_ptr.add(a_off), *a1_ptr.add(a_off + 1)]).to_f32(),
-            );
+            let a0_scale = _mm256_set1_ps(crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a0_ptr.add(a_off),
+                *a0_ptr.add(a_off + 1),
+            ])));
+            let a1_scale = _mm256_set1_ps(crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a1_ptr.add(a_off),
+                *a1_ptr.add(a_off + 1),
+            ])));
             let a0_vals = a0_ptr.add(a_off + 2);
             let a1_vals = a1_ptr.add(a_off + 2);
             let qs_sub = qs.add(sub * 8);
@@ -447,7 +476,7 @@ pub unsafe fn dot_q2_0_q8_0x2_ptr(
 ) -> (f32, f32) {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if avx2_lut_available() {
             return dot_q2_0_q8_0x2_lut_avx2(w_ptr, a0_ptr, a1_ptr, n);
         }
     }
@@ -539,6 +568,29 @@ unsafe fn dot_q2_0_q8_0_ptr_scalar(w_ptr: *const u8, a_ptr: *const u8, n: usize)
     sum
 }
 
+/// Cached probe for the two AVX2 LUT kernels, whose bodies use FMA and F16C intrinsics.
+///
+/// All three features are named because all three are executed by the bodies, and a
+/// `#[target_feature]` declaration is what decides whether an intrinsic can be inlined. At
+/// `x86-64-v2` the same source called `_mm256_fmadd_ps` and `f16_to_f32_x86_f16c` out of line
+/// (`dot_q2_0_q8_0_lut_avx2`: 256 instructions against 167) and read 0.87 GB/s against 2.64
+/// at `x86-64-v3`. Dispatch *and* [`kernel_name`] read this one function so the two cannot
+/// drift. See `docs/BUG_TRACKER.md`.
+#[cfg(target_arch = "x86_64")]
+fn avx2_lut_available() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(2); // 2 = unknown
+    let v = STATE.load(Ordering::Relaxed);
+    if v < 2 {
+        return v == 1;
+    }
+    let ok = std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c");
+    STATE.store(if ok { 1 } else { 0 }, Ordering::Relaxed);
+    ok
+}
+
 /// Cached AVX-512 F + VNNI probe, the pair `vpdpbusd` needs.
 ///
 /// The probe is a function rather than an inline condition precisely so that the dispatch
@@ -607,7 +659,7 @@ pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
         if avx512_vnni_available() {
             return dot_q2_0_q8_0_vnni_avx512(w_ptr, a_ptr, n);
         }
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if avx2_lut_available() {
             dot_q2_0_q8_0_lut_avx2(w_ptr, a_ptr, n)
         } else if std::arch::is_x86_feature_detected!("sse4.1") {
             dot_q2_0_q8_0_ptr_sse41(w_ptr, a_ptr, n)
@@ -639,7 +691,7 @@ pub fn kernel_name() -> &'static str {
         if avx512_vnni_available() {
             return "vnni256";
         }
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if avx2_lut_available() {
             return "avx2_lut";
         }
         if std::arch::is_x86_feature_detected!("sse4.1") {
@@ -671,7 +723,7 @@ mod tests {
                 "vnni512x2"
             } else if f && vnni {
                 "vnni256"
-            } else if std::arch::is_x86_feature_detected!("avx2") {
+            } else if avx2_lut_available() {
                 "avx2_lut"
             } else if std::arch::is_x86_feature_detected!("sse4.1") {
                 "sse41_lut"
