@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Windows installer for Hearth, built by `.github/workflows/release.yml` and by
+  hand with the command in `packaging/windows/README.md`:
+
+      wix build -arch x64 -d Version=0.2.0 -d PayloadDir=target/payload \
+        -d Icon=resources/hearth.ico -d DialogIcon=resources/hearth-setup.ico \
+        -o Hearth.msi packaging/windows/hearth.wxs
+
+  Design points, each of which was a decision rather than a default:
+
+  * `Scope="perUser"` with `ALLUSERS=2` and `MSIINSTALLPERUSER=1`: a standard
+    user installs the whole product under their own profile (files, Start-menu
+    entry, optional Desktop shortcut) with no UAC prompt, and removes it again
+    with no prompt. This is the same promise the zip has, which is why the two
+    can be mixed without the user noticing a difference.
+    Measured on Windows 11 here, with UAC at its default level: the Add/Remove
+    Programs row lands under HKLM while the payload, Start-menu entry and Desktop
+    shortcut stay in the installing account's profile, and Windows Installer's
+    own log still classifies the install as per-user. That mixture is a property
+    of ALLUSERS=2 rather than of this file, so it is recorded rather than
+    "fixed", and the uninstall is what the user actually experiences: no
+    elevation prompt, nothing left behind.
+  * `PerUserProgramFilesFolder` (WiX 6+) resolves to
+    %LOCALAPPDATA%\Programs in per-user scope. Plain `ProgramFiles64Folder`
+    does not redirect and fails with error 1303 against the real Program Files.
+  * `InstallerVersion="500"` is not decoration. Per-user scope is itself a
+    Windows Installer 5.0 feature, and this attribute is what puts 500 into the
+    Summary Information stream's page count (verified: pid 14 = 500), so the
+    engine itself enforces the real floor. It is also why there is no "requires
+    Windows 10" launch condition: on this machine Windows Installer reports
+    VersionNT=603 and WindowsBuild=9600 for every MSI this packaging shape
+    produces - the editor's shipped, working installer logs exactly the same -
+    and a condition on an emulated OS property can never be true. Setup failed
+    with 1603 inside LaunchConditions until the condition was removed.
+  * File versioning starts at 0.2.0 and the upgrade identity is the fixed
+    `UpgradeCode` below: never regenerate it, or a new install sits *beside* the
+    old one instead of replacing it. ProductCode differs per build by WiX
+    default, which is what a major upgrade wants.
+  * The `Upgrade` rows are written by hand rather than using `<MajorUpgrade>`
+    because that element's VersionMax is exclusive: reinstalling the *same*
+    version (a republished build, a plain re-run) matched nothing and left two
+    Add/Remove Programs entries. The inclusive range below removes anything at
+    or below this version first, and a genuinely newer install is only
+    detected, with the launch condition saying so instead of downgrading.
+  * `MediaTemplate EmbedCab="yes"`: without it WiX writes a sibling cab1.cab and
+    the installer dies with "Source file not found" when it is run from anywhere
+    but the build directory (observed: Downloads). `Package@Compressed` is
+    on by default and is NOT enough.
+  * `hearth-ui.exe` is installed as the only shortcut target because it is the
+    whole product: it serves the UI and spawns `hearth-chat-cli.exe` beside it.
+    The CLI gets no shortcut - it expects a model argument, so a shortcut would
+    open a console that closes again immediately.
+  * The icon pair mirrors `resources/hearth-setup.ico`: MSI's Icon control draws
+    the FIRST frame of an icon stretched to the control's pixel size, so the
+    dialog asset leads with its 48px frame (32x32 dialog units at 100% scaling)
+    while the shell/ARP icon leads with 16px.
+  * Uninstall removes the app and the shortcuts but not the user's models: the
+    `RemoveFolder` entries only remove *empty* directories, and .gguf files
+    downloaded in the app live in `models/`, so a reinstall finds them.
+  * Dialog strings are ASCII: Windows Installer renders them in the package's
+    language codepage, which rewrites anything else. Every control names a
+    TextStyle through `DefaultUIFont` because an unset one falls back to the
+    legacy 8pt raster face, which is what makes old installer pages blocky.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+      Name="Hearth"
+      Manufacturer="Eric-Lautanen"
+      Version="$(var.Version)"
+      UpgradeCode="346FF6B2-F464-473A-8436-054B8199D02C"
+      Scope="perUser"
+      Language="1033"
+      Codepage="65001"
+      Compressed="yes"
+      InstallerVersion="500">
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Upgrade Id="346FF6B2-F464-473A-8436-054B8199D02C">
+      <UpgradeVersion
+          Minimum="0.0.0"
+          IncludeMinimum="yes"
+          Maximum="$(var.Version)"
+          IncludeMaximum="yes"
+          OnlyDetect="no"
+          Property="WIX_UPGRADE_DETECTED" />
+      <UpgradeVersion
+          Minimum="$(var.Version)"
+          IncludeMinimum="no"
+          OnlyDetect="yes"
+          Property="WIX_NEWER_VERSION_DETECTED" />
+    </Upgrade>
+    <Property Id="WIX_UPGRADE_DETECTED" Secure="yes" />
+    <Property Id="WIX_NEWER_VERSION_DETECTED" Secure="yes" />
+    <Launch
+        Condition="NOT WIX_NEWER_VERSION_DETECTED"
+        Message="A newer version of Hearth is already installed." />
+    <InstallExecuteSequence>
+      <RemoveExistingProducts After="InstallInitialize" />
+    </InstallExecuteSequence>
+
+    <Property Id="ALLUSERS" Value="2" />
+    <Property Id="MSIINSTALLPERUSER" Value="1" />
+
+    <Icon Id="hearth.ico" SourceFile="$(var.Icon)" />
+    <Icon Id="hearth_setup.ico" SourceFile="$(var.DialogIcon)" />
+    <Binary Id="hearth_setup.ico" SourceFile="$(var.DialogIcon)" />
+    <Property Id="ARPPRODUCTICON" Value="hearth.ico" />
+    <!-- Updates arrive as a newer MSI, so there is nothing to modify in place. -->
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPCOMMENTS" Value="Local chat UI for Hearth models. Runs entirely on this computer." />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Eric-Lautanen/hearth" />
+
+    <!-- The installer's own choices, both ticked by default. A silent install
+         runs no UI and lands on these values, which is what a scripted rollout
+         must produce. -->
+    <Property Id="DESKTOP_SHORTCUT" Value="1" />
+    <Property Id="LAUNCH_APP" Value="1" />
+
+    <Feature Id="Main" Title="Hearth" Description="The app, the terminal client and setup's choices." Level="1">
+      <ComponentRef Id="AppExe" />
+      <ComponentRef Id="CliExe" />
+      <ComponentRef Id="ModelsNote" />
+      <ComponentRef Id="ReadmeDoc" />
+      <ComponentRef Id="MitLicense" />
+      <ComponentRef Id="ApacheLicense" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <!-- Its own feature so the checkbox can turn it off; Level 1, so a
+           silent install gets it too. The Start menu entry is not optional:
+           it is how an app is expected to be reachable after installing. -->
+      <Feature Id="DesktopShortcutFeature" Title="Desktop shortcut" Description="A shortcut to Hearth Chat on the Desktop." Level="1" AllowAdvertise="no">
+        <ComponentRef Id="DesktopShortcut" />
+      </Feature>
+    </Feature>
+
+    <Property Id="DefaultUIFont" Value="HearthBody" />
+
+    <UI Id="HearthOnePageUi">
+      <TextStyle Id="HearthBody" FaceName="Segoe UI" Size="9" />
+      <Dialog Id="HearthWelcomeDlg" Width="370" Height="270" Title="Install Hearth">
+        <Control Id="AppIcon" Type="Icon" X="18" Y="10" Width="32" Height="32" Text="hearth_setup.ico" />
+        <Control Id="Title" Type="Text" X="58" Y="12" Width="294" Height="18" Transparent="yes" NoPrefix="yes" Text="Install Hearth" />
+        <Control Id="Subtitle" Type="Text" X="58" Y="32" Width="294" Height="12" Transparent="yes" NoPrefix="yes" Text="Local chat over your own models - nothing leaves this PC." />
+        <Control Id="HeaderLine" Type="Line" X="0" Y="54" Width="370" Height="0" />
+        <Control Id="ShortcutSection" Type="Text" X="18" Y="66" Width="334" Height="12" Transparent="yes" NoPrefix="yes" Text="Choose what setup does" />
+        <Control Id="DesktopCheck" Type="CheckBox" X="18" Y="84" Width="336" Height="10" Property="DESKTOP_SHORTCUT" CheckBoxValue="1" Text="Create a shortcut on the Desktop" />
+        <Control Id="LaunchCheck" Type="CheckBox" X="18" Y="102" Width="336" Height="10" Property="LAUNCH_APP" CheckBoxValue="1" Text="Open Hearth Chat when setup finishes" />
+        <Control Id="ModelsSection" Type="Text" X="18" Y="126" Width="334" Height="12" Transparent="yes" NoPrefix="yes" Text="About models" />
+        <Control Id="ModelsNote" Type="Text" X="18" Y="140" Width="334" Height="42" Transparent="yes" NoPrefix="yes" Text="Setup installs the app, not the models. Use the Models panel in the app to download one afterwards - the 1.7B model is the smallest and the quickest to try." />
+        <Control Id="Note" Type="Text" X="18" Y="192" Width="334" Height="36" Transparent="yes" NoPrefix="yes" Text="Setup installs for your account only: no administrator rights, and nothing outside your own folder. Run this installer again to change these choices." />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <!-- The checkbox pattern: the check state lands in the property
+             (CheckBoxValue) and these events turn it into feature state.
+             Unchecked -> Remove (absent); checked -> AddLocal (installed). -->
+        <Control Id="Install" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="Install">
+          <Publish Event="AddLocal" Value="DesktopShortcutFeature" Condition="DESKTOP_SHORTCUT" Order="1" />
+          <Publish Event="Remove" Value="DesktopShortcutFeature" Condition="NOT DESKTOP_SHORTCUT" Order="2" />
+          <Publish Event="EndDialog" Value="Return" Order="3" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="EndDialog" Value="Exit" />
+        </Control>
+      </Dialog>
+      <Dialog Id="HearthDoneDlg" Width="370" Height="270" Title="Hearth Setup Complete">
+        <Control Id="AppIcon" Type="Icon" X="18" Y="10" Width="32" Height="32" Text="hearth_setup.ico" />
+        <Control Id="Title" Type="Text" X="58" Y="12" Width="294" Height="18" Transparent="yes" NoPrefix="yes" Text="Setup complete" />
+        <Control Id="Subtitle" Type="Text" X="58" Y="32" Width="294" Height="12" Transparent="yes" NoPrefix="yes" Text="Hearth [ProductVersion] is installed." />
+        <Control Id="HeaderLine" Type="Line" X="0" Y="54" Width="370" Height="0" />
+        <Control Id="Body" Type="Text" X="18" Y="68" Width="334" Height="44" Transparent="yes" NoPrefix="yes" Text="Hearth Chat is in the Start menu. Downloaded models are stored in [INSTALLFOLDER]models and are kept if you uninstall later." />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="Back" />
+        <!-- DoAction runs before EndDialog: once the dialog has returned, there
+             are no more control events to process. -->
+        <Control Id="Finish" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="Finish">
+          <Publish Event="DoAction" Value="LaunchHearth" Condition="LAUNCH_APP" Order="1" />
+          <Publish Event="EndDialog" Value="Return" Order="2" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Disabled="yes" Text="Cancel" />
+      </Dialog>
+      <InstallUISequence>
+        <Show Dialog="HearthWelcomeDlg" Before="ExecuteAction" />
+        <!-- OnExit="success" is the MSI exit-page slot (the -1 row); only a
+             fresh install gets a completion page, since `Installed` is already
+             set during a repair or an uninstall and "Setup complete" would be a
+             lie there. -->
+        <Show Dialog="HearthDoneDlg" OnExit="success" Condition="NOT Installed" />
+      </InstallUISequence>
+      <!-- The stock progress page (its Cancel event is intact and the UI
+           sequence drives its controls), plus the cancel/error/abort pages. -->
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="ErrorDlg" />
+    </UI>
+
+    <!-- Launches the installed app from the completion page. Type 18 (run a
+         file a component installed), immediate so it runs in the user's own
+         session, and async so setup does not wait on a server that outlives it.
+         The immediate context is why `Impersonate` is set explicitly; the empty
+         ExeCommand is the attribute WiX requires and means "no arguments". -->
+    <CustomAction
+        Id="LaunchHearth"
+        FileRef="HearthUiExe"
+        ExeCommand=""
+        Execute="immediate"
+        Impersonate="yes"
+        Return="asyncNoWait" />
+
+    <StandardDirectory Id="PerUserProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="Hearth">
+        <Component Id="AppExe" Guid="*">
+          <File Id="HearthUiExe" Source="$(var.PayloadDir)\hearth-ui.exe" KeyPath="yes" />
+          <!-- Uninstall must leave nothing behind, including this folder:
+               without RemoveFolder the directory survives its contents (the
+               exe and the Start-menu dir go, the empty Programs\Hearth shell
+               stayed). It only removes *empty* directories, which is what keeps
+               downloaded models. -->
+          <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        </Component>
+        <!-- The two-file layout is a contract: hearth-ui spawns this binary
+             from its own directory, so it ships beside it and nowhere else. -->
+        <Component Id="CliExe" Guid="*">
+          <File Id="HearthCliExe" Source="$(var.PayloadDir)\hearth-chat-cli.exe" KeyPath="yes" />
+        </Component>
+        <!-- The models directory is how the app finds models: it walks up from
+             its own executable looking for `models/` before falling back to the
+             working directory. This note is what creates the folder, and it is
+             plain text so the app's .gguf filter ignores it. The file has to sit
+             in a child Directory element: a File installs into its *component's*
+             directory, so a component in INSTALLFOLDER put the note beside the
+             executables instead of in models/. -->
+        <Directory Id="ModelsFolder" Name="models">
+          <Component Id="ModelsNote" Guid="*">
+            <File Id="ModelsReadme" Source="$(var.PayloadDir)\models\README.txt" KeyPath="yes" />
+            <!-- The same reasoning as INSTALLFOLDER, one level down: without
+                 this the uninstalled tree keeps an empty models\ shell, which
+                 in turn keeps Programs\Hearth alive. Empty-only removal is
+                 exactly the rule that lets a downloaded .gguf survive. -->
+            <RemoveFolder Id="RemoveModelsFolder" On="uninstall" />
+          </Component>
+        </Directory>
+        <Component Id="ReadmeDoc" Guid="*">
+          <File Id="ReadmeDocFile" Source="$(var.PayloadDir)\README.md" KeyPath="yes" />
+        </Component>
+        <Component Id="MitLicense" Guid="*">
+          <File Id="MitLicenseFile" Source="$(var.PayloadDir)\LICENSE-MIT" KeyPath="yes" />
+        </Component>
+        <Component Id="ApacheLicense" Guid="*">
+          <File Id="ApacheLicenseFile" Source="$(var.PayloadDir)\LICENSE-APACHE" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- The Start menu entry is the primary way in, with the uninstaller beside
+         it. Shortcuts need a KeyPath of their own and a per-user component's
+         key path cannot be a machine-context shortcut, so it is an HKCU value;
+         removing the value plus the folder makes uninstall leave nothing
+         behind. -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="HearthMenuFolder" Name="Hearth">
+        <Component Id="StartMenuShortcut" Guid="*">
+          <Shortcut
+              Id="HearthShortcut"
+              Name="Hearth Chat"
+              Description="Hearth - local chat for your own models"
+              Target="[INSTALLFOLDER]hearth-ui.exe"
+              WorkingDirectory="INSTALLFOLDER"
+              Icon="hearth.ico" />
+          <Shortcut
+              Id="HearthUninstallShortcut"
+              Name="Uninstall Hearth"
+              Description="Remove Hearth from this account"
+              Target="[SystemFolder]msiexec.exe"
+              Arguments="/x [ProductCode]" />
+          <RemoveFolder Id="RemoveHearthMenuFolder" On="uninstall" />
+          <RegistryValue Root="HKCU" Key="Software\Eric-Lautanen\Hearth" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- The Desktop shortcut, in its own optional feature. The Desktop folder is
+         not ours, so there is deliberately no RemoveFolder here. -->
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*">
+        <Shortcut
+            Id="HearthDesktopShortcut"
+            Name="Hearth Chat"
+            Description="Hearth - local chat for your own models"
+            Target="[INSTALLFOLDER]hearth-ui.exe"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="hearth.ico" />
+        <RegistryValue Root="HKCU" Key="Software\Eric-Lautanen\Hearth" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+  </Package>
+</Wix>
