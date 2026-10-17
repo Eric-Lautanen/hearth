@@ -115,6 +115,11 @@ cargo clean if need be
 cargo check/build --release
 cargo test -p hearth-quant -- --test-threads=1
 cargo fmt
+
+# Cross-platform gate: aarch64 is a release platform. `check` needs no linker,
+# so this runs anywhere and is what CI does (three targets + a qemu test job).
+cargo check --target aarch64-unknown-linux-gnu --workspace --all-targets
+cargo clippy --target aarch64-unknown-linux-gnu --workspace --all-targets -- -D warnings
 ```
 
 ## Critical format IDs

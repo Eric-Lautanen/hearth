@@ -1,181 +1,73 @@
 # Hearth — next session
 
-> **Session 2026-10-16 (pt 16) in one paragraph.** The CPU baseline is now **x86-64-v3**, the AVX2
-> kernels are **baseline-invariant**, and the shipped 1.7B Q1_0 went from ~13 to ~45 tok/s against
-> the v2 baseline it replaced. The v2 loss was one mechanism seen twice: `#[target_feature(enable =
-> "avx2")]` does not imply `fma`/`f16c`, so an AVX2 body reaching for `_mm256_fmadd_ps` or an f16
-> scale got an out-of-line call *per use* while the banner still said `avx2` (benchk Q1_0 0.55 GB/s;
-> with the declarations 2.73; at v3 3.48). buffy declared `fma`/`f16c` on the AVX2 bodies and routed
-> the 35 in-kernel f16 conversions through a declared `crate::f16_bits_to_f32` (declaring the feature
-> is what stops `half`'s runtime probe, and both of its arms, from inlining into the block loop);
-> SparkOC scoped the baseline to `[target.'cfg(target_arch = "x86_64")']` (the old `[build]` entry
-> would have broken every aarch64 build), added a CI job that builds `hearth-quant` at v2 and rejects
-> any out-of-line FMA/VNNI call or f16 call inside a SIMD body
-> (`scripts/check-kernel-baseline.py`), and found the same bug in
-> `dot_q2_0_q8_0_vnni_avx512` — a 256-bit EVEX kernel that declared `avx512f`+`avx512vnni` but not
-> `avx512vl`, which is why `vnni256` read 0.59 GB/s at v3 while native (VL in its baseline) hit
-> 1.58; with VL added it is 1.59. The other regression was self-inflicted and the sweep caught it:
-> the dense path had been moved onto the hybrid path's ¾-of-logical thread rule, and SMT
-> oversubscription starves the workers the spinning main thread waits on (dense 8B Q1_0: 12.1 tok/s
-> at 8 workers, 6.0 at 12, 4.0 at 16). The optima proved per-path, so the dense path uses
-> `pool::default_worker_count()` (physical cores from CPUID leaf 0x1F, `HEARTH_THREADS` override) and
-> the hybrid keeps its own 12.
+> **Session 2026-10-16 (pt 17) in one paragraph.** Two things landed, both found by measuring rather
+> than by reading. (1) The dispatch wait no longer spins through the whole wait:
+> `ThreadPool::wait_for_workers` spins for `SPIN_BUDGET` and then yields, worth +15–25% wherever the
+> pool outnumbers the physical cores (dense 8B Q1_0 12.1 → 13.2 tok/s at 8 workers and 6.0 → 6.9 at
+> 12; hybrid `Ternary-Bonsai-2-4B-PQ2_0` 5.2 → 6.4 at 8) and neutral at the default. That **closes**
+> the carry-over item that wanted the dispatching thread to take a chunk instead of waiting: the
+> remaining cliff is memory bandwidth and SMT sharing, not a starved worker, so the per-path counts
+> stand. (2) **aarch64 became a gated platform, and it had never been built.** One
+> `cargo check --target aarch64-unknown-linux-gnu --workspace --all-targets` showed `hearth-tls` did
+> not compile there at all — AES-NI and PCLMUL calls reached from branches gated only on the runtime
+> probe, naming modules that exist only on x86_64 — and `hearth-quant` had six dead-code warnings
+> plus two more in its test build. `macos-latest` is an arm64 runner now, so that same break had been
+> failing `check (macos-latest)` on `main` since the TLS crate landed. New CI: `arm-cross-check`
+> (three aarch64 targets, check + clippy `-D warnings`, no linker needed) and `arm-qemu-test` (the
+> CPU-only suites linked and *run* under `qemu-user` — the first execution of the aarch64 scalar
+> fallback anywhere, `pool::tests::physical_cores_is_always_a_usable_count` included). Run
+> `38988216344`: 8/8 green. Commits `5fd87ed` (pool), `7a918ad` (aarch64).
 
-## Do these first (carry-over from pt 16, SparkOC)
+## Do these first (carry-over from pt 17)
 
-1. **The thread cliff is bandwidth/SMT, not a starved worker — measured, and the cheap fix is in.**
-   `ThreadPool::wait_for_workers` now spins for a budget and then yields, rather than spinning
-   unconditionally, because a thread that never yields cannot stop oversubscribing a machine it is
-   already sharing. It is worth +15–25% wherever the pool outnumbers the physical cores (dense 8B
-   Q1_0 12.1 → 13.2 tok/s at 8 workers and 6.0 → 6.9 at 12; hybrid `Ternary-Bonsai-2-4B-PQ2_0`
-   5.2 → 6.4 at 8) and neutral at the default. It does **not** remove the cliff: 12 workers is still
-   ~half of 8 on the dense 8B, so the remainder is memory bandwidth and SMT sharing rather than a
-   spinning thread stealing cycles. The follow-on idea — let the dispatching thread run a chunk
-   instead of waiting — would add a 9th/13th *runnable* thread to an already saturated machine (and
-   needs `par_for`'s per-worker scratch resized for the extra id), so it is not expected to pay. Do
-   not spend a session on it without a measurement that says otherwise.
-2. **Keep the per-path counts; do not collapse them without an interleaved pair.** Dense
+1. **aarch64 runs, and it is slow by construction: there is no SIMD backend for it.** Every
+   dispatched kernel there is the scalar fallback, and `arm-qemu-test` is the only thing that has
+   ever executed that path. So NEON is the largest Goal-1 item left in `hearth-quant` — but *measure
+   first*: qemu is not a benchmark, so a real ARM target is the prerequisite for any number
+   (`macos-latest` is arm64 and already in the matrix; `cargo test` there is free, `cargo bench`-like
+   timing is not). The two shapes that suit NEON best are the `Q2V_U8` LUT dot — `vqtbl` is a table
+   lookup in one instruction, which is exactly what that kernel is — and the f32 glue in
+   `hearth-llm/src/ops.rs`.
+2. **Keep the per-path worker counts; do not collapse them without an interleaved pair.** Dense
    `pool::default_worker_count()` (physical cores) and the hybrid's ¾-of-logical are each the
    measured optimum on the same box: dense 8B Q1_0 wants 8, dense `Ternary-Bonsai-4B-Q2_0` wants 12
-   (9.8–10.8 against 8.1), hybrid wants 12 (7.4–7.9 against 6.3–6.5).
-3. **Portability program (Goal 1) — still not started.** A `benchk`-driven per-CPU-id calibration
-   runner that records the winning kernel per dtype and feeds the dispatch (replacing microarch
-   predicates with a measurement); ARM CI runners in the 3-OS matrix; and the portable GPU
-   scaffolding (opt-in behind `--device`/env, graceful with no device, must not break the CPU path
-   or the Windows/macOS builds).
+   (9.8–10.8 against 8.1), hybrid wants 12 (7.4–7.9 against 6.3–6.5). `HEARTH_THREADS` overrides
+   both.
+3. **The `benchk`-driven per-CPU calibration runner is still the unfinished half of Goal 1.** The
+   idea: record the winning kernel per dtype *on this machine* and feed the dispatch from that
+   record, replacing microarch predicates with a measurement. `benchk` already prints every arm's
+   GB/s and the CPUID decode; what it does not do is persist a winner or refuse a bad one. The hazard
+   it exists to fix is real: `benchk` ranks invert on noise (one v3 run ranked `avx2_lut` 2.51 ahead
+   of `vnni512x2` 1.70; the native rerun gave 1.35 against 1.68), so any calibration has to warm up,
+   take a minimum over several passes, and refuse to switch on a difference inside the noise band.
 4. **All three Q2_0 rows read ~36% under the 2026-10-15 chart in every sweep — assume noise before
    code.** v3 is not the cause: interleaved against the native binary, `Ternary-Bonsai-4B-Q2_0` is
    10.41 native against 8.15 v3 at 8 workers and 10.3 v3 at 12, i.e. equal once thread counts match.
-   One `benchk` run also ranked `avx2_lut` 2.51 ahead of `vnni512x2` 1.70 at v3 while a native rerun
-   gave 1.35 against 1.68 — so rank claims need two arms and a rested machine.
 5. **Goal 2 still open:** the `hearth-ui` model downloader (`GET /api/downloads`, single active
    download with `.part` + atomic rename, `POST /api/downloads/{start,cancel}`, size-polling or SSE
    progress, catalog overridable via `models/catalog.json` or `HEARTH_MODEL_CATALOG_JSON`); README
    screenshots; and `resources/hearth.svg`'s flame is still not vertically centred (rasterize to
    check).
+6. **GPU scaffolding (Goal 1, still not started):** opt-in behind `--device`/env, graceful when no
+   ROCm device exists, and it must not break the CPU path or the Windows/macOS builds. The aarch64
+   cross-check now guards the last of those three for the ARM half.
 
-> **Session 2026-10-16 (pt 15) in one paragraph.** The allow-block rule is now a property of the
-> workspace rather than a job in progress: **zero `#[allow(...)]` and zero `#[expect(...)]` anywhere**,
-> nothing silenced to get there, and the whole-repo gate green — `cargo clippy --workspace
-> --all-targets -- -D warnings`, `cargo fmt --check`, `cargo check --workspace --all-targets`
-> warning-free, `cargo test --workspace -- --test-threads=1` green (42 quant, 170 tls, rest), release
-> build clean. The 25 sites the quant sweep left were all real: 19 `too_many_arguments` (15 of them
-> `hearth-compute` dispatch methods, now taking named `Copy` shape structs in `args.rs` while the
-> buffers stay explicit; `ensure_batch_size` went from seven shape arguments to two, because the rest
-> were `self.config`; `matmul_batch`'s row count was never read and is deleted), 4 `needless_range_loop`
-> (both cache batches now iterate `caches.iter_mut().enumerate()`), `GgmlDType` variants camel-cased
-> with `name()` still returning the spec spellings so no log line moved, and dead weight deleted rather
-> than allowed — the never-wired FLUX VAE scaffolding, `GpuDevice`'s instance/adapter handles, and the
-> diffusion constructor's upload of every BF16/F32 weight as f32 that no forward path read. My own
-> scripted pass was off by one and deleted a row-buffer argument instead of the dead row count; one
-> build caught it, and the repair (and both exact deleted-line counts) is in the tracker. The AGENTS.md
-> section now states the rule — no allows ever, never a "pre-existing" warning, a finding that cannot be
-> fixed without changing behaviour is reported and measured — and its two stale claims (`cargo test
-> --test-threads=1 -p …`, "GPU stub warnings are OK") are corrected. Diffusion's VAE is still the
-> placeholder path; the real decoder is the next feature there.
+## Earlier sessions — the history lives in `docs/BUG_TRACKER.md`
 
-> **Session 2026-10-16 (pt 14) in one paragraph.** The crate now has a verifier, which is the first
-> thing in it that can *accept* anything: `verifier.rs`'s `PinnedVerifier` runs the three stages in a
-> stated order — the chain from the wire bytes (framing, parse, structure, links, anchor, windows,
-> revocation), the leaf's purpose and name, then the `CertificateVerify` signature with the leaf's own
-> key — and returns a typed failure per stage, with the trait's `String` being that same `Display`.
-> The anchors and the CRLs stay the caller's (borrowed, not copied, and no root store in this crate);
-> `RejectAll` remains the verifier a caller who has decided nothing gets. The slice's real work was
-> making the composition *testable*: a new `LEAF_EC_VALID` fixture (an EC leaf whose window sits inside
-> its issuer's, which no previous fixture allowed — `LEAF_EC`'s opens after its issuer's closes), so the
-> whole verifier is exercised with `0x0403` as well as `0x0804`, and generated `CertificateVerify`
-> vectors signed with the fixture leaves' keys over the §4.4.3 construction, each **verified by the
-> OpenSSL CLI before being written down**, plus the RSA one with a flipped byte, which the generator
-> refuses to emit if OpenSSL still accepts it. Six neutering rounds (chain call, caller's `Revocation`,
-> leaf check, signature check, `signed_data`/`signature` swap, the trait's entry point) all caught.
-> **242 checks green on both paths** (+4), clippy, fmt, `cargo doc`, workspace and regeneration
-> stability clean. Still no OCSP, no stapling, no CRL fetching and no transport — nothing in this crate
-> has ever opened a socket.
+- **pt 16** — CPU baseline → `x86-64-v3`; the AVX2 kernels made baseline-invariant by declaring
+  `fma`/`f16c`; the VNNI `avx512vl` fix; the per-path worker counts. *Tracker: "Baseline is
+  x86-64-v3…".*
+- **pt 15** — the allow-block sweep: zero `#[allow]`/`#[expect]` left anywhere, 25 sites fixed at
+  the cause.
+- **pt 14** — `PinnedVerifier`: the first thing in `hearth-tls` that can *accept*. *Tracker: slice 20.*
+- **pt 13** — CRLs, `Revocation::{Unchecked, Required}`, and the CRL `version` field two readers had
+  wrong together. *slice 19.*
+- **pt 12** — AKI/SKI matching, a link check no signature can make. *slice 18.*
+- **pt 11** — key rollover and the self-issued `pathLenConstraint` count. *slice 17.*
+- **pt 10** — what the OpenSSL oracle says about chain *shape*. *slice 16.*
+- **pt 9** — the oracle itself: fifteen paths put to `openssl verify`, verdicts recorded. *slice 15.*
 
-> **Session 2026-10-16 (pt 13) in one paragraph.** The last *absent* check is now present: revocation,
-> as caller-supplied CRLs. `crl.rs` reads a `CertificateList` strictly (unknown critical extensions
-> refused, which is what refuses a delta CRL; `certificateIssuer` refused by name; a v1 CRL with
-> extensions refused), and `chain.rs` gains a `Revocation` argument on `verify_chain` — `Unchecked`,
-> which has to be written out because a revoked certificate verifies in that mode, or `Required(&[crls])`,
-> where every certificate in the path needs a list from its issuer, the issuer must claim `cRLSign`,
-> every supplied list must verify its signature, the freshest `thisUpdate` speaks, and two equally fresh
-> lists that contradict each other are refused rather than guessed between. Seventeen cases were put to
-> the OpenSSL CLI with `-crl_check_all`/`-crl_check` and recorded; two are divergences with this crate
-> the stricter side (a delta CRL, which OpenSSL accepts as a complete one, and the leaf-only scope of
-> `-crl_check`). **The slice's real find was a bug in the parser *and* the fixtures together**: a CRL's
-> `version` is a plain `INTEGER`, not the `[0] EXPLICIT` a certificate uses, so thirteen unit tests were
-> passing on CRLs OpenSSL could not even load, and every real v2 CRL would have been refused — caught
-> only because the generator makes OpenSSL read every fixture and raises when it cannot. All 13 new
-> rules were proven load-bearing by removing them one at a time (238 checks green on both paths, +21),
-> and the neutering script's own bug — it ran one test target, so three rules looked unwatched — is
-> recorded. **Still nothing calls any of it**: `RejectAll` is the only `CertificateVerifier`, and there is
-> no OCSP, no stapling and no CRL fetching.
-
-> **Session 2026-10-16 (pt 12) in one paragraph.** The question slice 17 raised — are key identifiers worth more
-> than `-x509_strict`? — is answered by measurement: with a leaf whose `authorityKeyIdentifier` points at twenty
-> bytes nothing owns, **OpenSSL refuses the path (error 20) while this crate accepted it**, which is the
-> forbidden direction and so could not be written off as a divergence. `x509.rs` now reads
-> `subjectKeyIdentifier` and `authorityKeyIdentifier` (whose `keyIdentifier` is `[0]` **implicit**, the trap in
-> that extension), the generated table records both for all 30 fixtures so the parser is compared against
-> OpenSSL's reading of the same bytes, and `chain.rs` refuses a link when the child states a key identifier and
-> its issuer states a different one (`AuthorityKeyMismatch`, RFC 5280 §4.2.1.1). **The signature check cannot
-> make this one**: a certificate whose identifier lies was still signed by whoever signed it, which is exactly
-> why the fixture that proves the rule has a *valid* signature asserted beside the refusal. Absences are not
-> refusals (no `authorityKeyIdentifier` on the child, no `subjectKeyIdentifier` on the issuer) and the anchor is
-> checked on the same rule. Neutering it turns both the direct test and the oracle red. **217 checks green on
-> both paths** (216 before), clippy, fmt, `cargo doc`, workspace clean; 30 fixtures, 23 oracle paths.
-
-> **Session 2026-10-16 (pt 11) in one paragraph.** A gap found by reading the code rather than by a failing
-> test: `intermediates_below` excludes self-issued certificates from a `pathLenConstraint` count — the rule
-> that makes a **key rollover** legal — and in all 24 fixtures then every intermediate was non-self-issued,
-> so the branch that does the excluding never excluded anything. It now has a rollover path
-> (`ROLLOVER_CA_A` → `ROLLOVER_CA_B`, same DN, new key → a leaf), legal *only* because the rollover is
-> self-issued, with the contrast in the same test and the branch proven load-bearing by neutering
-> `self_issued` (the path is then `PathLengthExceeded { ca: Chain(2), allowed: 0, found: 1 }`). The oracle
-> then produced the most useful result of the day: with no key identifiers it refused two **sound** rollover
-> paths with error 7 and error 19 *while this crate accepted them* — a disagreement in the forbidden
-> direction, which the test therefore refused to accept as a divergence. The fix was the fixtures (these
-> three, and only these three, now carry AKI/SKI) and both paths then agree, which also re-reads the earlier
-> `-x509_strict` finding: key identifiers are how a real verifier tells two same-DN certificates apart, so
-> their absence was unrealistic fixtures, not a strict-mode nicety. **216 checks green on both paths** (215
-> before), clippy, fmt, `cargo doc`, workspace and generator stability clean; 27 fixtures, 21 oracle paths.
-
-> **Session 2026-10-16 (pt 10) in one paragraph.** The oracle's first real findings, from four paths about
-> the *shape* of the presented list rather than about any rule. **OpenSSL selects a path out of the pool;
-> this crate builds exactly the list it is given.** An unordered chain, a repeated certificate and an
-> unrelated certificate padded in are all accepted by OpenSSL 3.5.5 and all refused here (`BrokenLink`,
-> `NotACa`), which is deliberate and is RFC 8446 §4.4.2's own requirement — each certificate must certify
-> the one before it — but it is a **real interoperability cost**, now stated in `chain.rs`'s "what this does
-> not do": a server whose chain is out of order or padded is refused, and a caller who needs that tolerance
-> has to select the path first. Being the stricter side is the only divergence the oracle test permits, so
-> all three are recorded with their reason. They also happen to exercise "structure before links" on input
-> nobody built to be a path — the refusals name the offending certificate's position as `NotACa`, not a
-> broken link at the end — which is the property the module docs claim and no old fixture could show. 19
-> paths, 5 recorded divergences, all five strict. The oracle test now collects *every* disagreement and
-> prints the set, so adding a path costs one run rather than one run per surprise. **215 checks green on
-> both paths** (unchanged — this slice added paths, not tests), clippy, fmt, `cargo doc`, workspace and
-> generator stability all clean.
-
-> **Session 2026-10-16 (pt 9) in one paragraph.** The crate gets an **oracle**. Every check so far compared
-> our reading of a certificate against OpenSSL's *parser*, which left the policy — which rules run, and what
-> each means — checked only against my own reading of RFC 5280. Fifteen paths are now put to a second
-> implementation of path validation at the same instants (`openssl verify -partial_chain -auth_level 0`,
-> 3.5.5), with the verdicts recorded in the generated `VERIFY_CASES` table rather than taken at test time,
-> so nothing silently skips when the tool is missing. The test enforces the direction a disagreement may
-> take: OpenSSL accepting while this crate refuses, never the reverse. It paid for itself three times over.
-> It **measured** the identity-pin claim from pt 8, which had been recalled from memory rather than shown
-> (OpenSSL accepts a self-signed `cA: FALSE` certificate pinned as its own anchor). It **independently
-> corroborates** the new anchor rule (error 79, "invalid CA certificate", exactly as pt 8 reasoned). And
-> with `keyCertSign` neutered the oracle **fails by name** — a second implementation catching a regression
-> in a rule it was never told about. Two divergences remain, both with this crate the stricter side: a CA
-> certificate used as the server (`CaUsedAsLeaf`) and the `Policy::min_rsa_bits` floor. **215 checks green
-> on the hardware path and on `HEARTH_TLS_NO_HW=1`** (214 before), clippy `--all-targets -D warnings`, fmt,
-> `cargo doc` (zero warnings) and the workspace check clean, `std`-only, empty `[dependencies]`, and still
-> nothing in the crate calls
-> any of it: `RejectAll` is the only `CertificateVerifier`, and there is **no revocation checking of any
-> kind**. History: `docs/BUG_TRACKER.md`.
-
-## Next session — in this order
+## hearth-tls lane — next session, in this order
 
 1. **Certificate verification — the decision exists; its *inputs* and its wiring are the work.**
    A certificate parses (`x509.rs`), every suite verifies (`rsa.rs`, `ecdsa.rs`), `verify.rs` decides

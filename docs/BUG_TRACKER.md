@@ -3,6 +3,35 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers. Ref: llama.cpp-prism.
 
+### aarch64 was a release platform with no CI coverage — and it did not build (SparkOC, 2026-10-16 late)
+
+**`macos-latest` is an arm64 runner now, so `check (macos-latest)` had been red on `main` since the
+TLS crate landed.** The failure was visible, the cause was not: nobody had ever run the workspace
+for aarch64 locally. One `cargo check --workspace --all-targets --target aarch64-unknown-linux-gnu`
+reproduced the whole thing.
+
+- **`hearth-tls` did not compile for aarch64 at all.** `Aes128::encrypt_block` and `Gcm::ghash`
+  called `crate::aesni` / `crate::ghash_x86` from a branch gated only on the runtime probe. Those
+  modules are `#[cfg(target_arch = "x86_64")]`, and a branch the optimizer can prove dead is still
+  a name the compiler has to resolve — so the *call* has to sit behind the architecture gate too,
+  which is also where the probe is decided (`aes_ni_available` / `pclmul_available` already return
+  `false` off x86_64).
+- **`hearth-quant` reported six dead-code warnings there** (`AMD_FAMILY_SPLIT_AVX512`,
+  `cpuid_family`, `cpuid_is_amd`, `avx512_full_width_for`, `Q2V_I16`, `Q2V_U8`), plus `Q1V_SM` in the
+  test build and an unused `Instant` import. Every one is x86-only by construction — the AVX-512
+  width policy and the SIMD lookup tables have no non-x86 reader — so they are now
+  `#[cfg(target_arch = "x86_64")]`, and the four CPUID-policy tests are gated with the code they
+  test (they still run on x86, and hearth-quant runs 35 of its 42 tests on aarch64).
+- `benchk` built its variant list with a `mut` only the x86 arms needed, and kept a `have` stub
+  nothing called.
+
+**New CI:** `arm-cross-check` (check + clippy `-D warnings` for `aarch64-unknown-linux-gnu`,
+`aarch64-apple-darwin`, `aarch64-pc-windows-msvc`; `check` needs no linker, so it runs on the x86
+runners already in the matrix) and `arm-qemu-test` (links and *runs* the CPU-only suites under
+`qemu-user` — the first execution of the aarch64 scalar fallback anywhere, including
+`pool::tests::physical_cores_is_always_a_usable_count`, which now covers the non-x86 stub). Run
+`38988216344`: all 8 jobs green, macOS included. Commits `7a918ad` (CI + the four fixes).
+
 ### Baseline is x86-64-v3, the kernels are baseline-invariant, and one missing attribute was worth 2.7x (SparkOC, 2026-10-16)
 
 **`26eab4b` set the crate baseline to `x86-64-v2` and lost 3.4x. Root cause, proven from the
