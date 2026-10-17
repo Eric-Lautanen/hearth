@@ -1,0 +1,342 @@
+name: release
+
+# Tag a version (v0.2.0) to build and publish every artifact. The
+# workflow_dispatch path builds exactly the same artifacts on the same five
+# runners and stops before publishing, which is how a packaging change is
+# checked before a tag exists: the two paths differ only in the publish job.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp (dry run: nothing is published)"
+        required: true
+        default: "v0.0.0-dry-run"
+
+env:
+  CARGO_TERM_COLOR: always
+  # `v0.2.0` for a tag, the dispatch input for a dry run. Steps strip the
+  # leading `v` and any `-suffix`, since MSI product versions are numeric only.
+  STAMP: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both macOS architectures: a macOS 13 runner is Intel, a macOS 14
+          # runner is Apple silicon, and the bundle has to be built natively on
+          # each because an .app carries one architecture's binary.
+          - name: windows-x86_64
+            os: windows-latest
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: macos-x86_64
+            os: macos-13
+          - name: macos-arm64
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      # The artifact, not a debug build of the same commit, is what answers the
+      # request. Hearth's UI is a server that hands the page to a browser, so
+      # this needs no display: start it, ask it the two questions the app's own
+      # smoke test asks, and stop it.
+      - name: the binary serves the UI (linux, macos)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/hearth-ui --no-browser --port 8899 &
+          server=$!
+          served=0
+          for _ in $(seq 1 100); do
+            if curl -sf -o /dev/null http://127.0.0.1:8899/api/models; then served=1; break; fi
+            sleep 0.2
+          done
+          if [ "$served" -ne 1 ]; then
+            echo "::error::hearth-ui never answered /api/models"
+            kill "$server" 2>/dev/null || true
+            exit 1
+          fi
+          curl -sf -o /dev/null http://127.0.0.1:8899/api/downloads
+          curl -sf -o /dev/null http://127.0.0.1:8899/favicon.svg
+          kill "$server" 2>/dev/null || true
+          wait "$server" 2>/dev/null || true
+          echo "served /api/models, /api/downloads and /favicon.svg"
+
+      - name: the binary serves the UI (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $server = Start-Process -FilePath 'target\release\hearth-ui.exe' `
+            -ArgumentList '--no-browser', '--port', '8899' -PassThru
+          $served = $false
+          foreach ($_ in 1..100) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8899/api/models' | Out-Null
+              $served = $true
+              break
+            } catch { Start-Sleep -Milliseconds 200 }
+          }
+          if (-not $served) {
+            Stop-Process -Id $server.Id -Force
+            throw "hearth-ui never answered /api/models"
+          }
+          Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8899/api/downloads' | Out-Null
+          Stop-Process -Id $server.Id -Force
+          Write-Host "served /api/models and /api/downloads"
+
+      # ---- signing ---------------------------------------------------------
+      # Nothing here runs unless the repository carries the credentials, so a
+      # fork builds and publishes exactly what it did before. Which secrets and
+      # how to make them is packaging/SIGNING.md's subject. The executables are
+      # signed *before* the MSI is built, or the installer would embed unsigned
+      # copies.
+      - name: sign the executables (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CERT_PFX_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if (-not $env:CERT_PFX_B64) {
+            Write-Host "::notice::WINDOWS_CERT_PFX_B64 is unset: publishing unsigned Windows builds."
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_B64))
+          $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $signtool = Get-ChildItem $sdk -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\x64\' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found in the Windows SDK" }
+          foreach ($exe in 'hearth-ui.exe', 'hearth-chat-cli.exe') {
+            & $signtool.FullName sign /f $pfx /p $env:CERT_PASSWORD /fd sha256 `
+              /tr http://timestamp.digicert.com /td sha256 "target/release/$exe"
+            if ($LASTEXITCODE -ne 0) { throw "signing $exe failed" }
+            & $signtool.FullName verify /pa "target/release/$exe"
+            if ($LASTEXITCODE -ne 0) { throw "$exe failed signature verification" }
+          }
+          Remove-Item $pfx
+
+      - name: sign and notarize the bundle (macos)
+        if: runner.os == 'macOS'
+        env:
+          CERT_P12_B64: ${{ secrets.MACOS_CERT_P12_B64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          version="${{ env.STAMP }}"; version="${version#v}"; version="${version%%-*}"
+          sh scripts/package-macos.sh target/Hearth.app "$version"
+          if [ -z "${CERT_P12_B64:-}" ]; then
+            echo "::notice::MACOS_CERT_P12_B64 is unset: publishing an unsigned bundle."
+            exit 0
+          fi
+          : "${SIGN_IDENTITY:?MACOS_SIGN_IDENTITY must be set alongside the certificate}"
+          keychain="$RUNNER_TEMP/hearth-signing.keychain-db"
+          echo "$CERT_P12_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p actions "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p actions "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k actions "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          # Hardened runtime is not optional: notarytool rejects a bundle built
+          # without it, and the timestamp keeps the signature valid past the
+          # certificate's own expiry.
+          codesign --force --deep --timestamp --options runtime -s "$SIGN_IDENTITY" target/Hearth.app
+          codesign --verify --deep --strict --verbose=2 target/Hearth.app
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ]; then
+            : "${APPLE_TEAM_ID:?APPLE_TEAM_ID must be set to notarize}"
+            ditto -c -k --keepParent target/Hearth.app "$RUNNER_TEMP/notarize.zip"
+            xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" --wait
+            xcrun stapler staple target/Hearth.app
+            xcrun stapler validate target/Hearth.app
+            spctl --assess --type execute --verbose=2 target/Hearth.app
+          else
+            echo "::notice::signed but not notarized: APPLE_ID/APPLE_APP_PASSWORD unset."
+          fi
+          security delete-keychain "$keychain"
+
+      # ---- package per OS --------------------------------------------------
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = '${{ env.STAMP }}' -replace '^v', '' -replace '-.*$', ''
+          ./scripts/package-win.ps1 -Version $version -PayloadDir target/payload `
+            -OutDir target/dist -Zip
+
+      # WiX is a pinned dotnet tool: the runner image carries only legacy WiX
+      # v3, which the v4+ schema in packaging/windows/hearth.wxs predates.
+      - name: install WiX (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 7.0.0
+          # WiX v7's EULA (the OSMF one, free below its revenue threshold) plus
+          # the UI extension the installer's pages come from.
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" eula accept wix7
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext
+
+      - name: build the installer (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = '${{ env.STAMP }}' -replace '^v', '' -replace '-.*$', ''
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" build `
+            -acceptEula wix7 `
+            -ext WixToolset.UI.wixext `
+            -arch x64 `
+            -d Version=$version `
+            -d PayloadDir=target/payload `
+            -d Icon=resources/hearth.ico `
+            -d DialogIcon=resources/hearth-setup.ico `
+            -o "target/dist/hearth-v$version-windows-x86_64.msi" `
+            packaging/windows/hearth.wxs
+
+      # SmartScreen judges the installer the user double-clicks.
+      - name: sign the installer (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CERT_PFX_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if (-not $env:CERT_PFX_B64) { exit 0 }
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_B64))
+          $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $signtool = Get-ChildItem $sdk -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\x64\' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          Get-ChildItem -Path target/dist -Filter '*.msi' | ForEach-Object {
+            & $signtool.FullName sign /f $pfx /p $env:CERT_PASSWORD /fd sha256 `
+              /tr http://timestamp.digicert.com /td sha256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signing $($_.Name) failed" }
+            & $signtool.FullName verify /pa $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed signature verification" }
+          }
+          Remove-Item $pfx
+
+      - name: package (macos)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          version="${{ env.STAMP }}"; version="${version#v}"; version="${version%%-*}"
+          arch="$(uname -m)"
+          mkdir -p target/dist
+          # --keepParent is what puts Hearth.app itself at the root of the zip;
+          # without it the download unzips to a stray Contents/ folder that
+          # cannot be dragged to /Applications. --sequesterRsrc keeps the
+          # bundle's extended attributes, which is where a signature lives.
+          ditto -c -k --sequesterRsrc --keepParent target/Hearth.app \
+            "target/dist/hearth-v$version-macos-$arch.zip"
+
+      - name: package (linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          version="${{ env.STAMP }}"; version="${version#v}"; version="${version%%-*}"
+          arch="$(uname -m)"
+          stage="target/linux-stage"
+          rm -rf "$stage"; mkdir -p "$stage/models"
+          cp target/release/hearth-ui target/release/hearth-chat-cli "$stage/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          cp resources/models-README.txt "$stage/models/README.txt"
+          # The desktop entry and the icon travel beside the binaries; the
+          # README's Linux section says where they go.
+          cp resources/hearth.desktop resources/hearth.svg "$stage/"
+          mkdir -p target/dist
+          tar -czf "target/dist/hearth-v$version-linux-$arch.tar.gz" -C "$stage" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          # Listed rather than `hearth-*`: the WiX build also drops a .wixpdb
+          # debug database next to the MSI, and that must never reach a
+          # release. Everything users download is on this list, on purpose.
+          path: |
+            target/dist/hearth-*.zip
+            target/dist/hearth-*.msi
+            target/dist/hearth-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish github release
+    needs: build
+    # A dry run stops here: it built and uploaded exactly what a tag would have
+    # published, and nothing left GitHub.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      # The integrity contract for every artifact below: one line per file, in
+      # the format `sha256sum -c` reads back.
+      - name: publish SHA256SUMS
+        run: |
+          cd dist
+          sha256sum hearth-* | sed 's/  / /' > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Hearth ${{ github.ref_name }}
+
+            Hearth is a local chat UI for Hearth's own GGUF models: a stat-only
+            Rust inference engine, no Python, no WebView, no runtime to install.
+            The app opens in your browser and the models are downloaded from
+            inside it.
+
+            | File | OS | Install |
+            |---|---|---|
+            | `*-windows-x86_64.msi` | Windows 10/11 | **Run it - that is the install.** Per user, no administrator rights: Start-menu entry, optional Desktop shortcut, and an Add/Remove Programs row. A newer MSI replaces it in place. |
+            | `*-windows-x86_64.zip` | Windows 10/11 | Portable alternative: unzip anywhere and run `hearth-ui.exe`. Model downloads need `curl.exe`, which Windows 10 1803+ already has. |
+            | `*-linux-x86_64.tar.gz`, `*-linux-aarch64.tar.gz` | Linux | Unpack and run `hearth-ui` (it opens your browser); `hearth.desktop` and `hearth.svg` are there for a menu entry. |
+            | `*-macos-x86_64.zip`, `*-macos-arm64.zip` | macOS | Unzip and drag `Hearth.app` to Applications. Until a build is signed and notarized, the first launch needs right-click, Open. |
+
+            **Models are not in these downloads** (they are 0.5 GB and up). Open
+            the app and use the Models panel: pick a model, download it with
+            progress, and it lands in the `models/` folder next to the app.
+            Reinstalling or upgrading keeps it.
+
+            **arm64 note.** Every SIMD kernel in the engine currently dispatches
+            to avx2/avx512 on x86-64 and to the scalar fallback elsewhere, so the
+            arm64 builds are correct but not yet tuned. The x86-64 builds are the
+            fast ones.
+
+            **Signed builds.** When the repository has its signing secrets set,
+            the Windows executables and the MSI are Authenticode-signed and the
+            macOS bundle is Developer-ID signed and notarized, so neither shows
+            an unknown-publisher prompt. Without them the workflow still
+            publishes - unsigned - and the OS says so. See
+            `packaging/SIGNING.md`.
