@@ -12,14 +12,14 @@
 > `Programs\Hearth` alive (`RemoveFolder` on the model folder, empty-only); and the
 > artifact glob would have shipped WiX's `.wixpdb`. `hearth-ui` is now a GUI-subsystem
 > binary whose children get `CREATE_NO_WINDOW`, so nothing flashes a console.
-> `.github/workflows/release.yml` builds on five runners, and its `workflow_dispatch`
-> dry run passes **five of five green**, uploading the five artifacts and stopping
-> before publish — nothing is tagged or published yet (operator call). That run also
-> caught a runner that no longer existed: `macos-13` retired in December 2025 and a
-> job on a retired label queues forever, so the Intel leg was `macos-15-intel` (the
-> last Intel image) and arm64 moved to `macos-15`; `ubuntu-latest` migrates to
-> Ubuntu 26 on 2026-10-19, so that leg is pinned to `ubuntu-24.04` to keep the
-> artifacts' glibc floor where it is. Finally, the six-model sweep on the
+> `.github/workflows/release.yml` builds on five runners, its `workflow_dispatch` dry
+> run passes **five of five green**, and on the operator's call **v0.2.0 is tagged and
+> published** — six assets plus `SHA256SUMS`, every one re-hashed against the sums and
+> the shipped MSI re-checked 14 of 14. That path also caught a runner that no longer
+> existed: `macos-13` retired in December 2025 and a job on a retired label queues
+> forever, so the Intel leg is `macos-15-intel` (the last Intel image) and arm64 moved
+> to `macos-15`; `ubuntu-latest` migrates to Ubuntu 26 on 2026-10-19, so that leg is
+> pinned to `ubuntu-24.04` to hold the artifacts' glibc floor where it is. Finally, the six-model sweep on the
 > **final** binary read 49.26 / 25.39 / 22.71 / 11.41 / 12.85 / 6.07 tok/s against a
 > 46.7 / 23.6 / 23.6 / 12.2 / 13.0 / 6.2 baseline — the small models *above*, the 4B/8B
 > rows below, with re-runs spreading ±10-20% and an instrumented run measuring the CLI
@@ -33,16 +33,18 @@ Packaging specifics: `packaging/windows/README.md`, `packaging/SIGNING.md`.
 
 ## Do these first
 
-1. **Close the release (needs the operator).** Ask before `git tag v0.2.0` and before
-   any publish — both are public and awkward to undo. The dry run is done: run
-   `39015532967` is **five of five green**, `publish` skipped, and all five artifacts
-   were downloaded and inspected (Windows `.zip` + `.msi` with no `.wixpdb`, both
-   `Hearth.app` architectures with `Info.plist` and `hearth.icns`, both Linux tarballs
-   with the `.desktop`, the icon and `models/README.txt`). What has *never* run is the
-   `publish` job itself — a tag push is the only way to exercise it, and it is the last
-   untested step in the release. Re-run
-   `gh workflow run release.yml -f version=v0.0.0-dry-run` after any packaging change;
-   it is 5 minutes and it is what caught the retired `macos-13` label.
+1. **The release is out — nothing pending.** `v0.2.0` is tagged at `dbec2a0` and public
+   on [the releases page](https://github.com/Eric-Lautanen/hearth/releases/tag/v0.2.0):
+   six assets plus `SHA256SUMS`, with the `publish` job exercised for the first time.
+   All six were re-downloaded and hashed against `SHA256SUMS` and the shipped MSI
+   passed `scripts/msi-query.ps1` 14 of 14, so the CI artifacts are verified, not just
+   uploaded. For the next release: bump the versions, `git tag -a vX.Y.Z`, push the tag,
+   then `gh run watch` — the dry run
+   (`gh workflow run release.yml -f version=v0.0.0-dry-run`) is only needed when the
+   packaging itself changed. Two facts to carry: the runners' Windows binaries are
+   ~1 MB larger than local ones (different rustc), so any measurement should name the
+   binary it measured; and the signing gates stay deliberately no-op until a certificate
+   exists, so Windows builds are unsigned and macOS bundles need right-click → Open.
 2. **Re-baseline the performance table on a quiet box** (see the sweep note above).
    Both the six-model rows in `docs/BUG_TRACKER.md` and the README's model table are
    from busier windows than they claim. Run each model alone, warm up, take the mean of

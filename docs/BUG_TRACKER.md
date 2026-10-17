@@ -76,6 +76,20 @@ Signing gates no-op'd exactly as designed (`WINDOWS_CERT_PFX_B64 is unset: ...`,
 `actions/upload-artifact@v5` still declares Node 20, so the deprecation annotation
 persists after the v4 → v5 bump.
 
+**Release v0.2.0 is published.** Tagged `v0.2.0` at `dbec2a0` and pushed; the
+workflow's `publish` job ran for the first time and succeeded, putting six assets and
+`SHA256SUMS` on
+`https://github.com/Eric-Lautanen/hearth/releases/tag/v0.2.0`. Every published asset
+was re-downloaded and hashed against `SHA256SUMS` (6 of 6 match), and the *shipped*
+MSI was put through `scripts/msi-query.ps1` — 14 of 14, `ProductVersion=0.2.0`, with
+the new `README.md` (12,953 bytes) inside the cabinet, so the CI build is the tree we
+verified rather than a stale copy. One difference worth knowing before quoting a
+number: the runners' Windows binaries are about **1 MB larger** than the local ones
+(`hearth-chat-cli.exe` 6,923,776 against 5,892,608; `hearth-ui.exe` 750,592 against
+747,008) because the runners use a different rustc — so a measurement should name the
+binary it measured, and the re-baseline below wants an artifact built the way CI
+builds.
+
 **Benchmark note — the six-model sweep is noisy on this box right now.** Final
 binary, 50 tokens, temp 0, one model at a time, after warm-up: 1.7B Q1_0 49.26,
 1.7B Q2_0 25.39, 4B Q1_0 22.71, 4B Q2_0 11.41, 8B Q1_0 12.85, 8B Q2_0 6.07
