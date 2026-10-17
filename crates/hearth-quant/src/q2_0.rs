@@ -143,10 +143,13 @@ pub fn dot_q2_0_q8_0(weight_row: &[u8], act_data: &[u8], n: usize) -> f32 {
 ///
 /// # Safety
 /// `w_ptr` must be valid for `n/128*34` bytes and `a_ptr` for `n/32*34` bytes;
-/// the caller must confirm AVX-512F and AVX-512VNNI are present.
+/// the caller must confirm AVX-512F, AVX-512VNNI and AVX-512VL are present.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "avx512vnni")]
+// The 256-bit EVEX VNNI intrinsic is `avx512vnni` *and* `avx512vl`; without VL
+// declared, LLVM cannot inline it and every `vpdpbusd` becomes a call.
+#[target_feature(enable = "avx512vl")]
 pub unsafe fn dot_q2_0_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     use core::arch::x86_64::*;
     let blocks = n / BLOCK_SIZE;
@@ -591,7 +594,7 @@ fn avx2_lut_available() -> bool {
     ok
 }
 
-/// Cached AVX-512 F + VNNI probe, the pair `vpdpbusd` needs.
+/// Cached AVX-512 F + VNNI + VL probe, the features `vpdpbusd` needs.
 ///
 /// The probe is a function rather than an inline condition precisely so that the dispatch
 /// and [`kernel_name`] cannot drift: both read this. The crate's own history is the
@@ -605,8 +608,11 @@ fn avx512_vnni_available() -> bool {
     if v < 2 {
         return v == 1;
     }
+    // VL is not optional here: the kernel uses the 256-bit EVEX form, and naming only
+    // F + VNNI let the intrinsic fall out of line (see the kernel's own attribute).
     let ok = std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512vnni");
+        && std::arch::is_x86_feature_detected!("avx512vnni")
+        && std::arch::is_x86_feature_detected!("avx512vl");
     STATE.store(if ok { 1 } else { 0 }, Ordering::Relaxed);
     ok
 }
