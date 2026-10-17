@@ -1,7 +1,77 @@
 # Hearth Performance Tracker — CPU Final State → GPU Planning
 
 ## System
-AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers. Ref: llama.cpp-prism.
+AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 10 workers (`min(logical, physical + physical/4)`, see the first entry). Ref: llama.cpp-prism.
+
+### The Q2_0 dispatch preferred a kernel 47% slower per thread — and the worker count had to follow the kernel (SparkOC, 2026-10-16 late)
+
+Fourth instance of the missing-declaration class, and the first where the consequence was a dispatch
+*order* rather than a dead kernel. `dot_q2_0_q8_0_ptr` preferred the 512-bit VNNI arm, with a comment
+saying `vpdpbusd` "cuts the front-end work enough to pay for the half-width datapath" and citing a
+warm-machine `benchk` table (3.10 VNNI512 / 3.09 VNNI256 / 2.91 LUT). That table was taken *before
+the LUT kernel's declarations were fixed* — it went 256 → 167 instructions in the change log — and a
+body that cannot inline is not the body that ships.
+
+Re-measured on real weights at the shipped `x86-64-v3` baseline:
+
+| model (`blk.0`, every tensor) | dispatched (VNNI512x2) | vnni256 | avx2_lut |
+| --- | --- | --- | --- |
+| dense 4B Q2_0 | 1.76 | 1.61 | **2.57** |
+| hybrid 4B PQ2_0 | 1.74 | 1.61 | **2.56** |
+
+`avx2_lut` leads on *every* tensor, and the two arms that are the same function (`dispatched` and
+`vnni512x2`) agree within 1%, so the ranking is not a position artifact. The earlier session saw the
+same v3 reading (2.51 against 1.70) and dismissed it as clock ramp-up because a `native` rerun
+reversed it — but we ship v3, and `native` changes the codegen of a body written in 256-bit
+intrinsics.
+
+Two things came off the same table besides the order. The 512-bit arm is now gated on
+`crate::avx512_full_width`, which is the gate PTQ1_0 already puts on its AVX-512 kernel — the change
+log's earlier entry had *removed* that gate from Q2_0, to keep Zen 4 off the AVX2 LUT kernel, and
+that is the decision this measurement reverses. The 256-bit VNNI arm now sits below the LUT arm,
+where it is the fallback for a part whose AVX2 probe fails rather than a live choice (every part with
+AVX-512F also has the AVX2, FMA and F16C that arm needs). On this box both gates skip it
+(`avx512_full_width=false`), so the banner still reads `Q2_0=avx2_lut`. **A full-width AVX-512 part
+(Intel) is unmeasured — the 512-bit arm keeps the slot it was written for, and that is the one
+question the calibration runner below is the answer to.**
+
+**The kernel and the worker count are one decision.** The LUT kernel decodes through a per-block
+table in L1, and when SMT siblings share a core that table competes with the weight stream, so a
+pool that oversubscribes the physical cores pays about 2x for it. Sweep of the hybrid
+`Ternary-Bonsai-2-4B-PQ2_0` (one run per point, then mirrored groups for 8 and 10):
+
+| workers | 4 | 6 | 8 | 10 | 12 |
+| --- | --- | --- | --- | --- | --- |
+| LUT kernel | 4.98 | 6.38 | 7.1–7.4 | **7.7–7.9** | 4.3–4.9 |
+| VNNI kernel | — | — | 6.2 | — | 7.1–7.6 |
+
+so the fast kernel's optimum moved *up* from the old rule (physical cores) to about a quarter past
+it, while 12 (1.5x) falls off the cliff either way. That is now one rule for both paths:
+`pool::default_worker_count()` = `min(logical, physical + physical/4)` = 10 here, with the hybrid
+keeping ¾-of-logical for `PTQ1_0`, which has no fast kernel and measures 6.7 at 12 against 5.9 at 8.
+
+End to end, mirrored (before = VNNI Q2_0 dispatch + 8 dense / 12 hybrid workers; after = LUT + the
+new counts):
+
+| model | before | after | Δ |
+| --- | --- | --- | --- |
+| Bonsai-1.7B-Q1_0 | 47.05 | 49.22 | +4.6% |
+| Ternary-Bonsai-1.7B-Q2_0 | 19.38 | 28.04 | **+44.6%** |
+| Bonsai-4B-Q1_0 | 21.50 | 23.61 | +9.8% |
+| Ternary-Bonsai-4B-Q2_0 | 8.68 | 12.72 | **+46.6%** |
+| Bonsai-8B-Q1_0 | 12.38 | 13.37 | +8.0% |
+| Ternary-Bonsai-8B-Q2_0 | 4.93 | 7.35 | **+49.1%** |
+| hybrid 4B PQ2_0 | 7.54 | 8.21 | +8.8% |
+| hybrid 4B PTQ1_0 | 7.19 | 7.07 | −1.7% (path byte-identical: noise) |
+
+The Q1_0 rows move on the worker count alone (their kernel is unchanged from the previous commit);
+the Q2_0 rows are kernel plus count. `kernel_name()` reports `avx2_lut` for both paths, so the
+`[kernel]` banner and the service's `kernels` JSON stay honest without a per-path variant.
+
+Lesson, four times in one day: **a dispatch order is a measurement, and a measurement of a body that
+cannot inline is not a measurement of the body that ships.** The guard now covers the test target as
+well as the library (see the entry below), and the coupling above is what the calibration runner
+exists to remove (`docs/RESUME.md`).
 
 ### The kernel-baseline guard only built the library, so a test-only kernel was never checked (SparkOC, 2026-10-16 late)
 

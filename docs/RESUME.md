@@ -1,5 +1,25 @@
 # Hearth — next session
 
+> **Session 2026-10-16 (pt 18) in one paragraph.** The Q2_0 dispatch was preferring the *slower*
+> kernel — the fourth instance in a day of the same cause: a body whose `#[target_feature]` list was
+> incomplete when its dispatch order was decided. `dot_q2_0_q8_0_ptr` led with the 512-bit VNNI arm
+> on the strength of a `benchk` table taken *before* the AVX2 LUT kernel's declarations were fixed
+> (256 → 167 instructions in the change log). Re-measured on real weights at the v3 baseline we ship,
+> `avx2_lut` reads **2.56–2.57 GB/s against 1.74–1.76** for the VNNI pair, on every tensor of two
+> models, with the two arms that are the same function agreeing within 1%. The 512-bit arm went back
+> behind `crate::avx512_full_width` (the gate PTQ1_0 already uses; the earlier entry had removed it),
+> so a full-width AVX-512 part is the one case this measurement does not cover. Fixing the order
+> exposed a coupling the old per-path counts had hidden: **the kernel and the worker count are one decision** —
+> the LUT kernel's L1 table loses ~2x when SMT siblings share a core, so the fast kernel's optimum
+> moved from physical cores to about a quarter past them (10 here; 12 collapses to 5.8), and the
+> hybrid's ¾-of-logical was an artifact of the slow kernel it was measured against. One rule now:
+> `min(logical, physical + physical/4)`, with the hybrid keeping ¾-of-logical for `PTQ1_0`, which has
+> no fast kernel to be hurt by oversubscription. End to end, mirrored: **Q2_0 +44.6 / +46.6 / +49.1%**
+> (1.7B/4B/8B), Q1_0 +4.6 / +9.8 / +8.0% (the count alone), hybrid PQ2_0 +8.8%, hybrid PTQ1_0
+> unchanged. Also: the `kernel-baseline` CI job now builds the *test* target too, because a
+> `#[cfg(test)]` kernel is one the library build never sees — which is exactly where the Q1_0 VNNI
+> kernel hid.
+
 > **Session 2026-10-16 (pt 17) in one paragraph.** Two things landed, both found by measuring rather
 > than by reading. (1) The dispatch wait no longer spins through the whole wait:
 > `ThreadPool::wait_for_workers` spins for `SPIN_BUDGET` and then yields, worth +15–25% wherever the
@@ -7,7 +27,8 @@
 > 12; hybrid `Ternary-Bonsai-2-4B-PQ2_0` 5.2 → 6.4 at 8) and neutral at the default. That **closes**
 > the carry-over item that wanted the dispatching thread to take a chunk instead of waiting: the
 > remaining cliff is memory bandwidth and SMT sharing, not a starved worker, so the per-path counts
-> stand. (2) **aarch64 became a gated platform, and it had never been built.** One
+> stand. *(pt 18: they did not — the cliff is kernel-dependent, and both counts moved once the kernels
+> got faster.)* (2) **aarch64 became a gated platform, and it had never been built.** One
 > `cargo check --target aarch64-unknown-linux-gnu --workspace --all-targets` showed `hearth-tls` did
 > not compile there at all — AES-NI and PCLMUL calls reached from branches gated only on the runtime
 > probe, naming modules that exist only on x86_64 — and `hearth-quant` had six dead-code warnings
@@ -24,7 +45,7 @@
 > 4–6.6% faster than shuffle in L1, +6% per tensor on real weights (`benchk`), and +4.5% / +2.7% /
 > +3.6% end to end on the 1.7B / 4B / 8B Q1_0. Dispatched, with the guard now covering it.
 
-## Do these first (carry-over from pt 17)
+## Do these first (carry-over from pt 18)
 
 1. **aarch64 runs, and it is slow by construction: there is no SIMD backend for it.** Every
    dispatched kernel there is the scalar fallback, and `arm-qemu-test` is the only thing that has
@@ -34,26 +55,38 @@
    timing is not). The two shapes that suit NEON best are the `Q2V_U8` LUT dot — `vqtbl` is a table
    lookup in one instruction, which is exactly what that kernel is — and the f32 glue in
    `hearth-llm/src/ops.rs`.
-2. **Keep the per-path worker counts; do not collapse them without an interleaved pair.** Dense
-   `pool::default_worker_count()` (physical cores) and the hybrid's ¾-of-logical are each the
-   measured optimum on the same box: dense 8B Q1_0 wants 8, dense `Ternary-Bonsai-4B-Q2_0` wants 12
-   (9.8–10.8 against 8.1), hybrid wants 12 (7.4–7.9 against 6.3–6.5). `HEARTH_THREADS` overrides
-   both.
-3. **The `benchk`-driven per-CPU calibration runner is still the unfinished half of Goal 1.** The
-   idea: record the winning kernel per dtype *on this machine* and feed the dispatch from that
-   record, replacing microarch predicates with a measurement. `benchk` already prints every arm's
-   GB/s and the CPUID decode; what it does not do is persist a winner or refuse a bad one. The hazard
-   it exists to fix is real: `benchk` ranks invert on noise (one v3 run ranked `avx2_lut` 2.51 ahead
-   of `vnni512x2` 1.70; the native rerun gave 1.35 against 1.68), so any calibration has to warm up,
-   take a minimum over several passes, and refuse to switch on a difference inside the noise band.
-4. **All three Q2_0 rows read ~36% under the 2026-10-15 chart in every sweep — assume noise before
-   code.** v3 is not the cause: interleaved against the native binary, `Ternary-Bonsai-4B-Q2_0` is
-   10.41 native against 8.15 v3 at 8 workers and 10.3 v3 at 12, i.e. equal once thread counts match.
-5. **Goal 2 still open:** the `hearth-ui` model downloader (`GET /api/downloads`, single active
-   download with `.part` + atomic rename, `POST /api/downloads/{start,cancel}`, size-polling or SSE
-   progress, catalog overridable via `models/catalog.json` or `HEARTH_MODEL_CATALOG_JSON`); README
-   screenshots; and `resources/hearth.svg`'s flame is still not vertically centred (rasterize to
-   check).
+2. **The worker count follows the kernel; re-measure both together, never one alone.** As of pt 18 the
+   dense path *and* the hybrid's `Q2_0`/`PQ2_0` weights use `min(logical, physical + physical/4)` (10
+   here), and the hybrid's `PTQ1_0` keeps ¾-of-logical (12: measured 6.7 against 5.9 at 8). The two
+   rules disagree because the kernels do — `q1_0g128` VNNI and `q2_0` LUT are 6–47% faster than the
+   arms they replaced, and a fast kernel is *hurt* by oversubscription (12 workers on the LUT kernel
+   reads 5.8 tok/s against 12.5 at 10) while a slow one hides the pool's barrier behind more threads.
+   So any future kernel change owes a count sweep with it, and any count change owes an interleaved
+   pair: the earlier "dense wants 8, hybrid wants 12" rule was correct for the kernels it was measured
+   against and wrong for the ones that shipped. `HEARTH_THREADS` still overrides everything.
+3. **The `benchk`-driven per-CPU calibration runner is still the unfinished half of Goal 1, and pt 18
+   says what it has to model.** It is no longer just "pick the winning kernel per dtype": the kernel
+   and the worker count are one decision (item 2), so the record has to be a (kernel, count) pair per
+   dtype per path, and it has to *refuse* to switch on a difference inside the noise band. `benchk`
+   already prints every arm's GB/s and the CPUID decode, with a 300 ms warm-up per arm and a minimum of
+   two passes; what it does not do is persist a winner, sweep the count, or refuse. The hazard is real
+   and was misread once: a v3 run that ranked `avx2_lut` 2.51 ahead of `vnni512x2` 1.70 was dismissed
+   as clock ramp-up because a `native` rerun reversed it — but the v3 reading was right, and `native`
+   was measuring different codegen for the same source. **A baseline is part of the measurement; only
+   compare within one.**
+4. **Closed in pt 18: the Q2_0 rows were not noise — the dispatch was choosing the slower kernel, and
+   the thread count had been tuned to it.** They are now *above* the 2026-10-15 chart
+   (+44.6/+46.6/+49.1%), so the "~36% under, assume noise" reading is retired. The lesson to keep:
+   three sweeps of the same regression looked like drift because the explanation ("machine state plus
+   the thread count") was plausible, and the measurement that would have falsified it — the kernel arms
+   themselves, on real weights — was in `benchk` the whole time.
+5. **Goal 2 is essentially closed; one cosmetic item is left.** The downloader is implemented and
+   verified live (`GET /api/downloads` returns the catalog with per-model `state`/`downloaded_bytes`
+   and HuggingFace URLs; `/api/downloads/start` and `/cancel` queue one file at a time; the drawer in
+   `web/index.html` has checkboxes, per-item progress, resume and an add-a-URL box), and both README
+   screenshots are in `docs/screenshots/`. Left: `resources/hearth.svg`'s flame is still not vertically
+   centred (rasterize to check), and the screenshots predate the 2026-10-16 UI commits, so re-shoot
+   them the next time the UI changes.
 6. **GPU scaffolding (Goal 1, still not started):** opt-in behind `--device`/env, graceful when no
    ROCm device exists, and it must not break the CPU path or the Windows/macOS builds. The aarch64
    cross-check now guards the last of those three for the ARM half.

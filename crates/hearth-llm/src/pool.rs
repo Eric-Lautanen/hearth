@@ -96,19 +96,24 @@ const IDLE_WAIT: Duration = Duration::from_millis(100);
 
 /// Machine-derived worker count for the **dense** forward path.
 ///
-/// Honors `HEARTH_THREADS` first. Otherwise it uses the *physical* core count:
-/// the dots are memory-bandwidth bound, so SMT siblings mostly steal bandwidth
-/// from each other and from the spinning main thread. Backing off from the
-/// logical count is not enough, because the loss is a cliff rather than a slope.
-/// Measured on an 8C/16T box, the dense 8B Q1_0 runs 12.1 tok/s at 8 workers and
-/// 12.0 at 10, but 6.0 at 12 and 4.0 at 16. `std` only reports the logical count,
-/// so the SMT width comes from CPUID on x86_64 and the logical count is the
-/// fallback everywhere else.
+/// Honors `HEARTH_THREADS` first. Otherwise it uses the *physical* core count plus
+/// a quarter: the dots are memory-bandwidth bound, so SMT siblings steal bandwidth
+/// from each other, but the main thread is serial while the workers run (it
+/// quantizes the activations and drives the block), so a few spare threads keep the
+/// matmuls saturated. The loss past that is a cliff rather than a slope, which is
+/// why the rule stops well short of the logical count.
 ///
-/// The hybrid path keeps its own, *higher* count on purpose: it was measured to
-/// want more threads than physical cores on the same box, so one shared number
-/// would cost about 2x on whichever path it did not suit. See the comment at its
-/// `ThreadPool::new` in `model/qwen35.rs`.
+/// Re-measured on an 8C/16T box after the Q1_0 VNNI and Q2_0 LUT dispatches landed
+/// (both kernels are 6-47% faster, so the old physical-core optimum had moved):
+/// dense 8B Q1_0 reads 13.0 tok/s at 10 workers against 11.3 at 8, dense 1.7B Q1_0
+/// 49.3 against 46.9, dense 4B Q2_0 12.5 against 11.2, while 12 workers collapses
+/// to 5.8. `std` only reports the logical count, so the SMT width comes from CPUID
+/// on x86_64 and the logical count is the fallback everywhere else.
+///
+/// The hybrid path shares this rule for its `Q2_0`/`PQ2_0` weights and keeps its
+/// own, higher count for `PTQ1_0`, which has no fast kernel to be hurt by
+/// oversubscription. See the comment at its `ThreadPool::new` in
+/// `model/qwen35.rs`.
 pub fn default_worker_count() -> usize {
     if let Ok(v) = std::env::var("HEARTH_THREADS") {
         if let Some(n) = v.parse::<usize>().ok().filter(|n| *n > 0) {
@@ -118,7 +123,10 @@ pub fn default_worker_count() -> usize {
     let logical = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    physical_cores(logical)
+    let physical = physical_cores(logical);
+    // A quarter more than the physical count, never past the logical count: a
+    // machine without SMT has no spare threads to add.
+    (physical + physical / 4).min(logical)
 }
 
 /// Physical (non-SMT) core count, when the CPU will say.

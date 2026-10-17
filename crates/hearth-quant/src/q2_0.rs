@@ -597,8 +597,9 @@ fn avx2_lut_available() -> bool {
 }
 
 /// Cached probe for the 512-bit two-sub-block kernel, which additionally needs AVX-512DQ
-/// for `vextracti64x4`. Checked first by both callers, so the wider kernel wins where it
-/// can run at all.
+/// for `vextracti64x4`. The dispatch and `kernel_name` both pair it with
+/// [`crate::avx512_full_width`], so the wider kernel wins only where the datapath is
+/// genuinely wide.
 #[cfg(target_arch = "x86_64")]
 fn avx512_vnni_2sub_available() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -612,7 +613,8 @@ fn avx512_vnni_2sub_available() -> bool {
     ok
 }
 
-/// Raw-pointer dispatch: AVX-512 VNNI > AVX2 LUT > SSE4.1 LUT > scalar.
+/// Raw-pointer dispatch: full-width AVX-512 VNNI > AVX2 LUT > AVX-512 VNNI > SSE4.1 LUT >
+/// scalar.
 ///
 /// Every gate here is a **runtime** probe. There were `#[cfg(target_feature = …)]`
 /// attributes on the AVX-512 arms as well, and they were worse than redundant: they made a
@@ -627,26 +629,41 @@ pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
     #[cfg(target_arch = "x86_64")]
     {
         // AVX-512 512-bit VNNI: two sub-blocks (64 elements) per iteration, which needs
-        // `avx512dq` for `vextracti64x4` on top of AVX-512F + VNNI. Allowed on Zen 4:
-        // `vpdpbusd` cuts the front-end work enough to pay for the half-width datapath —
-        // over a 4B PQ2_0 `blk.0` row set (`benchk <model> pq2_0`) the aggregate led the
-        // 256-bit form by 3.10 vs 3.09 GB/s and the AVX2 LUT kernel by 3.09 vs 2.91 on a
-        // warm machine (2026-06). Re-measured cold on the same box it leads the same way
-        // and by more (1.59 vs 1.30 GB/s vs `avx2_lut`, 1.62 dispatched), which is why the
-        // ordering here is not in doubt even though the absolute figures move with clock
-        // ramp-up.
-        if avx512_vnni_2sub_available() {
+        // `avx512dq` for `vextracti64x4` on top of AVX-512F + VNNI. It keeps the first slot
+        // only where the datapath is genuinely 512 bits wide - the gate PTQ1_0 already puts on
+        // its AVX-512 kernel (`crate::avx512_full_width`) - because on a split one (Zen 4,
+        // family 19h) the wide form is two halves and loses the measurement below by 45%. The
+        // old order had this arm ungated, and that came from the same broken table as the rest
+        // of it.
+        if crate::avx512_full_width() && avx512_vnni_2sub_available() {
             return dot_q2_0_q8_0_vnni_avx512_2sub(w_ptr, a_ptr, n);
         }
-        // AVX-512 256-bit VNNI: `vpdpbusd` replaces the cvtepi8+madd pair. Gated on the
-        // VNNI features only, for the reason above: on Zen 4 it beats the AVX2 LUT kernel
-        // despite the same double-pumped datapath.
+        // AVX2 LUT next, because on real weights at the baseline this crate ships
+        // (`x86-64-v3`) it is the fastest arm by a wide margin: over the seven `blk.0`
+        // tensors of a dense 4B Q2_0 and the six of a hybrid 4B PQ2_0 it reads **2.56-2.57
+        // GB/s single-threaded against 1.74-1.76** for the VNNI pair, on *every* tensor, and
+        // the two arms that are the same function (`dispatched` and `vnni512x2`) agree
+        // within 1%, so the ranking is not a position artifact. End to end that is **+45 to
+        // +49% on all three dense Q2_0 models** (mirrored A/B, every group): +31% of it from
+        // the kernel alone and the rest from the worker count, which has to follow the kernel
+        // - see `pool::default_worker_count`. This is the arm that runs on a split-datapath
+        // part, which is the one the measurement is from.
+        //
+        // The order used to be the reverse, from a measurement taken *before the LUT kernel's
+        // declarations were fixed* - it went 256 -> 167 instructions in the change log. A body
+        // that cannot inline is not the body that ships, which is the same lesson as the Q1_0
+        // VNNI kernel in `q1_0g128` and the third instance of it in one day.
+        if avx2_lut_available() {
+            return dot_q2_0_q8_0_lut_avx2(w_ptr, a_ptr, n);
+        }
+        // AVX-512 256-bit VNNI: `vpdpbusd` replaces the cvtepi8+madd pair. Below the LUT arm
+        // this is a fallback for a part whose AVX2 probe fails rather than a live choice - every
+        // part that has AVX-512F also has the AVX2, FMA and F16C that arm needs - so it is kept
+        // as the honest end of the feature ladder, not as a ranking.
         if crate::avx512_vnni_available() {
             return dot_q2_0_q8_0_vnni_avx512(w_ptr, a_ptr, n);
         }
-        if avx2_lut_available() {
-            dot_q2_0_q8_0_lut_avx2(w_ptr, a_ptr, n)
-        } else if std::arch::is_x86_feature_detected!("sse4.1") {
+        if std::arch::is_x86_feature_detected!("sse4.1") {
             dot_q2_0_q8_0_ptr_sse41(w_ptr, a_ptr, n)
         } else {
             dot_q2_0_q8_0_ptr_scalar(w_ptr, a_ptr, n)
@@ -663,21 +680,18 @@ pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
 /// Reports the choice by *calling the same probes in the same order*, so it cannot
 /// disagree with the dispatch — a restated predicate is a predicate that can drift, and the
 /// previous version went further and wrapped the restatement in `cfg(target_feature)`,
-/// which made the report a function of the build machine too. Note the VNNI entries are
-/// deliberately *not* gated on [`crate::avx512_full_width`]: `vpdpbusd` cuts enough
-/// front-end work to beat the AVX2 LUT kernel even on a double-pumped Zen 4 datapath. See
-/// [`crate::selected_kernel`].
+/// which made the report a function of the build machine too. See [`crate::selected_kernel`].
 pub fn kernel_name() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        if avx512_vnni_2sub_available() {
+        if crate::avx512_full_width() && avx512_vnni_2sub_available() {
             return "vnni512x2";
-        }
-        if crate::avx512_vnni_available() {
-            return "vnni256";
         }
         if avx2_lut_available() {
             return "avx2_lut";
+        }
+        if crate::avx512_vnni_available() {
+            return "vnni256";
         }
         if std::arch::is_x86_feature_detected!("sse4.1") {
             return "sse41_lut";
@@ -704,12 +718,12 @@ mod tests {
             let f = std::arch::is_x86_feature_detected!("avx512f");
             let vnni = std::arch::is_x86_feature_detected!("avx512vnni");
             let dq = std::arch::is_x86_feature_detected!("avx512dq");
-            let expected = if f && vnni && dq {
+            let expected = if crate::avx512_full_width() && f && vnni && dq {
                 "vnni512x2"
-            } else if f && vnni {
-                "vnni256"
             } else if avx2_lut_available() {
                 "avx2_lut"
+            } else if f && vnni {
+                "vnni256"
             } else if std::arch::is_x86_feature_detected!("sse4.1") {
                 "sse41_lut"
             } else {
