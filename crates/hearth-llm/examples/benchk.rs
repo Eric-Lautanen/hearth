@@ -102,6 +102,16 @@ fn make_variants(dtype: GgmlDType) -> Vec<(&'static str, DotFn)> {
                 ));
             }
         }
+        if matches!(dtype, GgmlDType::Q1_0 | GgmlDType::Q10G128)
+            && have("avx512f")
+            && have("avx512vnni")
+            && have("avx512vl")
+        {
+            v.push((
+                "vnni256",
+                hearth_quant::q1_0g128::dot_q1_0g128_q8_0_vnni_avx512,
+            ));
+        }
         v
     }
     #[cfg(not(target_arch = "x86_64"))]

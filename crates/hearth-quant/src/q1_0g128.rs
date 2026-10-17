@@ -505,21 +505,29 @@ pub unsafe fn dot_q1_0g128_q8_0x2_ptr(
 /// Uses shuffle's SIMD bit expansion to get sign-corrected activations `sy`,
 /// then replaces maddubs+madd with a single vpdpbusd: dpbusd(1, sy) = Σ sy_i.
 ///
-/// NOTE: Not dispatched by default — ~33% regression on Zen 4 vs shuffle.
-/// vpdpbusd saves 1 μop per sub-block but LUT stores + 512-bit double-pumping
-/// add more overhead than the shuffle kernel's SIMD-only pipeline.
-/// Keep for future CPUs with native 512-bit VNNI units.
+/// **Dispatched** ahead of the shuffle kernel: 4–7% faster in L1
+/// (`bench_q1_0_vnni_vs_shuffle`) and +6% on real weights (`benchk`, all seven tensors of
+/// the 1.7B Q1_0: 3.35 GB/s against 3.16), which is worth +6.5% / +3.7% / +3.9% end to end
+/// on the 1.7B / 4B / 8B Q1_0 models. It used to be `#[cfg(test)]` with a note claiming a
+/// "~33% regression": that figure was measured at a `native` baseline, where the intrinsic
+/// still inlined. At the shipped `x86-64-v3` baseline the body was missing `avx512vl` and
+/// `fma`, so `_mm256_dpbusd_epi32` and every `_mm256_fmadd_ps` were out-of-line calls and
+/// the kernel measured +180% instead. Declare the features and it wins.
 ///
-/// `#[cfg(test)]` because its only consumer is `bench_q1_0_vnni_vs_shuffle`, which is what
-/// keeps the rejection above a measurement rather than a memory: the kernel stays compiled
-/// where it is measured and out of a shipped binary, which is also why there is no
-/// `#[allow(dead_code)]` here. Re-dispatching it means removing this line, on purpose.
-#[cfg(test)]
+/// # Safety
+/// Same contract as the other kernels in this file: `w_ptr` valid for `n/128*18` bytes and
+/// `a_ptr` for `n/32*34`, with `n` a multiple of 128.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "avx512vnni")]
-unsafe fn dot_q1_0g128_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
+// The 256-bit EVEX form (`_mm256_dpbusd_epi32`) is AVX-512VL, not AVX-512F: without this the
+// intrinsic cannot inline into the body and the kernel runs as per-instruction calls, which
+// measured +180% against shuffle instead of the ~33% recorded at a `native` baseline.
+#[target_feature(enable = "avx512vl")]
+// `_mm256_fmadd_ps` is FMA, which `avx2` does not imply.
+#[target_feature(enable = "fma")]
+pub unsafe fn dot_q1_0g128_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     let q1_blocks = n / 128;
     let ones_8 = _mm256_set1_epi8(1);
     let zero = _mm256_setzero_si256();
@@ -586,16 +594,22 @@ unsafe fn dot_q1_0g128_q8_0_vnni_avx512(w_ptr: *const u8, a_ptr: *const u8, n: u
 /// Uses LUT-based sign mask expansion (Q1V_SM) for xor/sub sign correction,
 /// then _mm512_dpbusd_epi32(ones, sy) = Σ sy_i. Requires avx512dq for vextracti64x4.
 ///
-/// NOTE: Not dispatched by default — ~33% regression on Zen 4 vs shuffle.
-/// LUT stores + 512-bit double-pumping outweigh loop-count reduction.
+/// NOTE: Not dispatched by default — slower than the shuffle kernel on Zen 4 (re-measured
+/// with the declarations below fixed, see `bench_q1_0_vnni_vs_shuffle`). LUT stores +
+/// 512-bit double-pumping outweigh the loop-count reduction.
 ///
 /// `#[cfg(test)]` for the same reason as its 256-bit sibling: measured by a test, never
 /// dispatched, so it does not belong in a shipped binary.
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "avx512vnni")]
 #[target_feature(enable = "avx512dq")]
+// Its 256-bit halves are FMA (`_mm256_fmadd_ps`), which `avx2` does not imply. Undeclared,
+// the five fmadds per block were out-of-line calls and the kernel measured +345% against
+// shuffle rather than the ~33% recorded at a `native` baseline.
+#[target_feature(enable = "fma")]
 unsafe fn dot_q1_0g128_q8_0_vnni_avx512_2sub(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     let q1_blocks = n / 128;
     let ones_8 = _mm512_set1_epi8(1);
@@ -964,7 +978,9 @@ fn avx2_kernel_available() -> bool {
 pub fn kernel_name() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        if avx2_kernel_available() {
+        if crate::avx512_vnni_available() {
+            "vnni256"
+        } else if avx2_kernel_available() {
             "avx2"
         } else {
             "sse41"
@@ -977,7 +993,6 @@ pub fn kernel_name() -> &'static str {
 }
 
 /// Dispatch: dot_q1_0g128_q8_0 using raw pointers (no slice bounds checks).
-/// Uses shuffle-based AVX2 kernel (no LUT, avoids L1 cache pressure).
 /// # Safety
 /// Both pointers must be valid for n/128*18 (w_ptr) and n/32*34 (a_ptr) bytes.
 /// n must be a multiple of 128.
@@ -985,7 +1000,14 @@ pub fn kernel_name() -> &'static str {
 pub unsafe fn dot_q1_0g128_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if avx2_kernel_available() {
+        // The VNNI kernel is 6% ahead of the shuffle kernel on real weights (`benchk`, all
+        // seven tensors of the 1.7B Q1_0: 3.35 GB/s against 3.16) and 4–7% ahead in L1. The
+        // ~33% regression that used to keep it out of the dispatch was measured with
+        // `avx512vl`/`fma` missing from the body, which is exactly the out-of-line-call bug
+        // the rest of this file documents.
+        if crate::avx512_vnni_available() {
+            dot_q1_0g128_q8_0_vnni_avx512(w_ptr, a_ptr, n)
+        } else if avx2_kernel_available() {
             dot_q1_0g128_q8_0_ptr_avx2(w_ptr, a_ptr, n)
         } else {
             dot_q1_0g128_q8_0_ptr_sse41(w_ptr, a_ptr, n)
@@ -1290,6 +1312,8 @@ mod tests {
     fn bench_q1_0_vnni_vs_shuffle() {
         if !std::arch::is_x86_feature_detected!("avx512f")
             || !std::arch::is_x86_feature_detected!("avx512vnni")
+            // The 256-bit arm is AVX-512VL, and the benchmark below runs it unconditionally.
+            || !std::arch::is_x86_feature_detected!("avx512vl")
         {
             eprintln!("Skipping VNNI benchmark (no AVX-512 VNNI)");
             return;

@@ -16,7 +16,13 @@
 > (three aarch64 targets, check + clippy `-D warnings`, no linker needed) and `arm-qemu-test` (the
 > CPU-only suites linked and *run* under `qemu-user` — the first execution of the aarch64 scalar
 > fallback anywhere, `pool::tests::physical_cores_is_always_a_usable_count` included). Run
-> `38988216344`: 8/8 green. Commits `5fd87ed` (pool), `7a918ad` (aarch64).
+> `38988216344`: 8/8 green. Commits `5fd87ed` (pool), `7a918ad` (aarch64). (3) **The Q1_0 VNNI kernel
+> had never been dispatched, for the same reason as (1) of the previous session.** `q1_0g128`'s
+> 256-bit VNNI kernel was `#[cfg(test)]` behind a "~33% regression on Zen 4" note that was measured at
+> a `native` baseline, where the intrinsic still inlined; at the v3 baseline we ship it was missing
+> `avx512vl` and `fma`, so it measured +180% and nobody re-measured. With the declarations fixed it is
+> 4–6.6% faster than shuffle in L1, +6% per tensor on real weights (`benchk`), and +4.5% / +2.7% /
+> +3.6% end to end on the 1.7B / 4B / 8B Q1_0. Dispatched, with the guard now covering it.
 
 ## Do these first (carry-over from pt 17)
 
@@ -51,6 +57,12 @@
 6. **GPU scaffolding (Goal 1, still not started):** opt-in behind `--device`/env, graceful when no
    ROCm device exists, and it must not break the CPU path or the Windows/macOS builds. The aarch64
    cross-check now guards the last of those three for the ARM half.
+7. **A/B protocol — mirror the order.** On this box the second run in a pair is worth ~2–3%, so plain
+   `before, after` pairs invent a win: today's first pass read +6.5% / +3.7% / +3.9% and the
+   order-mirrored re-run read +4.5% / +2.7% / +3.6%. Use `b,a,a,b` and `a,b,b,a` groups, compare
+   **group means**, and never compare across windows — the absolute level drifts ~10% over an hour.
+   The CLI's 50-token run has a ±5% spread on its own; one transient group in the 4B read 18.0 tok/s
+   where every other group read 21–22.
 
 ## Earlier sessions — the history lives in `docs/BUG_TRACKER.md`
 

@@ -119,6 +119,29 @@ pub(crate) fn avx512_full_width_for(
     has_avx512f && has_avx512bw && !(is_amd && family == AMD_FAMILY_SPLIT_AVX512)
 }
 
+/// Cached AVX-512 F + VNNI + VL probe: the features `vpdpbusd` needs in its 256-bit
+/// EVEX form, which is what both the Q2_0 and the Q1_0_G128 VNNI kernels use.
+///
+/// A function rather than an inline condition precisely so that the dispatch and the
+/// matching `kernel_name` cannot drift — and shared between the two formats rather than
+/// copied, for the same reason. VL is not optional: naming only F + VNNI let the intrinsic
+/// fall out of line in *both* kernels, and in `q1_0g128` that showed up as a kernel that
+/// measured +180% against the shuffle path and was therefore never dispatched.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn avx512_vnni_available() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(2); // 2 = unknown
+    let v = STATE.load(Ordering::Relaxed);
+    if v < 2 {
+        return v == 1;
+    }
+    let ok = std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512vnni")
+        && std::arch::is_x86_feature_detected!("avx512vl");
+    STATE.store(if ok { 1 } else { 0 }, Ordering::Relaxed);
+    ok
+}
+
 /// Reads a CPUID leaf.
 ///
 /// An `unsafe fn` wrapper rather than a direct call, because `__cpuid`'s safety is a

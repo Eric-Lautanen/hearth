@@ -596,29 +596,6 @@ fn avx2_lut_available() -> bool {
     ok
 }
 
-/// Cached AVX-512 F + VNNI + VL probe, the features `vpdpbusd` needs.
-///
-/// The probe is a function rather than an inline condition precisely so that the dispatch
-/// and [`kernel_name`] cannot drift: both read this. The crate's own history is the
-/// argument — a gate that answered "no" on every machine here cost 34% on PTQ1_0 and was
-/// invisible in everything a user or a benchmark printed.
-#[cfg(target_arch = "x86_64")]
-fn avx512_vnni_available() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(2); // 2 = unknown
-    let v = STATE.load(Ordering::Relaxed);
-    if v < 2 {
-        return v == 1;
-    }
-    // VL is not optional here: the kernel uses the 256-bit EVEX form, and naming only
-    // F + VNNI let the intrinsic fall out of line (see the kernel's own attribute).
-    let ok = std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512vnni")
-        && std::arch::is_x86_feature_detected!("avx512vl");
-    STATE.store(if ok { 1 } else { 0 }, Ordering::Relaxed);
-    ok
-}
-
 /// Cached probe for the 512-bit two-sub-block kernel, which additionally needs AVX-512DQ
 /// for `vextracti64x4`. Checked first by both callers, so the wider kernel wins where it
 /// can run at all.
@@ -630,7 +607,7 @@ fn avx512_vnni_2sub_available() -> bool {
     if v < 2 {
         return v == 1;
     }
-    let ok = avx512_vnni_available() && std::arch::is_x86_feature_detected!("avx512dq");
+    let ok = crate::avx512_vnni_available() && std::arch::is_x86_feature_detected!("avx512dq");
     STATE.store(if ok { 1 } else { 0 }, Ordering::Relaxed);
     ok
 }
@@ -664,7 +641,7 @@ pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
         // AVX-512 256-bit VNNI: `vpdpbusd` replaces the cvtepi8+madd pair. Gated on the
         // VNNI features only, for the reason above: on Zen 4 it beats the AVX2 LUT kernel
         // despite the same double-pumped datapath.
-        if avx512_vnni_available() {
+        if crate::avx512_vnni_available() {
             return dot_q2_0_q8_0_vnni_avx512(w_ptr, a_ptr, n);
         }
         if avx2_lut_available() {
@@ -696,7 +673,7 @@ pub fn kernel_name() -> &'static str {
         if avx512_vnni_2sub_available() {
             return "vnni512x2";
         }
-        if avx512_vnni_available() {
+        if crate::avx512_vnni_available() {
             return "vnni256";
         }
         if avx2_lut_available() {

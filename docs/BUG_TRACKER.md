@@ -3,6 +3,47 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers. Ref: llama.cpp-prism.
 
+### The Q1_0 VNNI kernel was never dispatched because of the same missing-declaration bug — and it is 6% faster (SparkOC, 2026-10-16 late)
+
+`hearth-quant/src/q1_0g128.rs` carried a 256-bit VNNI kernel as `#[cfg(test)]` with a note claiming a
+"~33% regression on Zen 4 vs shuffle — keep for future CPUs with native 512-bit VNNI units". That
+figure was measured at a `native` baseline, where `_mm256_dpbusd_epi32` still inlined. At the
+`x86-64-v3` baseline we ship, the body declared `avx2` + `avx512f` + `avx512vnni` but **not**
+`avx512vl` (the 256-bit EVEX form) or `fma` (`_mm256_fmadd_ps`), so the intrinsic and every fmadd
+were out-of-line calls. Third instance of the same bug class in one day.
+
+Against the shuffle kernel, from the kernel's own benchmark test:
+
+| arm | n=2048 | n=4096 | n=6144 | n=9728 |
+| --- | --- | --- | --- | --- |
+| VNNI256 as it was (no VL, no FMA) | +178% | +185% | +189% | +190% |
+| VNNI256, declarations fixed | **−3.8%** | **−6.6%** | **−5.2%** | **−4.2%** |
+| VNNI512 2-sub (AVX2 + FMA added) | +337% | +348% | +356% | +345% |
+
+The 512-bit kernel stays out — double-pumping is real — but the 256-bit one is *faster*, so it is
+now dispatched ahead of shuffle, behind `crate::avx512_vnni_available()` (moved from `q2_0` into
+`lib.rs` so both formats and both `kernel_name`s read one probe). Real weights agree: `benchk` on
+the 1.7B Q1_0, all seven `blk.0.` tensors, **3.35 GB/s against 3.16** for shuffle, +6% on every
+tensor. End to end, interleaved against the previous binary, group means:
+
+| model | before | after | change |
+| --- | --- | --- | --- |
+| Bonsai-1.7B-Q1_0 | 45.66 / 43.94 / 43.27 / 42.47 | 47.33 / 45.10 / 45.11 / 45.52 | **+4.5%** (4 groups, 8 runs/arm) |
+| Bonsai-4B-Q1_0 | 22.42 / 22.13 / 18.02 / 20.53 / 21.31 / 21.27 | 22.88 / 21.72 / 21.76 / 21.32 / 21.93 / 21.85 | **+2.7% median** (one group caught a transient) |
+| Bonsai-8B-Q1_0 | 11.45 / 11.88 / 11.89 / 12.06 | 12.12 / 12.25 / 12.30 / 12.31 | **+3.6%** (4 groups, 8 runs/arm) |
+| Ternary-Bonsai-4B-Q2_0 | 8.97 / 8.93 | 9.33 / 8.77 | noise, as it should be — that path did not change |
+
+**Method note, because it cost an hour.** The first pass ran `before` then `after` inside each pair
+and read +6.5% / +3.7% / +3.9%. Re-running the two binaries against each other with the order
+*mirrored* (`b,a,a,b` groups and `a,b,b,a` groups) shrank every number to the ones above: on this
+box the second run in a pair is worth ~2–3%, so an unmirrored A/B invents a win. The unit is the
+group mean, and every group here is order-mirrored.
+
+`hearth-quant`'s 42 tests pass with it dispatched and the VNNI sums are bit-identical to shuffle. The
+`kernel-baseline` guard covers it now — with `avx512vl` removed it fails with
+`dot_q1_0g128_q8_0_vnni_avx512 -> __mm256_dpbusd_epi32`. It did not before because the kernel was
+`#[cfg(test)]` and the guard builds the lib: a bench-only kernel is a kernel nothing checks.
+
 ### aarch64 was a release platform with no CI coverage — and it did not build (SparkOC, 2026-10-16 late)
 
 **`macos-latest` is an arm64 runner now, so `check (macos-latest)` had been red on `main` since the
@@ -86,7 +127,10 @@ so there is no suppression anywhere.
 
 **6-model sweep at the new default** (one run each, warmed, `--temp 0 --max-tokens 50`, ±10–15%).
 The `pt 17` column is the same tree plus the dispatch-wait yield (and the aarch64 `#[cfg]` gates,
-which are x86 no-ops), so it is also the check that the yield did not cost anything:
+which are x86 no-ops), so it is also the check that the yield did not cost anything. The three Q1_0
+rows then gained a further +2–4.5% from the VNNI dispatch (entry at the top of this file) and were
+not re-swept, because the absolute level drifts ±10% between windows and the mirrored A/B is the
+better evidence:
 
 | Model | pt 16 | pt 17 (final binary) | 2026-10-15 chart |
 | ----- | ----- | -------------------- | ---------------- |
