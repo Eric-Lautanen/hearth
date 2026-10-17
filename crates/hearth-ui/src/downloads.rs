@@ -683,7 +683,7 @@ impl Manager {
         dir: &std::path::Path,
         part: &std::path::Path,
     ) -> Result<(), String> {
-        let mut child = match std::process::Command::new("curl")
+        let mut child = match crate::hide_console(&mut std::process::Command::new("curl"))
             .args(["-s", "-L", "--fail", "-C", "-", "--retry", "2", "-o"])
             .arg(part)
             .arg(&e.url)
@@ -769,7 +769,7 @@ fn part_len(dir: &std::path::Path, filename: &str) -> u64 {
 fn curl_available() -> bool {
     static CURL_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CURL_OK.get_or_init(|| {
-        std::process::Command::new("curl")
+        crate::hide_console(&mut std::process::Command::new("curl"))
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

@@ -5,6 +5,13 @@
 //! `hearth-chat-cli --service` over line-JSON stdio — the single pipeline
 //! into the engine. The UI never links hearth-llm directly.
 
+// Windows, and only Windows: a shortcut launch allocates no console of its own,
+// so a console-subsystem binary opens a black window that then stays for the
+// server's whole lifetime. Under the GUI subsystem there is no window at all,
+// while a launch *from* a terminal keeps its inherited stdout/stderr, so the dev
+// loop loses none of its diagnostics.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -297,7 +304,7 @@ fn spawn_service(ctx: Arc<AppCtx>) -> Result<(), String> {
         ));
     }
 
-    let mut child = std::process::Command::new(&cli)
+    let mut child = hide_console(&mut std::process::Command::new(&cli))
         .arg("--service")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1457,10 +1464,28 @@ fn main() {
     }
 }
 
+/// Spawn a helper process without giving it a console window of its own.
+///
+/// `hearth-ui` is a GUI-subsystem binary (see the crate attribute at the top),
+/// but every process it spawns - the service CLI, `curl`, the browser opener -
+/// is a console binary, and Windows would allocate a fresh console window for
+/// each one: precisely the window the GUI subsystem just removed. This is the
+/// single place that decision is expressed; off Windows it compiles to nothing.
+pub(crate) fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW, from the documented process creation flags.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 fn open_browser(url: &str) {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("cmd")
+        let _ = hide_console(&mut std::process::Command::new("cmd"))
             .args(["/C", "start", "", url])
             .spawn();
     }
