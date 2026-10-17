@@ -20,6 +20,9 @@ are checked:
     RUSTFLAGS="-C target-cpu=x86-64-v2" \
       cargo rustc -p hearth-quant --release --tests --target-dir target/baseline-asm-tests -- --emit=asm
 
+`scripts/baseline-invariance.py` is the measurement this stands in for: build `benchk` at two
+baselines, then check that every arm and the dispatch read the same at both.
+
 The test build matters as much as the library one: a kernel only the tests reach is
 a kernel the library build never sees, and the Q1_0_G128 VNNI kernel sat there behind
 `#[cfg(test)]` while it measured +180% against the kernel it was meant to replace.

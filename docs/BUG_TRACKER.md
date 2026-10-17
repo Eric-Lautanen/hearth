@@ -68,6 +68,33 @@ The Q1_0 rows move on the worker count alone (their kernel is unchanged from the
 the Q2_0 rows are kernel plus count. `kernel_name()` reports `avx2_lut` for both paths, so the
 `[kernel]` banner and the service's `kernels` JSON stay honest without a per-path variant.
 
+**Baseline invariance, measured.** The dispatch change was re-checked at the weak baseline, because
+the arm it makes the default (the Q2_0 LUT kernel) had read 3x slower at `x86-64-v2` before its f16c
+fix (0.87 against 2.64 GB/s). Same source, two side target dirs (`RUSTFLAGS="-C target-cpu=x86-64-v2"`
+against the shipped v3), `benchk` twice each, best of two:
+
+| model (`blk.0`) | arm | v2 | v3 |
+| --- | --- | --- | --- |
+| dense 4B Q2_0 | `avx2_lut` | 2.75 | 2.84 |
+| dense 4B Q2_0 | `dispatched` | 2.69 | 2.81 |
+| dense 4B Q2_0 | `vnni256` | 1.72 | 1.72 |
+| dense 4B Q2_0 | `vnni512x2` | 1.85 | 1.87 |
+| hybrid 4B PQ2_0 | `avx2_lut` | 2.75 | 2.83 |
+| hybrid 4B PQ2_0 | `dispatched` | 2.72 | 2.80 |
+
+Every arm is within 3% across the two baselines and `dispatched` tracks the LUT arm at both, so the
+new order is not a v3-only artifact: at v2 the old order would have selected `vnni512x2` (1.85) where
+the new one selects `avx2_lut` (2.75) — **+49% at the weak baseline too**.
+
+`scripts/baseline-invariance.py` is that check as a tool. It builds nothing (it takes
+`NAME=TARGET_DIR` pairs) and reports the two failure modes separately: *arm drift*, where one arm
+reads lower at one baseline, and *dispatch drift*, where `dispatched` is not the fastest arm at that
+baseline. Validated against artifacts rather than by assertion — run on the pre-change benchk in
+`target/buffy-ab/v3-target` it reports `old: dispatched 1.85 vs best arm avx2_lut 2.77 (0.67) <--
+dispatch drift`, which is the bug this commit fixes, plus `vnni256` 0.67 → 1.73 (0.39), which is the
+declaration fix on that kernel. It is deliberately not a CI gate: shared runners are not a
+benchmark, so the static guard stays the gate and this is the measurement it stands in for.
+
 Lesson, four times in one day: **a dispatch order is a measurement, and a measurement of a body that
 cannot inline is not a measurement of the body that ships.** The guard now covers the test target as
 well as the library (see the entry below), and the coupling above is what the calibration runner

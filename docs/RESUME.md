@@ -73,7 +73,10 @@
    and was misread once: a v3 run that ranked `avx2_lut` 2.51 ahead of `vnni512x2` 1.70 was dismissed
    as clock ramp-up because a `native` rerun reversed it — but the v3 reading was right, and `native`
    was measuring different codegen for the same source. **A baseline is part of the measurement; only
-   compare within one.**
+   compare within one.** `scripts/baseline-invariance.py` is the first piece and it is done: it takes
+   `NAME=TARGET_DIR` pairs, runs `benchk` twice per baseline, and reports *arm drift* and *dispatch
+   drift* separately — validated by catching both on the pre-change artifacts in `target/buffy-ab/`.
+   What remains is the count axis and persisting a winner.
 4. **Closed in pt 18: the Q2_0 rows were not noise — the dispatch was choosing the slower kernel, and
    the thread count had been tuned to it.** They are now *above* the 2026-10-15 chart
    (+44.6/+46.6/+49.1%), so the "~36% under, assume noise" reading is retired. The lesson to keep:
