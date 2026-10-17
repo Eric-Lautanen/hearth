@@ -12,9 +12,14 @@
 > `Programs\Hearth` alive (`RemoveFolder` on the model folder, empty-only); and the
 > artifact glob would have shipped WiX's `.wixpdb`. `hearth-ui` is now a GUI-subsystem
 > binary whose children get `CREATE_NO_WINDOW`, so nothing flashes a console.
-> `.github/workflows/release.yml` builds on five runners with a `workflow_dispatch`
-> dry-run that stops before publish — **the dry run has not been executed yet, and
-> nothing is tagged or published** (operator call). Finally, the six-model sweep on the
+> `.github/workflows/release.yml` builds on five runners, and its `workflow_dispatch`
+> dry run passes **five of five green**, uploading the five artifacts and stopping
+> before publish — nothing is tagged or published yet (operator call). That run also
+> caught a runner that no longer existed: `macos-13` retired in December 2025 and a
+> job on a retired label queues forever, so the Intel leg was `macos-15-intel` (the
+> last Intel image) and arm64 moved to `macos-15`; `ubuntu-latest` migrates to
+> Ubuntu 26 on 2026-10-19, so that leg is pinned to `ubuntu-24.04` to keep the
+> artifacts' glibc floor where it is. Finally, the six-model sweep on the
 > **final** binary read 49.26 / 25.39 / 22.71 / 11.41 / 12.85 / 6.07 tok/s against a
 > 46.7 / 23.6 / 23.6 / 12.2 / 13.0 / 6.2 baseline — the small models *above*, the 4B/8B
 > rows below, with re-runs spreading ±10-20% and an instrumented run measuring the CLI
@@ -29,12 +34,15 @@ Packaging specifics: `packaging/windows/README.md`, `packaging/SIGNING.md`.
 ## Do these first
 
 1. **Close the release (needs the operator).** Ask before `git tag v0.2.0` and before
-   any publish — both are public and awkward to undo. Before asking, run the dry run:
-   `gh workflow run release.yml -f version=v0.0.0-dry-run`, then check all five jobs
-   (`gh run watch`, `gh run view --log-failed`) and that each uploaded artifact is a
-   `.zip` / `.msi` / `.tar.gz` and never a `.wixpdb`. `ubuntu-24.04-arm` and the two
-   macOS runners are the unverified legs — the macOS leg is the first real test of
-   `scripts/package-macos.sh`, the Linux one of the tarball + `.desktop` layout.
+   any publish — both are public and awkward to undo. The dry run is done: run
+   `39015532967` is **five of five green**, `publish` skipped, and all five artifacts
+   were downloaded and inspected (Windows `.zip` + `.msi` with no `.wixpdb`, both
+   `Hearth.app` architectures with `Info.plist` and `hearth.icns`, both Linux tarballs
+   with the `.desktop`, the icon and `models/README.txt`). What has *never* run is the
+   `publish` job itself — a tag push is the only way to exercise it, and it is the last
+   untested step in the release. Re-run
+   `gh workflow run release.yml -f version=v0.0.0-dry-run` after any packaging change;
+   it is 5 minutes and it is what caught the retired `macos-13` label.
 2. **Re-baseline the performance table on a quiet box** (see the sweep note above).
    Both the six-model rows in `docs/BUG_TRACKER.md` and the README's model table are
    from busier windows than they claim. Run each model alone, warm up, take the mean of
@@ -170,6 +178,13 @@ and an OpenSSL-oracle case. What is left, in order of proof:
   cannot be read through the Installer COM API at all — use `wix msi decompile`;
   `wix build` needs `-acceptEula wix7`, and MSI custom-action FileRefs need
   `ExeCommand=""` (WIX0038/WIX0044).
+- **Runner labels are load-bearing and fail silently.** `macos-13` was retired in
+  December 2025 and a job on it queues forever rather than erroring; the replacements
+  are `macos-15-intel` (Intel, until Aug 2027) and `macos-15`/`macos-14` (arm64), and
+  `macos-14` is itself being retired. `ubuntu-latest` moves to Ubuntu 26 on
+  2026-10-19, so it is pinned to `ubuntu-24.04` to hold the glibc floor of the
+  published binaries. `actions/upload-artifact@v5` still declares Node 20, so that
+  deprecation annotation is GitHub's, not ours.
 
 ## Verification habits for a shared checkout
 

@@ -57,6 +57,25 @@ either way. One measured oddity, documented rather than "fixed": the ARP row is
 registered under `HKLM` while the payload and shortcuts stay in the profile (a
 property of `ALLUSERS=2`; MSI's own log still classifies the install as per-user).
 
+**The dry run found a runner that no longer exists.** `workflow_dispatch` with
+`version=v0.0.0-dry-run` built and uploaded all five artifacts and stopped before
+publishing, but `build (macos-x86_64)` never started: it queued for 31 minutes
+because `macos-13` was retired in December 2025 — a label with no runner queues
+forever instead of failing, which is the silent failure mode. GitHub's changelog
+names `macos-15-intel` as the replacement (the last Intel image, until Aug 2027),
+and `macos-14` is itself being retired, so arm64 moved to `macos-15` as well. In
+the same round: `ubuntu-latest` migrates to Ubuntu 26 on 2026-10-19, which would
+have silently raised the glibc floor of every published binary, so that leg pins
+`ubuntu-24.04` — an older-glibc build runs on a newer distro, never the reverse.
+Second run: **five of five green, 1-5 minutes each**, publish skipped, all five
+artifacts downloaded and inspected — Windows `.zip` + `.msi` (no `.wixpdb`),
+`Hearth.app` on both architectures with `Info.plist` and `hearth.icns` inside,
+Linux tarballs with `hearth.desktop`, `hearth.svg` and `models/README.txt`.
+Signing gates no-op'd exactly as designed (`WINDOWS_CERT_PFX_B64 is unset: ...`,
+`MACOS_CERT_P12_B64 is unset: ...`). One warning remains and it is GitHub's own:
+`actions/upload-artifact@v5` still declares Node 20, so the deprecation annotation
+persists after the v4 → v5 bump.
+
 **Benchmark note — the six-model sweep is noisy on this box right now.** Final
 binary, 50 tokens, temp 0, one model at a time, after warm-up: 1.7B Q1_0 49.26,
 1.7B Q2_0 25.39, 4B Q1_0 22.71, 4B Q2_0 11.41, 8B Q1_0 12.85, 8B Q2_0 6.07
