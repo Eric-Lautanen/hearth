@@ -75,6 +75,18 @@ to mislead: at v3 one run ranked `avx2_lut` 2.51 ahead of `vnni512x2` 1.70, the 
 dispatch comment, but a native rerun gives `avx2_lut` 1.35 against `vnni512x2` 1.68 — VNNI ahead,
 dispatch order correct, and the first reading was clock ramp-up.
 
+**Follow-up: the thread cliff is bandwidth/SMT, not the spinning main thread.**
+`ThreadPool::wait_for_workers` now spins for a budget and then `yield_now`s instead of spinning
+unconditionally, because a thread that never yields keeps its own workers off a core it is already
+oversubscribing. Measured on the dense 8B Q1_0 the same afternoon: 12.1 → 13.2 tok/s at 8 workers,
+6.0 → 6.9 at 12, 4.0 → 4.8 at 16 (three runs at 8, spread 12.33–13.82, against a pre-change
+12.1–12.31), 1.7B Q1_0 43.4 → 45.3, hybrid 4B PQ2_0 5.2 → 6.4 at 8 workers and 7.4 → 7.4–7.9 at 12.
+So the spin was worth ~15–25% of the oversubscribed loss, and it is gone, but it is not the cliff:
+12 workers is still about half of 8 on the dense 8B. That leaves memory bandwidth plus SMT sharing
+as the mechanism, which also means the proposed "let the dispatching thread take a chunk" change
+would only add a 9th/13th runnable thread to a saturated machine — it is dropped, not deferred. A
+single anomalous hybrid reading (6.14 against 6.71/7.31/7.53) was re-measured and did not reproduce.
+
 ### Clippy pass completed (SparkOC, 2026-10-15 night) — CI green, no perf change
 
 Finished buffy's pass: 64 sites across `hearth-llm` (format borrows,

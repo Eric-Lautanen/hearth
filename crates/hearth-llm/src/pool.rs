@@ -84,7 +84,8 @@ struct Worker {
     done_flag: Arc<AtomicBool>,
 }
 
-/// Spin iterations a worker does before it stops looking for work. A dispatch
+/// Spin iterations before a worker stops looking for work, and before the
+/// dispatching thread stops spinning on a worker and yields instead. A dispatch
 /// normally follows the previous one within microseconds while tokens are being
 /// produced, so the spin catches almost every dispatch without a syscall.
 const SPIN_BUDGET: u64 = 65536;
@@ -332,6 +333,28 @@ impl ThreadPool {
         }
     }
 
+    /// Wait for every worker to finish the chunk it was given.
+    ///
+    /// The dispatching thread spins first: a dispatch normally completes in
+    /// microseconds, so the spin catches it without a syscall. It must not spin
+    /// *unconditionally*, though — the pool routinely has more runnable threads than
+    /// physical cores, and a thread that never yields keeps its own workers off the
+    /// core they need (8B Q1_0 on an 8C/16T box: 13.2 tok/s at 8 workers against 6.9
+    /// at 12 now, 12.1 against 6.0 when it spun straight through).
+    fn wait_for_workers(&self) {
+        for w in &self.workers {
+            let mut spins = 0u64;
+            while !w.done_flag.load(Ordering::Acquire) {
+                spins += 1;
+                if spins < SPIN_BUDGET {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
     pub fn num_threads(&self) -> usize {
         self.num_threads
     }
@@ -369,11 +392,7 @@ impl ThreadPool {
             w.done_flag.store(false, Ordering::Relaxed);
         }
         self.dispatch();
-        for w in &self.workers {
-            while !w.done_flag.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-        }
+        self.wait_for_workers();
     }
 
     pub fn par_quantize(&self, seq_len: usize, dim: usize, f32_base: usize, q8_base: usize) {
@@ -416,11 +435,7 @@ impl ThreadPool {
             w.done_flag.store(false, Ordering::Relaxed);
         }
         self.dispatch();
-        for w in &self.workers {
-            while !w.done_flag.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-        }
+        self.wait_for_workers();
     }
 
     pub fn par_dot_rows(&self, p: DotRowsParams) {
@@ -478,11 +493,7 @@ impl ThreadPool {
             w.done_flag.store(false, Ordering::Relaxed);
         }
         self.dispatch();
-        for w in &self.workers {
-            while !w.done_flag.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-        }
+        self.wait_for_workers();
     }
 
     pub fn par_dot_rows_batched(&self, p: BatchedDotRowsParams) {
@@ -534,11 +545,7 @@ impl ThreadPool {
             w.done_flag.store(false, Ordering::Relaxed);
         }
         self.dispatch();
-        for w in &self.workers {
-            while !w.done_flag.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-        }
+        self.wait_for_workers();
     }
 }
 

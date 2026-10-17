@@ -23,19 +23,21 @@
 
 ## Do these first (carry-over from pt 16, SparkOC)
 
-1. **Let the main thread participate instead of spinning — this removes the thread cliff and unifies
-   the two worker counts.** `pool.rs` hands out `num_threads` chunks and then spins on every
-   `done_flag`; under SMT that spin steals the very cycles its workers need (dense 8B Q1_0: 12.1
-   tok/s at 8, 6.0 at 12). Split into `num_threads + 1` chunks, let the dispatching thread run one
-   under its own id before it waits for the rest, then re-measure the dense 8B Q1_0 and the hybrid
-   `Ternary-Bonsai-2-4B-PQ2_0` at 8 and 12. If 12 stops being a cliff, one machine-derived count
-   serves both paths and the `qwen35.rs` exception goes away. Keep `HEARTH_THREADS` and the CPUID
-   default either way.
-2. **If (1) does not land, keep the split explicit and documented** — dense
-   `pool::default_worker_count()` (physical cores), hybrid ¾-of-logical. The measured optima really
-   do differ per kernel on the same box: dense 8B Q1_0 wants 8, dense `Ternary-Bonsai-4B-Q2_0` wants
-   12 (9.8–10.8 against 8.1), hybrid wants 12 (7.3–7.5 against 4.8–5.7). Do not collapse them
-   without an interleaved pair for each.
+1. **The thread cliff is bandwidth/SMT, not a starved worker — measured, and the cheap fix is in.**
+   `ThreadPool::wait_for_workers` now spins for a budget and then yields, rather than spinning
+   unconditionally, because a thread that never yields cannot stop oversubscribing a machine it is
+   already sharing. It is worth +15–25% wherever the pool outnumbers the physical cores (dense 8B
+   Q1_0 12.1 → 13.2 tok/s at 8 workers and 6.0 → 6.9 at 12; hybrid `Ternary-Bonsai-2-4B-PQ2_0`
+   5.2 → 6.4 at 8) and neutral at the default. It does **not** remove the cliff: 12 workers is still
+   ~half of 8 on the dense 8B, so the remainder is memory bandwidth and SMT sharing rather than a
+   spinning thread stealing cycles. The follow-on idea — let the dispatching thread run a chunk
+   instead of waiting — would add a 9th/13th *runnable* thread to an already saturated machine (and
+   needs `par_for`'s per-worker scratch resized for the extra id), so it is not expected to pay. Do
+   not spend a session on it without a measurement that says otherwise.
+2. **Keep the per-path counts; do not collapse them without an interleaved pair.** Dense
+   `pool::default_worker_count()` (physical cores) and the hybrid's ¾-of-logical are each the
+   measured optimum on the same box: dense 8B Q1_0 wants 8, dense `Ternary-Bonsai-4B-Q2_0` wants 12
+   (9.8–10.8 against 8.1), hybrid wants 12 (7.4–7.9 against 6.3–6.5).
 3. **Portability program (Goal 1) — still not started.** A `benchk`-driven per-CPU-id calibration
    runner that records the winning kernel per dtype and feeds the dispatch (replacing microarch
    predicates with a measurement); ARM CI runners in the 3-OS matrix; and the portable GPU
