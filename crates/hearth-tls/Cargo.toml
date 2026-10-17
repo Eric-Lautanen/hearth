@@ -1,6 +1,6 @@
 [package]
 name = "hearth-tls"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Hand-rolled, dependency-free TLS 1.3 primitives for the Hearth model downloader (std only)"
 

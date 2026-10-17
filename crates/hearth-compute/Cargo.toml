@@ -1,6 +1,6 @@
 [package]
 name = "hearth-compute"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "GPU compute backend via wgpu/WGSL for hearth-llm"
 

@@ -343,7 +343,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hearth-compute"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -354,11 +354,11 @@ dependencies = [
 
 [[package]]
 name = "hearth-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "hearth-diffusion"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-gguf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "half",
  "hearth-core",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-llm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-quant"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-sampler"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hearth-core",
  "rand",
@@ -423,11 +423,11 @@ dependencies = [
 
 [[package]]
 name = "hearth-tls"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "hearth-tokenizer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hearth-gguf",
 ]
