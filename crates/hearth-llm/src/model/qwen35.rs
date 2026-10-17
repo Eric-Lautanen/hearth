@@ -772,8 +772,8 @@ impl Qwen35Core {
             timers: Q35Timers::default(),
         };
 
-        // The ternary format decides the worker count as much as the path does: see
-        // the pool comment below.
+        // The weight format decides the worker count as much as the path does; the
+        // rule, and the measurements behind it, live on `pool::hybrid_worker_count`.
         let q2_weights = gguf
             .tensors
             .iter()
@@ -781,43 +781,10 @@ impl Qwen35Core {
 
         Ok(Qwen35Core {
             config,
-            // The worker count follows the *kernel*, because the kernel and the count
-            // are one decision: a slow kernel hides the pool's barrier behind more
-            // workers, a fast one is hurt by them.
-            //
-            // `Q2_0`/`PQ2_0` dispatch to the AVX2 LUT kernel, which is the fastest arm
-            // per thread but decodes through a per-block table in L1 - and when SMT
-            // siblings share a core that table competes with the weight stream, so
-            // oversubscribing it costs about 2x. Measured on
-            // Ternary-Bonsai-2-4B-PQ2_0 on an 8C/16T box: 7.7 tok/s at 10 workers,
-            // 7.1 at 8 and 4.3-4.8 at 12, so this format takes the dense path's rule
-            // (a quarter past physical).
-            //
-            // `PTQ1_0` has no such kernel and goes the other way: its hybrid measures
-            // 6.7 tok/s at 12 workers against 5.9 at 8. One shared count costs about
-            // 2x on whichever format loses, so the rule is per-format, not per-path.
-            //
-            // HEARTH_THREADS overrides both.
-            pool: ThreadPool::new(
-                std::env::var("HEARTH_THREADS")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|n| *n > 0)
-                    .unwrap_or_else(|| {
-                        if q2_weights {
-                            crate::pool::default_worker_count()
-                        } else {
-                            let logical = std::thread::available_parallelism()
-                                .map(|n| n.get())
-                                .unwrap_or(4);
-                            if logical > 8 {
-                                (logical * 3 / 4).max(8)
-                            } else {
-                                logical
-                            }
-                        }
-                    }),
-            ),
+            // The count follows the kernel, because the kernel and the count are one
+            // decision: a slow kernel hides the pool's barrier behind more workers, a
+            // fast one is hurt by them. See `pool::hybrid_worker_count`.
+            pool: ThreadPool::new(crate::pool::hybrid_worker_count(q2_weights)),
             tokenizer: std::sync::Mutex::new(tokenizer),
             token_embd,
             output,

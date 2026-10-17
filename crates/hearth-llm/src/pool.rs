@@ -96,37 +96,86 @@ const IDLE_WAIT: Duration = Duration::from_millis(100);
 
 /// Machine-derived worker count for the **dense** forward path.
 ///
-/// Honors `HEARTH_THREADS` first. Otherwise it uses the *physical* core count plus
-/// a quarter: the dots are memory-bandwidth bound, so SMT siblings steal bandwidth
-/// from each other, but the main thread is serial while the workers run (it
-/// quantizes the activations and drives the block), so a few spare threads keep the
-/// matmuls saturated. The loss past that is a cliff rather than a slope, which is
-/// why the rule stops well short of the logical count.
+/// Honors `HEARTH_THREADS` first, then [`dense_worker_count_for`] with this
+/// machine's core counts.
+pub fn default_worker_count() -> usize {
+    if let Some(n) = hearth_threads_override() {
+        return n;
+    }
+    let logical = logical_cores();
+    dense_worker_count_for(logical, physical_cores(logical))
+}
+
+/// Machine-derived worker count for the **hybrid** path, which does not have one
+/// optimum: the weight format decides it as much as the path does, because the
+/// kernel and the count are one decision.
+///
+/// `Q2_0`/`PQ2_0` dispatch to the AVX2 LUT kernel, which is the fastest arm per
+/// thread but decodes through a per-block table in L1 — when SMT siblings share a
+/// core that table competes with the weight stream, so oversubscribing it costs
+/// about 2x and this format takes the dense rule. `PTQ1_0` has no such kernel and
+/// goes the other way: it hides the pool's barrier behind more threads (measured
+/// 6.7 tok/s at 12 workers against 5.9 at 8 on Ternary-Bonsai-2-4B-PTQ1_0).
+///
+/// Honors `HEARTH_THREADS` first, then [`hybrid_worker_count_for`].
+pub(crate) fn hybrid_worker_count(has_q2_weights: bool) -> usize {
+    if let Some(n) = hearth_threads_override() {
+        return n;
+    }
+    let logical = logical_cores();
+    hybrid_worker_count_for(logical, physical_cores(logical), has_q2_weights)
+}
+
+/// The dense path's policy, with the core counts passed in so the rule can be
+/// checked for machines this one is not.
+///
+/// A quarter past the physical count: the dots are memory-bandwidth bound, so SMT
+/// siblings steal bandwidth from each other, but the main thread is serial while
+/// the workers run (it quantizes the activations and drives the block), so a few
+/// spare threads keep the matmuls saturated. The loss past that is a cliff rather
+/// than a slope, which is why the rule stops well short of the logical count.
 ///
 /// Re-measured on an 8C/16T box after the Q1_0 VNNI and Q2_0 LUT dispatches landed
 /// (both kernels are 6-47% faster, so the old physical-core optimum had moved):
 /// dense 8B Q1_0 reads 13.0 tok/s at 10 workers against 11.3 at 8, dense 1.7B Q1_0
 /// 49.3 against 46.9, dense 4B Q2_0 12.5 against 11.2, while 12 workers collapses
-/// to 5.8. `std` only reports the logical count, so the SMT width comes from CPUID
-/// on x86_64 and the logical count is the fallback everywhere else.
-///
-/// The hybrid path shares this rule for its `Q2_0`/`PQ2_0` weights and keeps its
-/// own, higher count for `PTQ1_0`, which has no fast kernel to be hurt by
-/// oversubscription. See the comment at its `ThreadPool::new` in
-/// `model/qwen35.rs`.
-pub fn default_worker_count() -> usize {
-    if let Ok(v) = std::env::var("HEARTH_THREADS") {
-        if let Some(n) = v.parse::<usize>().ok().filter(|n| *n > 0) {
-            return n;
-        }
-    }
-    let logical = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let physical = physical_cores(logical);
-    // A quarter more than the physical count, never past the logical count: a
-    // machine without SMT has no spare threads to add.
+/// to 5.8.
+fn dense_worker_count_for(logical: usize, physical: usize) -> usize {
+    // A machine without SMT has no spare threads to add.
     (physical + physical / 4).min(logical)
+}
+
+/// The hybrid path's policy, with the core counts passed in for the same reason:
+/// the format picks the rule, and only `PTQ1_0` takes the higher count.
+fn hybrid_worker_count_for(logical: usize, physical: usize, has_q2_weights: bool) -> usize {
+    if has_q2_weights {
+        dense_worker_count_for(logical, physical)
+    } else if logical > 8 {
+        // Three quarters of the logical count, with a floor of eight.
+        (logical * 3 / 4).max(8)
+    } else {
+        logical
+    }
+}
+
+/// `HEARTH_THREADS`, when it names a usable count.
+///
+/// Shared by both policies so they cannot disagree about what an override is. A
+/// count of zero would spin the pool up with no workers and hang every dispatch,
+/// so it is normalized rather than trusted.
+fn hearth_threads_override() -> Option<usize> {
+    std::env::var("HEARTH_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// The logical processor count, with `std`'s fallback for the hosts where it
+/// cannot say.
+fn logical_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 /// Physical (non-SMT) core count, when the CPU will say.
@@ -594,5 +643,28 @@ mod tests {
     #[test]
     fn worker_count_is_never_zero() {
         assert!(default_worker_count() >= 1);
+        assert!(hybrid_worker_count(true) >= 1);
+        assert!(hybrid_worker_count(false) >= 1);
+    }
+
+    /// The dense rule is a quarter past physical and never past logical: a machine
+    /// without SMT has no spare threads to add.
+    #[test]
+    fn dense_count_is_a_quarter_past_physical() {
+        assert_eq!(dense_worker_count_for(16, 8), 10);
+        assert_eq!(dense_worker_count_for(32, 16), 20);
+        assert_eq!(dense_worker_count_for(8, 8), 8);
+        assert_eq!(dense_worker_count_for(4, 4), 4);
+        assert_eq!(dense_worker_count_for(2, 1), 1);
+    }
+
+    /// The hybrid rule follows the *kernel*, not the path: `Q2_0`/`PQ2_0` weights
+    /// take the dense rule because the LUT kernel is hurt by oversubscription, and
+    /// `PTQ1_0` keeps three quarters of the logical count.
+    #[test]
+    fn hybrid_count_follows_the_kernel() {
+        assert_eq!(hybrid_worker_count_for(16, 8, true), 10);
+        assert_eq!(hybrid_worker_count_for(16, 8, false), 12);
+        assert_eq!(hybrid_worker_count_for(8, 4, false), 8);
     }
 }
