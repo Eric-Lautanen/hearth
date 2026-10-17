@@ -93,6 +93,68 @@ const SPIN_BUDGET: u64 = 65536;
 /// backstop for the notify path: a worker is woken directly by `dispatch`.
 const IDLE_WAIT: Duration = Duration::from_millis(100);
 
+/// Machine-derived worker count for the **dense** forward path.
+///
+/// Honors `HEARTH_THREADS` first. Otherwise it uses the *physical* core count:
+/// the dots are memory-bandwidth bound, so SMT siblings mostly steal bandwidth
+/// from each other and from the spinning main thread. Backing off from the
+/// logical count is not enough, because the loss is a cliff rather than a slope.
+/// Measured on an 8C/16T box, the dense 8B Q1_0 runs 12.1 tok/s at 8 workers and
+/// 12.0 at 10, but 6.0 at 12 and 4.0 at 16. `std` only reports the logical count,
+/// so the SMT width comes from CPUID on x86_64 and the logical count is the
+/// fallback everywhere else.
+///
+/// The hybrid path keeps its own, *higher* count on purpose: it was measured to
+/// want more threads than physical cores on the same box, so one shared number
+/// would cost about 2x on whichever path it did not suit. See the comment at its
+/// `ThreadPool::new` in `model/qwen35.rs`.
+pub fn default_worker_count() -> usize {
+    if let Ok(v) = std::env::var("HEARTH_THREADS") {
+        if let Some(n) = v.parse::<usize>().ok().filter(|n| *n > 0) {
+            return n;
+        }
+    }
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    physical_cores(logical)
+}
+
+/// Physical (non-SMT) core count, when the CPU will say.
+///
+/// Reads the hardware threads per core from the SMT topology leaf. A part
+/// without SMT, or an unhelpful hypervisor, reports 1, which leaves the logical
+/// count in place.
+#[cfg(target_arch = "x86_64")]
+fn physical_cores(logical: usize) -> usize {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    // Leaf 0x1F is the modern extended-topology leaf and 0xB is its older
+    // equivalent; sub-leaf 0's EBX[15:0] is the thread count per core. The
+    // topology level in ECX is ignored deliberately: sub-leaf 0 is the SMT
+    // level on every shipping part.
+    let max_leaf = __cpuid(0).eax;
+    let leaf = if max_leaf >= 0x1f {
+        0x1f
+    } else if max_leaf >= 0x0b {
+        0x0b
+    } else {
+        return logical;
+    };
+    let threads_per_core = (__cpuid_count(leaf, 0).ebx & 0xffff) as usize;
+    if threads_per_core >= 2 && threads_per_core <= logical {
+        (logical / threads_per_core).max(1)
+    } else {
+        logical
+    }
+}
+
+/// Non-x86_64 hosts do not expose SMT width through a portable CPU query, so
+/// the logical count stands (Apple silicon and most ARM parts have no SMT).
+#[cfg(not(target_arch = "x86_64"))]
+fn physical_cores(logical: usize) -> usize {
+    logical
+}
+
 pub struct ThreadPool {
     workers: Vec<Worker>,
     params: Arc<AtomicPtr<WorkParams>>,
@@ -491,5 +553,31 @@ impl Drop for ThreadPool {
                 let _ = h.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SMT query feeds a thread count straight into `ThreadPool::new`, so it
+    /// has to be a usable count for any host, including ones whose topology leaf
+    /// is missing or nonsense (containers, some hypervisors).
+    #[test]
+    fn physical_cores_is_always_a_usable_count() {
+        for logical in [1usize, 2, 3, 4, 8, 16, 64, 256] {
+            let cores = physical_cores(logical);
+            assert!(
+                (1..=logical).contains(&cores),
+                "logical={logical} yielded {cores}"
+            );
+        }
+    }
+
+    /// A count of zero would spin the pool up with no workers and hang every
+    /// dispatch; the override is normalized rather than trusted.
+    #[test]
+    fn worker_count_is_never_zero() {
+        assert!(default_worker_count() >= 1);
     }
 }

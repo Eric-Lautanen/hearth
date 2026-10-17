@@ -22,7 +22,7 @@ use hearth_tokenizer::Tokenizer;
 use crate::config::ModelConfig;
 use crate::kvcache::{KVCache, KVStorage};
 use crate::ops;
-use crate::pool::ThreadPool;
+use crate::pool::{default_worker_count, ThreadPool};
 use hearth_compute::{
     CacheWriteBatchShape, CacheWriteShape, FlashAttnShape, FusedQkvBuffers, GpuCompute,
     HeadNormShape, MlpBatchShape, MlpShape, NormShape, PrefillAttnShape, QkvBatchShape, QkvShape,
@@ -363,7 +363,7 @@ impl LlamaModel {
             "token_embd.weight".to_string()
         };
 
-        let pool = ThreadPool::new(8);
+        let pool = ThreadPool::new(default_worker_count());
 
         let rope_cache = ops::RopeCache::new(
             max_seq,
