@@ -3,6 +3,78 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers. Ref: llama.cpp-prism.
 
+### Baseline is x86-64-v3, the kernels are baseline-invariant, and one missing attribute was worth 2.7x (SparkOC, 2026-10-16)
+
+**`26eab4b` set the crate baseline to `x86-64-v2` and lost 3.4x. Root cause, proven from the
+listing rather than argued.** `#[target_feature(enable = "avx2")]` does not imply `fma` or `f16c`.
+Under a v2 baseline an AVX2 kernel that reaches for `_mm256_fmadd_ps` or converts an f16 scale
+cannot inline those, so LLVM emits an out-of-line call *per use* while the dispatch banner still
+reports `avx2`. The v2-built `dot_q1_0g128_q8_0_ptr_avx2` was 494 instructions with 5
+`__mm256_fmadd_ps` calls, 4 `f16_to_f32_x86_f16c` calls and 5 `detect_and_initialize` calls;
+with `-C target-feature=+fma,+f16c` it is 135 instructions and 0 calls. `f16c` alone was not
+enough (v2+f16c still logged 0.67 GB/s: the 5 fmadd calls remained).
+
+| arm | benchk Q1_0 (GB/s) | Bonsai-1.7B-Q1_0 (tok/s) |
+| --- | --- | --- |
+| x86-64-v2 | 0.55 | ~13 |
+| x86-64-v2 (buffy's fma/f16c declarations) | 2.73 | 43.0 |
+| x86-64-v3 (new default) | 3.48 | 45.4 |
+| `-C target-cpu=native` | 3.12 | 50.6 |
+
+**Fixes landed.** (1) `.cargo/config.toml` scopes its rustflags to
+`[target.'cfg(target_arch = "x86_64")']` and pins `x86-64-v3` — the old `[build]` entry would have
+failed every aarch64 build with "unknown CPU". (2) buffy declared `fma`/`f16c` on the AVX2 bodies,
+folded both into the availability predicates, and routed the 35 in-kernel conversions through a
+declared `crate::f16_bits_to_f32`, which is what stops `half`'s runtime probe (and both of its
+arms) from being inlined into the block loop. The declarations are the true cause-fix and stay:
+they make the kernels baseline-invariant, so a lower-baseline build keeps fast AVX2 even where v3
+is not an option. (3) **`dot_q2_0_q8_0_vnni_avx512` declared `avx512f` + `avx512vnni` but used the
+256-bit EVEX form, which also needs `avx512vl`** — the same bug class, and the whole reason
+`vnni256` read 0.59 GB/s under v3 while `native` (whose baseline includes VL) reached 1.58. With
+VL added to the body and to `avx512_vnni_available()`, **vnni256 is 1.59 GB/s at v3**, level with
+native. (4) `scripts/check-kernel-baseline.py` + a `kernel-baseline` CI job build `hearth-quant`
+at `x86-64-v2` and fail on any out-of-line call to an FMA/VNNI intrinsic (never legitimate) or to
+an f16 helper *inside* an `avx2`/`avx512`/`vnni` body. Validated in both directions: it rejects
+the pre-fix listing (41 calls) and accepts the fixed tree. `fmadd`-only or `f16`-only greps are
+wrong in opposite ways — the fixed crate still makes 61 legitimate f16 calls in scalar/SSE41 and
+dequantize paths, and a blanket grep false-fires on them. `RUSTFLAGS` does override the
+`[target.'cfg…']` rustflags (v3 listing 409390 B, native override 389917 B), which is what the
+job relies on.
+
+**Worker count: the ¾-of-logical rule was a 2x regression on the dense 8B.** It was already
+committed in the hybrid path; SparkOC's uncommitted slice spread it to the dense path, and the
+first sweep caught it (8B Q1_0 6.0 against native 12.6–13.2). The loss is a cliff, not a slope:
+the main thread spins at 100% while it waits, so SMT oversubscription starves the workers that are
+doing the work. Thread sweep, dense 8B Q1_0: 6→10.9, **8→12.1, 10→12.0**, 12→6.0, 16→4.0. The
+1.7B also collapses at 16 (5.4). But the optimum is path- and kernel-specific, not machine-wide:
+Ternary-Bonsai-2-4B-PQ2_0 (hybrid) is 7.3–7.5 at 12 against 4.8–5.7 at 8, and Ternary-Bonsai-4B-Q2_0
+(dense) is 9.8–10.8 at 12 against 8.1 at 8 — the opposite of the dense Q1_0 8B. One shared count
+would cost ~2x on whichever path loses, so the decision is: **dense uses `pool::default_worker_count()`**
+(physical cores, read from CPUID leaf 0x1F → 0xB → logical fallback; honours `HEARTH_THREADS`; 8 on
+this box, equal to the old hardcoded 8, and correct on a 4C or 32C host), and **the hybrid path keeps
+its own ¾-of-logical rule (12)**. CPUID is safe on 1.99 (`__cpuid`/`__cpuid_count` are not unsafe),
+so there is no suppression anywhere.
+
+**6-model sweep at the new default** (one run each, warmed, `--temp 0 --max-tokens 50`, ±10–15%):
+
+| Model | tok/s | 2026-10-15 chart |
+| ----- | ----- | ---------------- |
+| Bonsai-1.7B-Q1_0 | 43.40 | 47.13 |
+| Ternary-Bonsai-1.7B-Q2_0 | 15.56 | 24.53 |
+| Bonsai-4B-Q1_0 | 18.66 | 18.84 |
+| Ternary-Bonsai-4B-Q2_0 | 7.82 | 12.41 |
+| Bonsai-8B-Q1_0 | 11.3–12.3 | 12.20 |
+| Ternary-Bonsai-8B-Q2_0 | 4.33 | 6.75 |
+
+All three Q1_0 rows match the chart; all three Q2_0 rows read ~36% under it, the same family-wide
+drift pt 15 already documented (±25% on both arms). It is not a v3 artifact: interleaved against
+the native binary, Ternary-Bonsai-4B-Q2_0 is **10.41 native against 8.15 v3 at 8 workers, and 10.3
+v3 at 12 workers** — v3 matches native once the thread counts match, so the gap to the chart is
+machine state plus the thread count, not the baseline. `benchk` kernel ranks are also noisy enough
+to mislead: at v3 one run ranked `avx2_lut` 2.51 ahead of `vnni512x2` 1.70, the reverse of the
+dispatch comment, but a native rerun gives `avx2_lut` 1.35 against `vnni512x2` 1.68 — VNNI ahead,
+dispatch order correct, and the first reading was clock ramp-up.
+
 ### Clippy pass completed (SparkOC, 2026-10-15 night) — CI green, no perf change
 
 Finished buffy's pass: 64 sites across `hearth-llm` (format borrows,

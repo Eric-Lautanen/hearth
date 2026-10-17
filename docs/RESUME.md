@@ -1,5 +1,57 @@
 # Hearth — next session
 
+> **Session 2026-10-16 (pt 16) in one paragraph.** The CPU baseline is now **x86-64-v3**, the AVX2
+> kernels are **baseline-invariant**, and the shipped 1.7B Q1_0 went from ~13 to ~45 tok/s against
+> the v2 baseline it replaced. The v2 loss was one mechanism seen twice: `#[target_feature(enable =
+> "avx2")]` does not imply `fma`/`f16c`, so an AVX2 body reaching for `_mm256_fmadd_ps` or an f16
+> scale got an out-of-line call *per use* while the banner still said `avx2` (benchk Q1_0 0.55 GB/s;
+> with the declarations 2.73; at v3 3.48). buffy declared `fma`/`f16c` on the AVX2 bodies and routed
+> the 35 in-kernel f16 conversions through a declared `crate::f16_bits_to_f32` (declaring the feature
+> is what stops `half`'s runtime probe, and both of its arms, from inlining into the block loop);
+> SparkOC scoped the baseline to `[target.'cfg(target_arch = "x86_64")']` (the old `[build]` entry
+> would have broken every aarch64 build), added a CI job that builds `hearth-quant` at v2 and rejects
+> any out-of-line FMA/VNNI call or f16 call inside a SIMD body
+> (`scripts/check-kernel-baseline.py`), and found the same bug in
+> `dot_q2_0_q8_0_vnni_avx512` — a 256-bit EVEX kernel that declared `avx512f`+`avx512vnni` but not
+> `avx512vl`, which is why `vnni256` read 0.59 GB/s at v3 while native (VL in its baseline) hit
+> 1.58; with VL added it is 1.59. The other regression was self-inflicted and the sweep caught it:
+> the dense path had been moved onto the hybrid path's ¾-of-logical thread rule, and SMT
+> oversubscription starves the workers the spinning main thread waits on (dense 8B Q1_0: 12.1 tok/s
+> at 8 workers, 6.0 at 12, 4.0 at 16). The optima proved per-path, so the dense path uses
+> `pool::default_worker_count()` (physical cores from CPUID leaf 0x1F, `HEARTH_THREADS` override) and
+> the hybrid keeps its own 12.
+
+## Do these first (carry-over from pt 16, SparkOC)
+
+1. **Let the main thread participate instead of spinning — this removes the thread cliff and unifies
+   the two worker counts.** `pool.rs` hands out `num_threads` chunks and then spins on every
+   `done_flag`; under SMT that spin steals the very cycles its workers need (dense 8B Q1_0: 12.1
+   tok/s at 8, 6.0 at 12). Split into `num_threads + 1` chunks, let the dispatching thread run one
+   under its own id before it waits for the rest, then re-measure the dense 8B Q1_0 and the hybrid
+   `Ternary-Bonsai-2-4B-PQ2_0` at 8 and 12. If 12 stops being a cliff, one machine-derived count
+   serves both paths and the `qwen35.rs` exception goes away. Keep `HEARTH_THREADS` and the CPUID
+   default either way.
+2. **If (1) does not land, keep the split explicit and documented** — dense
+   `pool::default_worker_count()` (physical cores), hybrid ¾-of-logical. The measured optima really
+   do differ per kernel on the same box: dense 8B Q1_0 wants 8, dense `Ternary-Bonsai-4B-Q2_0` wants
+   12 (9.8–10.8 against 8.1), hybrid wants 12 (7.3–7.5 against 4.8–5.7). Do not collapse them
+   without an interleaved pair for each.
+3. **Portability program (Goal 1) — still not started.** A `benchk`-driven per-CPU-id calibration
+   runner that records the winning kernel per dtype and feeds the dispatch (replacing microarch
+   predicates with a measurement); ARM CI runners in the 3-OS matrix; and the portable GPU
+   scaffolding (opt-in behind `--device`/env, graceful with no device, must not break the CPU path
+   or the Windows/macOS builds).
+4. **All three Q2_0 rows read ~36% under the 2026-10-15 chart in every sweep — assume noise before
+   code.** v3 is not the cause: interleaved against the native binary, `Ternary-Bonsai-4B-Q2_0` is
+   10.41 native against 8.15 v3 at 8 workers and 10.3 v3 at 12, i.e. equal once thread counts match.
+   One `benchk` run also ranked `avx2_lut` 2.51 ahead of `vnni512x2` 1.70 at v3 while a native rerun
+   gave 1.35 against 1.68 — so rank claims need two arms and a rested machine.
+5. **Goal 2 still open:** the `hearth-ui` model downloader (`GET /api/downloads`, single active
+   download with `.part` + atomic rename, `POST /api/downloads/{start,cancel}`, size-polling or SSE
+   progress, catalog overridable via `models/catalog.json` or `HEARTH_MODEL_CATALOG_JSON`); README
+   screenshots; and `resources/hearth.svg`'s flame is still not vertically centred (rasterize to
+   check).
+
 > **Session 2026-10-16 (pt 15) in one paragraph.** The allow-block rule is now a property of the
 > workspace rather than a job in progress: **zero `#[allow(...)]` and zero `#[expect(...)]` anywhere**,
 > nothing silenced to get there, and the whole-repo gate green — `cargo clippy --workspace
