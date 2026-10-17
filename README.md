@@ -82,7 +82,10 @@ instead of buffering a reply. Raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER
 
 ## Quick start
 
-**Prerequisites:** [Rust](https://rustup.rs) 1.88+ · x86_64 CPU with AVX2 (most 2015+)
+**Prerequisites:** [Rust](https://rustup.rs) 1.88+ · an x86_64 CPU with AVX2 + FMA +
+F16C (the x86-64-v3 baseline this ships: Intel Haswell 2013+, AMD Zen 2017+). The
+SSE4.1/scalar fallbacks and the AVX-512 VNNI kernels are chosen by a runtime probe, so
+building with `RUSTFLAGS="-C target-cpu=x86-64"` runs on older parts instead
 · a Bonsai GGUF in the project `models/` folder — easiest via the web UI's
 download button (top-right), or manually from HuggingFace (`<repo>/resolve/main/<file>`):
 
@@ -103,7 +106,8 @@ download button (top-right), or manually from HuggingFace (`<repo>/resolve/main/
 | `Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5.5 GiB | [Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
 | `Ternary-Bonsai-2-27B-PQ2_0.gguf` | 6.7 GiB | [Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
 
-**Build** (first build takes 2–5 min; `target-cpu=native`, `lto=fat`):
+**Build** (first build takes 2–5 min; `lto=fat`, x86_64 baseline `x86-64-v3`;
+add `RUSTFLAGS="-C target-cpu=native"` for a max-perf local-only binary):
 
 ```bash
 git clone https://github.com/Eric-Lautanen/hearth.git

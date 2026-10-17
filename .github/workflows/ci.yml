@@ -11,13 +11,20 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: clippy
+          components: clippy, rustfmt
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
 
       - name: cargo check (all)
         run: cargo check --workspace --all-targets
@@ -26,4 +33,27 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test (lib crates)
-        run: cargo test --workspace --exclude hearth-compute --exclude hearth-bench --exclude hearth-app
+        run: cargo test --workspace --exclude hearth-compute --exclude hearth-bench --exclude hearth-app -- --test-threads=1
+
+  # The cheap, deterministic guard for the class of bug that cost 5.7x on the
+  # 1.7B Q1_0 in one silent step: a runtime-dispatched SIMD kernel compiles to
+  # per-instruction calls when the *crate baseline* lacks a feature the body
+  # uses (`avx2` does not imply `fma`/`f16c`; the 256-bit EVEX VNNI form needs
+  # `avx512vl` on top of `avx512vnni`). Build the kernels at a weak baseline and
+  # fail on any out-of-line FMA/VNNI call, or any f16 conversion called from a
+  # SIMD body -- that call is the regression, and the banner still says `avx2`.
+  kernel-baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Kernels must keep hardware FMA/F16C at a weak baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-C target-cpu=x86-64-v2" cargo rustc -p hearth-quant --release --lib \
+            --target-dir target/baseline-asm -- --emit=asm
+          asm=$(ls target/baseline-asm/release/deps/hearth_quant-*.s)
+          python3 scripts/check-kernel-baseline.py "$asm"

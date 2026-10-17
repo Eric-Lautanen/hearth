@@ -1,8 +1,14 @@
-[build]
-# Portable baseline: every SIMD fast path in this repo is behind a runtime
-# feature probe (is_x86_feature_detected + #[target_feature] callees), so the
-# baseline only governs *autovectorized* code. x86-64-v2 (SSE4.2) runs anywhere
-# from ~2011 on; AVX2/AVX-512 still dispatch at runtime where present.
-# For a max-perf local build: RUSTFLAGS="-C target-cpu=native" cargo build --release
-rustflags = ["-C", "target-cpu=x86-64-v2"]
-
+# x86_64 build baseline, scoped to x86_64 so aarch64 (Mac ARM, Linux ARM) keeps
+# its own default instead of being handed an x86 CPU name.
+#
+# x86-64-v3 is AVX2 + FMA + F16C + BMI2 (Haswell, 2013+): the lowest baseline at
+# which the hot path keeps its vector code. A lower baseline does not merely slow
+# autovectorized code -- it stops the AVX2/FMA/F16C intrinsics inside the
+# runtime-dispatched kernels from inlining, because `#[target_feature(enable =
+# "avx2")]` does not imply `fma`/`f16c`. Measured on the 1.7B Q1_0 dot kernel:
+# 0.55 GB/s at x86-64-v2 versus 3.12 at native/v3 (silent 5.7x, dispatch banner
+# still reporting avx2). See docs/BUG_TRACKER.md.
+#
+# Max-perf local build: RUSTFLAGS="-C target-cpu=native" cargo build --release
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]

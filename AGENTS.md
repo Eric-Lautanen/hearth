@@ -139,6 +139,13 @@ cargo fmt
 - DON'T use conditional branches in hot paths (LLVM generates bad code)
 - DON'T use `i32x8::new([...])` for <8 elements (construction overhead > SIMD benefit)
 - DO use `From<&[f32]>` / `f32x8` for contiguous data (rms_norm, silu, softmax in ops.rs)
+- Baseline features: a `#[target_feature]` kernel body MUST declare every feature it uses.
+  `avx2` does not imply `fma` or `f16c`, so an AVX2 kernel that reaches for `_mm256_fmadd_ps`
+  or f16→f32 scales must also declare `fma`/`f16c` (every AVX2 CPU has both). When the crate
+  baseline omits a feature the body needs, the intrinsic stops inlining and the kernel runs
+  as per-instruction calls — a silent 5.7x on the 1.7B Q1_0 dot kernel, with the dispatch
+  banner still reporting `avx2`. x86_64 builds pin `x86-64-v3` in `.cargo/config.toml` for the
+  same reason; never lower it below the features any dispatched kernel body uses.
 
 ## Model-size-aware optimization policy
 
