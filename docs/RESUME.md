@@ -49,7 +49,25 @@
 > 4–6.6% faster than shuffle in L1, +6% per tensor on real weights (`benchk`), and +4.5% / +2.7% /
 > +3.6% end to end on the 1.7B / 4B / 8B Q1_0. Dispatched, with the guard now covering it.
 
-## Do these first (carry-over from pt 18)
+> **Session 2026-10-17 (pt 19) in one paragraph — a negative result, and the experiment that keeps the
+> dense count honest.** The pt-18 entry left one question: *why* the dense batched prefill is unstable
+> above the physical count when the single-token path is stable *and* faster there. The obvious suspect
+> was the dispatcher's own wait (`wait_for_workers` spins `SPIN_BUDGET` then `yield_now`-loops, and
+> `yield_now` only offers the core to a thread ready on the same *logical* processor). Made
+> per-dispatch — a batched dispatch blocks on a condvar the workers notify under the same lock, a
+> single-token dispatch still yields — the park **reduced** the 9-worker spread (8582/8605/8720/8617 ms
+> against 12999/8320/13256/19933/8439 for yield) but did **not** remove it: a later window read 6409 ms
+> (dense 4B Q2_0) and 14725 ms (dense 8B Q2_0) against a steady 5310/9601 at the shipped count of 8. At
+> 8 the park buys nothing (9281 against 9357), and parking *unconditionally* costs single-token decode
+> 7%, so it is **reverted** — the count stays `physical`, the wait stays yield. What the sweep did pin
+> down is the other half: count 9 is a repeatable **+2.8 to +6.6% decode** on all six dense models
+> (count-isolated, same binary: 1.7B Q1_0 48.84 → 50.24, 4B Q1_0 22.01 → 22.13, 4B Q2_0 12.58 → 13.02,
+> 8B Q1_0 11.72 → 12.45, 8B Q2_0 5.83 → 6.22), and the *only* thing blocking it as a default is the
+> batched prefill's cliff. New hypothesis for that cliff: DRAM bandwidth, not CPU contention — the
+> batched path streams the whole weight file once per dispatch, so a 9th worker adds fetch footprint,
+> not bandwidth.
+
+## Do these first (carry-over from pt 18/19)
 
 1. **aarch64 runs, and it is slow by construction: there is no SIMD backend for it.** Every
    dispatched kernel there is the scalar fallback, and `arm-qemu-test` is the only thing that has
@@ -59,22 +77,24 @@
    timing is not). The two shapes that suit NEON best are the `Q2V_U8` LUT dot — `vqtbl` is a table
    lookup in one instruction, which is exactly what that kernel is — and the f32 glue in
    `hearth-llm/src/ops.rs`.
-2. **The worker count follows the *path* — and, on the hybrid, the kernel.** As of pt 18: dense =
-   `physical` (8 here) because the dense prefill is batched and unstable above the physical count;
-   hybrid `Q2_0`/`PQ2_0` = `min(logical, physical + physical/4)` (10, measured 8.5 tok/s decode and
-   13346 ms prefill against 7.9 / 13940 at 8); hybrid `PTQ1_0` = ¾-of-logical (12, 6.7 tok/s against
-   5.9 at 8). The first version of the pt-18 change moved the dense count to the quarter as well and
-   cost **2.4x on dense 8B Q2_0 prefill** (10060 → 21856 ms) while it *helped* decode — the sweep that
-   exposed it was prefill, not decode. So: **any kernel change owes a count sweep on *both* passes,
-   and any count change owes an interleaved pair on both passes.** The open question is *why* the
-   batched path destabilises above physical. First hypothesis to test: the pool's spin-then-yield wait
-   (`wait_for_workers` spins `SPIN_BUDGET` then yields, pt 17) steals a core from a worker while a long
-   batched chunk runs — run dense 8B Q2_0's 109-token prefill at 9 workers with the spin budget set to
-   zero and see whether the 2.4x spread collapses. If it does, the fix is a per-dispatch decision
-   (spin for short single-token waits, yield immediately for batched ones) and the dense count can then
-   be re-swept; if it does not, the next suspects are `batched_rows_chunk`'s tile walk
-   (`tile_size = 1048576 / row_bytes`, one L2-sized tile per worker) and `flash_attention_prefill`.
-   `HEARTH_THREADS` still overrides everything.
+2. **The worker count follows the *path* — and, on the hybrid, the kernel — and pt 19 tested the part
+   of that which was still open.** As shipped: dense = `physical` (8 here); hybrid `Q2_0`/`PQ2_0` =
+   `min(logical, physical + physical/4)` (10, measured 8.5 tok/s decode and 13346 ms prefill against
+   7.9 / 13940 at 8); hybrid `PTQ1_0` = ¾-of-logical (12, 6.7 tok/s against 5.9 at 8). The dense rule
+   is the odd one out, and it is not about the kernel: it is the **batched** prefill, which is unstable
+   above physical (2.4x spread on identical invocations at 9 workers). The pt-18 protocol lesson still
+   holds — **any kernel change owes a count sweep on *both* passes, and any count change owes an
+   interleaved pair on both passes** — and pt 19 added the result: the dispatcher's wait is *not* the
+   cause (parking it per-dispatch reduced the spread but left it, so the wait still yields and the park
+   is not in the tree; see the tracker entry). The dense *decode* conversely wants 9 and gets +2.8-6.6%
+   from it, which makes the count a live trade for the calibration runner (item 3) rather than a
+   hand-set rule. **Next test for the cliff: DRAM bandwidth.** A batched dispatch streams the whole
+   weight file, so a 9th worker adds fetch footprint rather than bandwidth, and the suspects are
+   `batched_rows_chunk`'s tile walk (`tile_size = 1048576 / row_bytes`, one L2-sized tile per worker —
+   two workers on one L2 slice would thrash it) and the `dot_fn2` pairing. Separate bandwidth from
+   contention by varying `tile_size` and the pairing at a *fixed* count of 9 and watching whether the
+   spread collapses. `HEARTH_THREADS` still overrides everything, and `HEARTH_THREADS=9` on a dense
+   model is +3-7% decode with a prefill that can be 20-50% slower, so it is not a default.
 3. **The `benchk`-driven per-CPU calibration runner is still the unfinished half of Goal 1, and pt 18
    says what it has to model.** It is no longer just "pick the winning kernel per dtype": the worker
    count is one decision *per path* (item 2), so the record has to be a (kernel, count) pair per dtype
@@ -87,7 +107,9 @@
    compare within one.** `scripts/baseline-invariance.py` is the first piece and it is done: it takes
    `NAME=TARGET_DIR` pairs, runs `benchk` twice per baseline, and reports *arm drift* and *dispatch
    drift* separately — validated by catching both on the pre-change artifacts in `target/buffy-ab/`.
-   What remains is the count axis and persisting a winner.
+   What remains is the count axis — which now has data (the dense decode wants 9, the batched prefill
+   wants 8, the hybrid wants quarter-past / ¾) — and persisting a winner: the record has to be a
+   (kernel, count, path) triple, and it has to refuse a switch inside the noise band.
 4. **Closed in pt 18: the Q2_0 rows were not noise — the dispatch was choosing the slower kernel.**
    With the kernel fixed and the count back at physical they read **+31% decode and −4 to −7% prefill**
    on all three dense Q2_0 models (mirrored, with the Q1_0 rows as an unchanged control). The "count

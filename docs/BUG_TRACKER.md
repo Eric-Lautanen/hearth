@@ -1,7 +1,47 @@
 # Hearth Performance Tracker — CPU Final State → GPU Planning
 
 ## System
-AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the first entry for why they differ. Ref: llama.cpp-prism.
+AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
+
+### The dispatcher's wait does not explain the batched prefill's cliff, so the dense count stays physical (SparkOC, 2026-10-17)
+
+Follow-up to the entry below, which left one question open: *why* the dense **batched** prefill
+(`matmul_batch` into `batched_rows_chunk`) loses 2.4x at 9 workers on an 8C/16T box when the
+single-token path is stable there and *faster* (decode +2.8 to +6.6% on all six dense models in two
+mirrored sweeps). First hypothesis: the dispatcher's own wait. `wait_for_workers` spins
+`SPIN_BUDGET` and then `yield_now`-loops, and `yield_now` only offers the core to a thread ready on
+the same *logical* processor, so the dispatcher keeps competing with the worker that shares its core
+— and a batched chunk runs for milliseconds.
+
+Tested by making the wait per-dispatch (batched dispatch blocks on a condvar the workers notify under
+the same lock; single-token dispatch keeps yielding), mirrored against the shipped binary:
+
+| dense 8B Q2_0, 109-token prefill | yield | park |
+| --- | --- | --- |
+| 8 workers (the shipped count) | 9357 ms | 9281 ms |
+| 9 workers | 12999/8320/13256/19933/8439 | 8582/8605/8720/8617 |
+
+The park **reduces** the 9-worker spread but does not remove it: the same 9-worker binary read 6409 ms
+(dense 4B Q2_0) and 14725 ms (dense 8B Q2_0) against a steady 5310/9601 for the count-8 arm in a later
+window. At the shipped count it buys nothing (9281 against 9357 is inside the noise), and parking
+*unconditionally* costs single-token decode 7% (dense 4B Q2_0 11.3 tok/s against 12.2) — which is why
+it had to be conditioned on `seq_len > 1` at all. So it was **reverted**: the count stays `physical`,
+the wait stays yield, and the park was not kept, because a change with no measurement behind it is
+just code.
+
+The count-9 decode half is real and repeatable, though, and count-isolated runs pin it down (same
+binary, `HEARTH_THREADS` 8 against 9): dense 1.7B Q1_0 48.84 → 50.24, 4B Q1_0 22.01 → 22.13, plus
+4B Q2_0 12.58 → 13.02, 8B Q1_0 11.72 → 12.45, 8B Q2_0 5.83 → 6.22 against the shipped arm. The two
+paths genuinely want different counts; the batched prefill's cliff is the only thing holding the
+dense count at physical.
+
+Next hypothesis, for whoever picks this up: the batched prefill is DRAM-bandwidth bound — it streams
+the whole weight file once per dispatch — so a 9th worker adds fetch footprint rather than bandwidth,
+and the swings look like cache/bank conflicts rather than CPU contention. Testing that means varying
+`batched_rows_chunk`'s `tile_size` (one L2-sized tile per worker) or the `dot_fn2` pairing, not the
+pool. Meanwhile the count question has a usable answer: `HEARTH_THREADS=9` on a dense model is +3-7%
+decode with a prefill that can be 20-50% slower, so it is not a default and never will be until the
+cliff is understood.
 
 ### The Q2_0 dispatch preferred a kernel 47% slower per thread, and the worker count follows the prefill (SparkOC, 2026-10-16 late)
 
