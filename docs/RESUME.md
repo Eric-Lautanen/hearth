@@ -170,13 +170,27 @@
    the same regression looked like drift because the explanation ("machine state plus the thread
    count") was plausible, and the measurement that would have falsified it — the kernel arms
    themselves, on real weights — was in `benchk` the whole time.
-5. **Goal 2 is essentially closed; one cosmetic item is left.** The downloader is implemented and
-   verified live (`GET /api/downloads` returns the catalog with per-model `state`/`downloaded_bytes`
-   and HuggingFace URLs; `/api/downloads/start` and `/cancel` queue one file at a time; the drawer in
-   `web/index.html` has checkboxes, per-item progress, resume and an add-a-URL box), and both README
-   screenshots are in `docs/screenshots/`. Left: `resources/hearth.svg`'s flame is still not vertically
-   centred (rasterize to check), and the screenshots predate the 2026-10-16 UI commits, so re-shoot
-   them the next time the UI changes.
+5. **Goal 2: the code side is closed; the screenshots are blocked on a visible window.** The
+   downloader is implemented and verified live (`GET /api/downloads` returns the catalog with per-model
+   `state`/`downloaded_bytes` and HuggingFace URLs; `/api/downloads/start` and `/cancel` queue one file
+   at a time; the drawer in `web/index.html` has checkboxes, per-item progress, resume and an add-a-URL
+   box). Done in pt 20:
+   - `resources/hearth.svg` is centred, and *measured* centred: the flame path's bbox is
+     (5.5,2)-(18.5,21.7), so the transform is now `translate(32,32) scale(2) translate(-12,-11.85)` and
+     the file's comment records that bbox. Rendered as a document, `getBoundingClientRect` reads
+     padTop = padBottom = 90.78 px and padLeft = padRight = 164.06 px; the old `translate(8,6)` read
+     65.6 against 116 px, a 50 px asymmetry. Verify any later tweak the same way, not by eye.
+   - `/favicon.svg` serves `resources/hearth.svg` from the binary (`web::FAVICON_SVG`), linked from
+     `index.html` with `type="image/svg+xml"`, so the browser tab, the desktop entry and the macOS
+     bundle share one icon and cannot drift.
+   - the README's 14-model table is re-measured (warm-up plus two runs, mean shown: 4B Q1_0 18.8 → 23.6,
+     8B Q1_0 12.2 → 13.0, the rest inside the documented spread) and the env table is corrected
+     (`HEARTH_THREADS` overrides *both* paths; dense = physical cores, not a fixed 8; `HEARTH_PIN_WEIGHTS`
+     was missing and is added).
+   **Left, and blocked:** both README screenshots predate the 2026-10-16 UI commits. `browser.screenshot`
+   refuses without a *visible* desktop window and no browser tool can restore one — bring the browser
+   window to the front, then re-shoot `/` (chat) and the downloads drawer (about 1600x1000) over
+   `docs/screenshots/hearth-{chat,downloads}.png`.
 6. **GPU scaffolding (Goal 1, still not started):** opt-in behind `--device`/env, graceful when no
    ROCm device exists, and it must not break the CPU path or the Windows/macOS builds. The aarch64
    cross-check now guards the last of those three for the ARM half.

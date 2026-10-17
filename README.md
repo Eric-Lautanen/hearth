@@ -31,29 +31,31 @@ for rotation representation, avoiding gimbal lock...
 
 ## Performance
 
-14 models on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5), one run each at
-`--temp 0 --max-tokens 50 --prompt "Hello" --prompt-raw`, idle machine, warmed
-up first. 8 workers. Single runs on this box vary: an interleaved re-run later
-the same evening read the Q2_0 family ~25% lower on two independent binaries,
-so treat these as snapshots — only alternating same-session pairs carry
-information.
+14 models on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5), at `--temp 0
+--max-tokens 50 --prompt "Hello" --prompt-raw`, idle machine, one model at a
+time, a warm-up run then two measured runs each — the mean is shown. Every model
+runs at its shipped worker count (dense models one worker per physical core, the
+`qwen35` hybrids by their own rule). Single runs on this box vary ±5-10%: an
+interleaved re-run of the same binaries read the Q2_0 family ~25% lower, so treat
+these as snapshots — only alternating same-session pairs carry information, and
+the spread is what `scripts/count-sweep.py` measures for you.
 
 | Size | Format               | d_model | Layers | tok/s |
 | ---- | -------------------- | ------- | ------ | ----- |
-| 1.7B | Q1_0 (1-bit, 128-el) | 2048    | 28     | **47.1** |
-| 1.7B | Q2_0 (2-bit ternary) | 2048    | 28     | **24.5** |
-| 4B   | Q1_0 (1-bit, 128-el) | 2560    | 36     | **18.8** |
-| 4B   | Q2_0 (2-bit ternary) | 2560    | 36     | **12.4** |
-| 8B   | Q1_0 (1-bit, 128-el) | 4096    | 36     | **12.2** |
-| 8B   | Q2_0 (2-bit ternary) | 4096    | 36     | **6.8** |
-| 2B²  | PTQ1_0 (1-bit)       | —       | —      | **16.3** |
-| 2B²  | PQ2_0 (2-bit)        | —       | —      | **17.8** |
-| 4B²  | PTQ1_0 (1-bit)       | —       | —      | **6.6** |
-| 4B²  | PQ2_0 (2-bit)        | —       | —      | **7.5** |
-| 9B²  | PTQ1_0 (1-bit)       | —       | —      | **4.2** |
-| 9B²  | PQ2_0 (2-bit)        | —       | —      | **4.8** |
-| 27B² | PTQ1_0 (1-bit)       | —       | 64     | **1.35** |
-| 27B² | PQ2_0 (2-bit)        | —       | 64     | **1.53** |
+| 1.7B | Q1_0 (1-bit, 128-el) | 2048    | 28     | **46.7** |
+| 1.7B | Q2_0 (2-bit ternary) | 2048    | 28     | **23.6** |
+| 4B   | Q1_0 (1-bit, 128-el) | 2560    | 36     | **23.6** |
+| 4B   | Q2_0 (2-bit ternary) | 2560    | 36     | **12.2** |
+| 8B   | Q1_0 (1-bit, 128-el) | 4096    | 36     | **13.0** |
+| 8B   | Q2_0 (2-bit ternary) | 4096    | 36     | **6.2** |
+| 2B²  | PTQ1_0 (1-bit)       | —       | —      | **15.6** |
+| 2B²  | PQ2_0 (2-bit)        | —       | —      | **18.2** |
+| 4B²  | PTQ1_0 (1-bit)       | —       | —      | **6.9** |
+| 4B²  | PQ2_0 (2-bit)        | —       | —      | **7.2** |
+| 9B²  | PTQ1_0 (1-bit)       | —       | —      | **4.1** |
+| 9B²  | PQ2_0 (2-bit)        | —       | —      | **5.0** |
+| 27B² | PTQ1_0 (1-bit)       | —       | 64     | **1.4** |
+| 27B² | PQ2_0 (2-bit)        | —       | 64     | **1.6** |
 
 ² = Ternary Bonsai 2 (`qwen35` hybrid). The 27B pair runs at ~1.4 tok/s, so
 raise `--max-tokens` deliberately — the UI streams progress and reasoning live
@@ -153,14 +155,16 @@ Only set what you want to change — the rest follows the model:
 | `--max-tokens` / `--max-context` | 512 / model's length | Reply budget, context window |
 | `--prompt` / `--prompt-raw` | — | One-shot mode / skip the chat template |
 | `--show-think` | off | Show `<think>` reasoning instead of hiding it |
-| `--gpu` / `--gpu-layers N` | cpu | GPU load strategy |
+| `--gpu` / `--gpu-layers N` | cpu | Put all / the first N layers on GPU; falls back to CPU when no GPU backend is present |
 | `--pin-weights` | off | Mmap vs RAM (leave off for 27B-scale on 16 GB — pinning 5.9 GB died silently) |
 | `--service` / `--dump-info` / `--kv-f32` | — | UI backend mode / print metadata / compat flag |
 
 | Variable | Default | What it does |
 | -------- | ------- | ------------ |
 | `HEARTH_MODELS_DIR` | repo `models/` | Model folder for UI + CLI resolution |
-| `HEARTH_CTX_CAP` / `HEARTH_THREADS` | model's length / ~3/4 cores (hybrid only) | KV cap; worker count for the `qwen35` path (dense models use a fixed 8-worker pool) |
+| `HEARTH_CTX_CAP` | model's length | KV cache ceiling |
+| `HEARTH_THREADS` | per path: dense = physical cores, hybrid `Q2_0`/`PQ2_0` = physical + ¼, hybrid `PTQ1_0` = ¾ of logical | Worker count; overrides both paths |
+| `HEARTH_PIN_WEIGHTS` | off | Same as `--pin-weights` |
 | `HEARTH_MODEL_CATALOG_JSON` / `HEARTH_DL_ALLOW_HTTP` / `HEARTH_NO_AUTO_SHUTDOWN` | built-in / off / off | Catalog override, http mirrors, keep UI up |
 | `HEARTH_UI_TOKEN` | off (open) | Require a token on every `/api/*` call (header or `?token=`); the UI prompts once |
 

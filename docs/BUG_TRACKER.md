@@ -3,6 +3,44 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Goal 2 refresh: the icon was 2.3 units high, the UI had no favicon, and the README's table was a kernel behind (SparkOC, 2026-10-17)
+
+Three user-facing gaps closed in one pass, none of them near a hot path.
+
+**The SVG flame was not vertically centred — 2.3 units out, and the arithmetic says why.** The flame
+path spans (5.5,2)-(18.5,21.7) in its own units, so its centre is (12,11.85). `translate(8,6) scale(2)`
+put it at y 10-49.4 inside a 56-unit tile at (4,4)-(60,60): 6 units of padding above against 10.6
+below. The fix names the geometry instead of the magic number — `translate(32,32) scale(2)
+translate(-12,-11.85)` puts the path's own bbox centre on the tile centre — and the file now records
+the bbox in a comment. Verified at *render* time, not by eye and not by hand arithmetic twice: served
+as a document and measured with `getBoundingClientRect`, padTop = padBottom = 90.78 px and padLeft =
+padRight = 164.06 px (ratio 1.807 = 15/8.3, exactly as designed), where the old transform read 65.6
+against 116 px — a 50 px asymmetry at that scale. A tweak that is "obviously centred" is what produced
+the bug; the measurement is cheap.
+
+**The UI had no favicon.** `/favicon.svg` now serves `resources/hearth.svg` straight out of the binary
+(`web::FAVICON_SVG`, `include_bytes!`), and `index.html` links it with `type="image/svg+xml"` — one
+icon file for the browser tab, the desktop entry and the macOS bundle, so they cannot drift apart.
+Route check after the change: `/` 200 `text/html` 60.5 kB, `/favicon.svg` 200 `image/svg+xml` 971 B,
+`/api/models` 200 json, `/api/downloads` 200 json.
+
+**The README's benchmark table was a kernel behind.** All 14 models re-measured one at a time (a
+warm-up run then two measured runs each, mean published), which is also this session's mandated sweep.
+The Q1_0 rows carry the pt-17/18 VNNI dispatch fix: **4B Q1_0 18.8 → 23.6 tok/s (+25%)** and 8B Q1_0
+12.2 → 13.0 (+6%). Everything else moved inside the variance the table already documents: 1.7B Q1_0
+47.1 → 46.7, 1.7B Q2_0 24.5 → 23.6, 4B Q2_0 12.4 → 12.2, 8B Q2_0 6.8 → 6.2, hybrids 16.3/17.8/6.6/7.5/
+4.2/4.8/1.35/1.53 → 15.6/18.2/6.9/7.2/4.1/5.0/1.4/1.6. 8B Q2_0's 6.2 is the same row this tracker
+already records as reading ~25% lower in an interleaved re-run, so it is not a regression — and no row
+regressed outside spread. The env table also had a real error, "worker count for the `qwen35` path
+(dense models use a fixed 8-worker pool)". It is now split honestly: `HEARTH_THREADS` overrides *both*
+paths, the dense default is **physical cores** (8 is this box, not a constant), the hybrids follow
+their own rule, and `HEARTH_PIN_WEIGHTS` — which the CLI documents and the table omitted — is added.
+
+**Blocked, not forgotten:** both README screenshots still predate the 2026-10-16 UI commits.
+`browser.screenshot` refuses without a *visible* desktop window, and no browser tool can restore one,
+so the re-shoot needs a person to bring the window forward. The UI itself was verified live on
+127.0.0.1:8900 (all four routes above).
+
 ### Count 9's batched-prefill cliff is bimodal — and it was never the dispatcher's wait (SparkOC, 2026-10-17)
 
 Follow-up to the entry below, which left one question open: *why* the dense **batched** prefill
