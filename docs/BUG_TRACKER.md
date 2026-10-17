@@ -3,7 +3,7 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
-### The dispatcher's wait does not explain the batched prefill's cliff, so the dense count stays physical (SparkOC, 2026-10-17)
+### Count 9's batched-prefill cliff is bimodal — and it was never the dispatcher's wait (SparkOC, 2026-10-17)
 
 Follow-up to the entry below, which left one question open: *why* the dense **batched** prefill
 (`matmul_batch` into `batched_rows_chunk`) loses 2.4x at 9 workers on an 8C/16T box when the
@@ -21,19 +21,19 @@ the same lock; single-token dispatch keeps yielding), mirrored against the shipp
 | 8 workers (the shipped count) | 9357 ms | 9281 ms |
 | 9 workers | 12999/8320/13256/19933/8439 | 8582/8605/8720/8617 |
 
-The park **reduces** the 9-worker spread but does not remove it: the same 9-worker binary read 6409 ms
-(dense 4B Q2_0) and 14725 ms (dense 8B Q2_0) against a steady 5310/9601 for the count-8 arm in a later
-window — that window was contended as well, and the last paragraph of this entry is the tie-break. At
-the shipped count it buys nothing (9281 against 9357 is inside the noise), and parking
-*unconditionally* costs single-token decode 7% (dense 4B Q2_0 11.3 tok/s against 12.2) — which is why
-it had to be conditioned on `seq_len > 1` at all. So it was **reverted**: the count stays `physical`,
-the wait stays yield, and the park was not kept, because a change with no measurement behind it is
-just code.
+**The 9-worker row is not a comparison.** The yield numbers are pt 18's window, the park numbers this
+one, and those two windows are not interchangeable — which is the trap the whole entry is about. The
+only same-window pair is the 8-worker row, where the park buys nothing (9281 against 9357 is inside
+the noise), and parking *unconditionally* costs single-token decode 7% (dense 4B Q2_0 11.3 tok/s
+against 12.2), which is why it had to be conditioned on `seq_len > 1` at all. So it was **reverted**:
+the count stays `physical`, the wait stays yield, and the park was not kept, because a change with no
+same-window measurement behind it is just code. (A later window did read the park tight at 9 —
+8582/8605/8720/8617 — but with no yield arm beside it in that same window, that establishes nothing.)
 
 The count-9 decode half is real and repeatable, though, and count-isolated runs pin it down (same
 binary, `HEARTH_THREADS` 8 against 9): dense 1.7B Q1_0 48.84 → 50.24, 4B Q1_0 22.01 → 22.13, plus
 4B Q2_0 12.58 → 13.02, 8B Q1_0 11.72 → 12.45, 8B Q2_0 5.83 → 6.22 against the shipped arm. The two
-paths genuinely want different counts; the batched prefill's cliff is the only thing holding the
+paths genuinely want different counts; the batched prefill's tail is the only thing holding the
 dense count at physical.
 
 Two follow-up probes killed the obvious suspects and moved the answer. **Bandwidth**: a batched
@@ -41,22 +41,50 @@ prefill streams its ~2.3 GB of weights once per dispatch, so the 9.2 s at count 
 1% of what the memory system delivers — so it is not bandwidth bound. **DVFS**: sampling
 `\Processor Information(_total)\% Processor Performance` through the prefill reads a mean of 108% at 8
 workers against 103-105% at 9, boost peaks 123-125% in both, temperature 36.8 C — the frequency does
-not collapse. What the same session showed is how much of pt 18's "2.4x spread at 9" was the *box*
-rather than the code: on a quiet machine, mirrored and tight, 9 workers beats 8 at *every* prompt
-length measured — 19 tokens 1977 → 1831 ms, 55 tokens 5039 → 4700, 109 tokens 9396 → 8952 (ratios
-0.93 / 0.93 / 0.95). Those pt-18 sweeps ran minutes after release builds, with a browser and this
-harness live, so the 19933 ms outlier is ambient load — and so is much of the 4B Q2_0 row that made
-the count-9 arm look disqualified.
+not collapse.
 
-The honest statement of the dense rule is therefore **robustness, not speed**. With count = `physical`
-the pool has exactly one runnable worker per core, so external load costs it a little (each worker
-still owns a core). At 9+ the pool is one over, so any second contender tips a core into three
-threads, a worker is descheduled, and the dispatch pays for it in full because its time is the **max
-over workers**. That is the same mechanism behind the older 8B Q1_0 reading (13.2 tok/s at 8 against
-6.9 at 12) and behind 10 workers being a consistent 2.1x. The count-9 *mean* is better on a quiet box
-and its *variance* is worse on a busy one — and for a default on a laptop, variance is the number that
-matters. **So the calibration runner has to measure variance, not just the mean** (RESUME item 3): a
-count that wins by 5% quiet and loses 2x loaded is not a winner.
+The same session also found the mode: on a quiet machine 9 workers beats 8 at *every* prompt length
+measured — 19 tokens 1977 → 1831 ms, 55 tokens 5039 → 4700, 109 tokens 9396 → 8952 (ratios 0.93 /
+0.93 / 0.95). One sample per point, so those runs cannot see a spread — and when the controlled sweep
+could, the ambient-load explanation for pt 18's outlier fell over: a 6-thread busy load (the runner's
+loaded condition) doubles every row — 14 runnable threads on 8 physical cores — yet it moves the tail
+around rather than concentrating it on 9 (4B Q2_0 loaded prefill 13795/13959 ms for 8/9, inside 5%;
+8B Q2_0 loaded prefill 27070/26395, i.e. 9 ahead, while the loaded *decode* spread read 15.9% at 8
+against 59.4% at 9). So the load arm confirms the mechanism but is no sharper than the quiet window
+for finding the tail — the tail is count 9's own.
+
+**What the controlled sweep found** (`scripts/count-sweep.py` — the tool RESUME item 3 asks for: a
+per-count mean *and* spread per condition, the run order rotated, a fragility flag, and an explicit
+"inside the noise, no switch justified"). Dense 8B Q2_0, 109-token prefill, `HEARTH_THREADS` 8 against
+9, no added load:
+
+| | count 8 | count 9 |
+| --- | --- | --- |
+| raw (5 repeats) | 9062 9134 9217 9008 8991 | 8528 8599 8679 **15115** 8296 |
+| mean / spread | 9082 ms / 2.5% | 9843 ms / 69.3% |
+| clean state | 9082 ms | ~8400 ms (0.93x of count 8) |
+
+Count 9's batched prefill is **bimodal**, not erratic: four runs in five it is the ~7% faster arm the
+length sweep saw, and the fifth is 1.7x slower than its own clean state. A second quiet window read
+the same shape (60.4% spread against 1.3% for count 8), and pt 18's window read the tail end of it
+(12999/19933). Both earlier readings were true samples of one distribution — the "cliff" was the tail,
+the quiet sweep was the mode.
+
+The mechanism is the split. `pool.rs` divides a batch statically (`chunk = n.div_ceil(nt)`, worker `i`
+takes `i*chunk..(i+1)*chunk`), so 9 workers over 109 rows hand the ninth 5 rows against 13 for the
+other eight, and 9 threads on 8 physical cores always leaves one core holding two of them. When that
+pair is two long chunks the dispatch waits on the slower one for the whole run (the tail); when it is
+a long chunk and the 5-row one, the penalty ends early (the mode). Count 8 has neither problem: eight
+14-row chunks on eight cores, balanced.
+
+So the dense rule is **robustness, not speed**. Count = `physical` gives exactly one runnable worker
+per core, so external load costs it a little and its spread stays 1-3%. At 9+ the pool is one over and
+a dispatch cannot finish before its last worker, so one bad placement costs the run. The same
+mechanism is behind the older 8B Q1_0 reading (13.2 tok/s at 8 against 6.9 at 12) and behind 10 workers
+being a consistent 2.1x. Count 9's *mode* is 5-7% better and its *tail* is 1.7-2.2x worse, and for a
+default on a laptop the tail is the number that matters. **So the calibration runner has to measure the
+spread, not just the mean** (RESUME item 3): a count that wins by 5% quiet and loses 2x on one run in
+five is not a winner — `scripts/count-sweep.py` flagged count 9 fragile the first time it ran.
 
 ### The Q2_0 dispatch preferred a kernel 47% slower per thread, and the worker count follows the prefill (SparkOC, 2026-10-16 late)
 

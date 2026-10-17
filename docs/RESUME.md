@@ -55,26 +55,54 @@
 > was the dispatcher's own wait (`wait_for_workers` spins `SPIN_BUDGET` then `yield_now`-loops, and
 > `yield_now` only offers the core to a thread ready on the same *logical* processor). Made
 > per-dispatch — a batched dispatch blocks on a condvar the workers notify under the same lock, a
-> single-token dispatch still yields — the park **reduced** the 9-worker spread (8582/8605/8720/8617 ms
-> against 12999/8320/13256/19933/8439 for yield) but did **not** remove it: a later window read 6409 ms
-> (dense 4B Q2_0) and 14725 ms (dense 8B Q2_0) against a steady 5310/9601 at the shipped count of 8. At
-> 8 the park buys nothing (9281 against 9357), and parking *unconditionally* costs single-token decode
-> 7%, so it is **reverted** — the count stays `physical`, the wait stays yield. What the sweep did pin
-> down is the other half: count 9 is a repeatable **+2.8 to +6.6% decode** on all six dense models
+> single-token dispatch still yields — the park read 8582/8605/8720/8617 ms at 9 against
+> 12999/8320/13256/19933/8439 for yield, but *those two columns are different windows* (pt 20 corrects
+> this): the only same-window pair is at 8, where the park buys nothing (9281 against 9357). Either way
+> it is **reverted** — parking *unconditionally* costs single-token decode 7%, so it had to be
+> conditioned on `seq_len > 1` at all, and the count stays `physical` with the wait on yield. What the
+> sweep did pin down is the other half: count 9 is a repeatable **+2.8 to +6.6% decode** on all six
+> dense models
 > (count-isolated, same binary: 1.7B Q1_0 48.84 → 50.24, 4B Q1_0 22.01 → 22.13, 4B Q2_0 12.58 → 13.02,
 > 8B Q1_0 11.72 → 12.45, 8B Q2_0 5.83 → 6.22), and the *only* thing blocking it as a default is the
-> batched prefill's cliff. Two probes then killed the obvious suspects: it is not bandwidth (a
+> batched prefill's tail. Two probes then killed the obvious suspects: it is not bandwidth (a
 > dispatch streams ~2.3 GB of weights in ~9.2 s ≈ 250 MB/s) and not DVFS (the perf counter reads mean
 > 108% at 8 workers against 103-105% at 9, boost peaks 123-125% in both, 36.8 C throughout). And pt
-> 18's "2.4x spread at 9" turns out to have been mostly the box: on a quiet machine, mirrored, 9
-> workers beats 8 at *every* prompt length measured (19/55/109 tokens: 1977→1831, 5039→4700,
-> 9396→8952 ms) — those pt-18 sweeps ran minutes after release builds with a browser and this harness
-> live. So the dense rule is **robustness, not speed**: at `physical` the pool has one runnable worker
-> per core and external load costs it little; at 9+ it is one over, so a second contender tips a core
-> into three threads and the max-over-workers dispatch pays for it in full. Count 9 has the better
-> mean quiet and the worse *variance* busy — for a laptop default, variance is the number that matters.
+> 18's "2.4x spread at 9" was then read as mostly the box, because a quiet machine had 9 beating 8 at
+> *every* prompt length measured (19/55/109 tokens: 1977→1831, 5039→4700, 9396→8952 ms) — but pt 20's
+> controlled sweeps retired that reading too (one sample per point is a *mode*, not the whole story):
+> same window, count 9's 109-token prefill is 8528/8599/8679/**15115**/8296 ms against
+> 9062/9134/9217/9008/8991 for count 8, i.e. a ~7% better mode and a 1.7x worse tail. So the dense
+> rule is **robustness, not speed**, and the tail is what a laptop default is judged on.
 
-## Do these first (carry-over from pt 18/19)
+> **Session 2026-10-17 (pt 20) in one paragraph — count 9's prefill is bimodal, and the mechanism is
+> the static split.** pt 19 left the count question as "9 is better quiet and worse busy", with its
+> park experiment reverted and pt 18's 2.4x outlier blamed on the box. Both readings are corrected by
+> the controlled sweep. First the record: the park table's 9-worker row compared the park window
+> against pt 18's window, so the park's effect at 9 was never measured against the shipped arm at all —
+> the only same-window pair is at 8, where it bought nothing (9281 against 9357 ms), and "the park
+> reduced the spread" was a cross-window artefact of exactly the kind this exercise exists to catch.
+> Second the finding: `scripts/count-sweep.py` (new — it sweeps a count on both passes, on a quiet box
+> *and* under a controlled busy load, rotates the run order, prints a per-count mean **and** spread,
+> and flags a count whose spread exceeds a threshold) measured dense 8B Q2_0's 109-token prefill at
+> counts 8 and 9, five runs each, same window, no added load: count 8 read 9062/9134/9217/9008/8991
+> (spread 2.5%) and count 9 read 8528/8599/8679/**15115**/8296 (spread 69.3%). So count 9 is
+> **bimodal**, not erratic: four runs in five it is the ~7% faster arm pt 19's quiet sweep saw (clean
+> state ~8400 ms, 0.93x of count 8), and the fifth is 1.7x slower than its own clean state. A second
+> quiet window read the same shape (60.4% against 1.3%), and pt 18's window read the tail end of it —
+> the "cliff" was the tail and the quiet sweep was the mode, both true samples of one distribution. The
+> mechanism is in `pool.rs`'s *static* split (`chunk = n.div_ceil(nt)`, worker `i` takes
+> `i*chunk..(i+1)*chunk`): 9 workers over 109 rows hand the ninth 5 rows against 13 for the other
+> eight, and 9 threads on 8 physical cores must leave one core holding two of them — two long chunks
+> sharing a core cost the whole dispatch (a dispatch cannot finish before its last worker), while a
+> long chunk beside the 5-row one ends early. The 6-thread load arm confirms the oversubscription
+> (everything doubles: 14 runnable threads on 8 cores) but is *not* what produces the tail — it moved
+> the tail around instead (4B Q2_0 loaded prefill 13795/13959 ms for 8/9; 8B Q2_0 loaded prefill
+> 27070/26395, count 9 ahead) — so "the box did it" is retired as well. The dense count stays
+> `physical` for a measured reason now: its spread is 1-3%, count 9's mode is 5-7% better and its tail
+> 1.7-2.2x worse, and a default has to be judged on the tail. **A count is chosen on its spread, not
+> its mean** — and the tool that says so is in the tree (`scripts/count-sweep.py`).
+
+## Do these first (carry-over from pt 19/20)
 
 1. **aarch64 runs, and it is slow by construction: there is no SIMD backend for it.** Every
    dispatched kernel there is the scalar fallback, and `arm-qemu-test` is the only thing that has
@@ -84,48 +112,61 @@
    timing is not). The two shapes that suit NEON best are the `Q2V_U8` LUT dot — `vqtbl` is a table
    lookup in one instruction, which is exactly what that kernel is — and the f32 glue in
    `hearth-llm/src/ops.rs`.
-2. **The worker count follows the *path* — and, on the hybrid, the kernel — and pt 19 tested the part
-   of that which was still open.** As shipped: dense = `physical` (8 here); hybrid `Q2_0`/`PQ2_0` =
+2. **The worker count follows the *path* — and, on the hybrid, the kernel — and pt 20 measured why the
+   dense one is the odd one out.** As shipped: dense = `physical` (8 here); hybrid `Q2_0`/`PQ2_0` =
    `min(logical, physical + physical/4)` (10, measured 8.5 tok/s decode and 13346 ms prefill against
    7.9 / 13940 at 8); hybrid `PTQ1_0` = ¾-of-logical (12, 6.7 tok/s against 5.9 at 8). The dense rule
-   is the odd one out, and it is not about the kernel: it is the **batched** prefill, which is unstable
-   above physical (2.4x spread on identical invocations at 9 workers). The pt-18 protocol lesson still
-   holds — **any kernel change owes a count sweep on *both* passes, and any count change owes an
-   interleaved pair on both passes** — and pt 19 added the result: the dispatcher's wait is *not* the
-   cause (parking it per-dispatch reduced the spread but left it, so the wait still yields and the park
-   is not in the tree; see the tracker entry). The dense *decode* conversely wants 9 and gets +2.8-6.6%
-   from it, which makes the count a live trade for the calibration runner (item 3) rather than a
-   **The remaining question is the contention susceptibility, and it is a robustness question.** With
-   count = `physical` the pool has exactly one runnable worker per core, so external load costs it a
-   little; at 9+ the pool is one over and a second contender tips a core into three threads, which the
-   max-over-workers dispatch pays for in full (the same mechanism as the older 8B Q1_0 reading, 13.2
-   tok/s at 8 against 6.9 at 12, and 10 workers being a consistent 2.1x). Count 9 has the better mean
-   on a quiet box (prefill 1977→1831, 5039→4700, 9396→8952 ms at 19/55/109 prompt tokens) and the worse
-   variance on a busy one, so it stays a `HEARTH_THREADS=9` opt-in and not a default.
-   `HEARTH_THREADS` overrides everything.
-3. **The `benchk`-driven per-CPU calibration runner is still the unfinished half of Goal 1, and pt 18
-   says what it has to model.** It is no longer just "pick the winning kernel per dtype": the worker
-   count is one decision *per path* (item 2), so the record has to be a (kernel, count) pair per dtype
-   per path — and it has to *refuse* to switch on a difference inside the noise band. `benchk`
-   already prints every arm's GB/s and the CPUID decode, with a 300 ms warm-up per arm and a minimum of
-   two passes; what it does not do is persist a winner, sweep the count, or refuse. The hazard is real
-   and was misread once: a v3 run that ranked `avx2_lut` 2.51 ahead of `vnni512x2` 1.70 was dismissed
-   as clock ramp-up because a `native` rerun reversed it — but the v3 reading was right, and `native`
-   was measuring different codegen for the same source. **A baseline is part of the measurement; only
-   compare within one.** `scripts/baseline-invariance.py` is the first piece and it is done: it takes
-   `NAME=TARGET_DIR` pairs, runs `benchk` twice per baseline, and reports *arm drift* and *dispatch
-   drift* separately — validated by catching both on the pre-change artifacts in `target/buffy-ab/`.
-   What remains is the count axis — which now has data (the dense *mean* wants 9, the dense default
-   stays 8 for the robustness reason in item 2, the hybrid wants quarter-past / ¾) — and persisting a
-   winner: the record has to be a (kernel, count, path) triple, it has to refuse a switch inside the
-   noise band, and it has to **measure under contention as well as on a quiet box**. Count 9's mean is
-   better quiet and its variance is far worse loaded, and a default on a user's laptop has to be
-   judged on the loaded number.
+   is not about its kernel: it is the **batched** prefill, whose spread at 9 workers is bimodal — the
+   measurement is the first bullet below and the mechanism is the second. `HEARTH_THREADS` overrides
+   everything.
+   - **The dense rule is about the batched prefill's *spread*, and that spread is bimodal.** Over 109
+     batched rows, count 9 reads 8528/8599/8679/**15115**/8296 ms against 9062/9134/9217/9008/8991 for
+     count 8 (same window, no added load): its mode is ~7% *faster* than 8 and its tail is 1.7x slower,
+     while count 8's spread stays 1-3%. A default is judged on the tail, so the count stays `physical`
+     and count 9 stays a `HEARTH_THREADS=9` opt-in — the dense *decode* half (+2.8-6.6%, item 3's count
+     axis) does not pay for that tail. The protocol lesson still holds — **any kernel change owes a
+     count sweep on *both* passes, and any count change owes an interleaved pair on both passes** — and
+     pt 19 added that the dispatcher's wait is *not* the cause (the park is not in the tree).
+   - **The mechanism is `pool.rs`'s static split, and it names a candidate change.** A batch is divided
+     as `chunk = n.div_ceil(nt)`, worker `i` taking `i*chunk..(i+1)*chunk`, so 9 workers over 109 rows
+     hand the ninth worker 5 rows against 13 for the other eight — an unbalanced split *and* 9 threads
+     on 8 physical cores, i.e. one core always holding two workers. Two long chunks sharing a core cost
+     the whole dispatch (it cannot finish before its last worker); a long chunk beside the 5-row one
+     ends early. **Untested hypothesis for the next session:** an atomic work-stealing split for the
+     batched path (`batched_rows_chunk` taking a `fetch_add`ed row range) removes the imbalance and
+     bounds the sharing penalty to the final row, which should turn count 9's tail from 1.7x into
+     something small — and if the spread does *not* tighten, that falsifies the mechanism above.
+     Measure it the protocol's way (mirrored, both passes, counts 8/9/10, with
+     `scripts/count-sweep.py`); do not ship a split change on the reasoning alone.
+3. **The `benchk`-driven per-CPU calibration runner is still the unfinished half of Goal 1 — but both
+   of its axes now have tools.** It is not just "pick the winning kernel per dtype": the worker count
+   is one decision *per path* (item 2), so the record has to be a (kernel, count, path) triple, and it
+   has to *refuse* to switch on a difference inside the noise band. `benchk` already prints every arm's
+   GB/s and the CPUID decode, with a 300 ms warm-up per arm and a minimum of two passes; what it does
+   not do is persist a winner, sweep the count, or refuse.
+   - **Done — `scripts/baseline-invariance.py`** (the kernel axis): `NAME=TARGET_DIR` pairs, `benchk`
+     twice per baseline, *arm drift* and *dispatch drift* reported separately, validated by catching
+     both on the pre-change artifacts in `target/buffy-ab/`.
+   - **Done — `scripts/count-sweep.py`** (the count axis, new in pt 20): a count on both passes, on a
+     quiet box *and* under a controlled busy load, run order rotated, a per-count mean **and** spread,
+     a fragility flag, and an explicit "inside the noise, no switch justified". It is what established
+     item 2, and it carries the rule that matters: **judge a count on its spread**, because the loaded
+     arm alone is not enough — it confirms the oversubscription mechanism (everything doubles) without
+     being a sharper finder of the tail than the quiet window (4B Q2_0 loaded prefill 13795/13959 ms
+     for 8/9 against 4656/4467 quiet; 8B Q2_0 loaded prefill read count 9 *ahead* at 27070/26395).
+   - **What remains:** persisting the winner as a (kernel, count, path) triple with the refusal rule,
+     and folding the count sweep into `benchk`'s report instead of leaving it a separate script.
+   The hazard the harness exists to prevent is real and was misread once: a v3 run that ranked
+   `avx2_lut` 2.51 ahead of `vnni512x2` 1.70 was dismissed as clock ramp-up because a `native` rerun
+   reversed it — but the v3 reading was right, and `native` was measuring different codegen for the
+   same source. **A baseline is part of the measurement; only compare within one** — and pt 20's
+   correction of its own park table says the same about a *window*.
 4. **Closed in pt 18: the Q2_0 rows were not noise — the dispatch was choosing the slower kernel.**
    With the kernel fixed and the count back at physical they read **+31% decode and −4 to −7% prefill**
    on all three dense Q2_0 models (mirrored, with the Q1_0 rows as an unchanged control). The "count
    alone bought +45%+" reading was wrong and is retired: that measurement used a short prompt, i.e.
-   decode only, and the same count cost 2.4x on prefill (item 2). The lesson to keep: three sweeps of
+   decode only, and the same count pays up to 2.4x on a bad prefill run (item 2 — 1.7x in a
+   controlled window). The lesson to keep: three sweeps of
    the same regression looked like drift because the explanation ("machine state plus the thread
    count") was plausible, and the measurement that would have falsified it — the kernel arms
    themselves, on real weights — was in `benchk` the whole time.
@@ -144,7 +185,10 @@
    order-mirrored re-run read +4.5% / +2.7% / +3.6%. Use `b,a,a,b` and `a,b,b,a` groups, compare
    **group means**, and never compare across windows — the absolute level drifts ~10% over an hour.
    The CLI's 50-token run has a ±5% spread on its own; one transient group in the 4B read 18.0 tok/s
-   where every other group read 21–22.
+   where every other group read 21–22. **A *loaded* row is a different measurement, not a faster one**:
+   `scripts/count-sweep.py --load N` is deliberately contended (never run it beside real work, and never
+   compare its rows to quiet ones) — it answers "does this count keep its shape when the box is busy",
+   which is the question a laptop default has to answer.
 
 ## Earlier sessions — the history lives in `docs/BUG_TRACKER.md`
 
