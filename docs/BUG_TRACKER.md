@@ -23,7 +23,8 @@ the same lock; single-token dispatch keeps yielding), mirrored against the shipp
 
 The park **reduces** the 9-worker spread but does not remove it: the same 9-worker binary read 6409 ms
 (dense 4B Q2_0) and 14725 ms (dense 8B Q2_0) against a steady 5310/9601 for the count-8 arm in a later
-window. At the shipped count it buys nothing (9281 against 9357 is inside the noise), and parking
+window — that window was contended as well, and the last paragraph of this entry is the tie-break. At
+the shipped count it buys nothing (9281 against 9357 is inside the noise), and parking
 *unconditionally* costs single-token decode 7% (dense 4B Q2_0 11.3 tok/s against 12.2) — which is why
 it had to be conditioned on `seq_len > 1` at all. So it was **reverted**: the count stays `physical`,
 the wait stays yield, and the park was not kept, because a change with no measurement behind it is
@@ -35,13 +36,27 @@ binary, `HEARTH_THREADS` 8 against 9): dense 1.7B Q1_0 48.84 → 50.24, 4B Q1_0 
 paths genuinely want different counts; the batched prefill's cliff is the only thing holding the
 dense count at physical.
 
-Next hypothesis, for whoever picks this up: the batched prefill is DRAM-bandwidth bound — it streams
-the whole weight file once per dispatch — so a 9th worker adds fetch footprint rather than bandwidth,
-and the swings look like cache/bank conflicts rather than CPU contention. Testing that means varying
-`batched_rows_chunk`'s `tile_size` (one L2-sized tile per worker) or the `dot_fn2` pairing, not the
-pool. Meanwhile the count question has a usable answer: `HEARTH_THREADS=9` on a dense model is +3-7%
-decode with a prefill that can be 20-50% slower, so it is not a default and never will be until the
-cliff is understood.
+Two follow-up probes killed the obvious suspects and moved the answer. **Bandwidth**: a batched
+prefill streams its ~2.3 GB of weights once per dispatch, so the 9.2 s at count 8 is ~250 MB/s — under
+1% of what the memory system delivers — so it is not bandwidth bound. **DVFS**: sampling
+`\Processor Information(_total)\% Processor Performance` through the prefill reads a mean of 108% at 8
+workers against 103-105% at 9, boost peaks 123-125% in both, temperature 36.8 C — the frequency does
+not collapse. What the same session showed is how much of pt 18's "2.4x spread at 9" was the *box*
+rather than the code: on a quiet machine, mirrored and tight, 9 workers beats 8 at *every* prompt
+length measured — 19 tokens 1977 → 1831 ms, 55 tokens 5039 → 4700, 109 tokens 9396 → 8952 (ratios
+0.93 / 0.93 / 0.95). Those pt-18 sweeps ran minutes after release builds, with a browser and this
+harness live, so the 19933 ms outlier is ambient load — and so is much of the 4B Q2_0 row that made
+the count-9 arm look disqualified.
+
+The honest statement of the dense rule is therefore **robustness, not speed**. With count = `physical`
+the pool has exactly one runnable worker per core, so external load costs it a little (each worker
+still owns a core). At 9+ the pool is one over, so any second contender tips a core into three
+threads, a worker is descheduled, and the dispatch pays for it in full because its time is the **max
+over workers**. That is the same mechanism behind the older 8B Q1_0 reading (13.2 tok/s at 8 against
+6.9 at 12) and behind 10 workers being a consistent 2.1x. The count-9 *mean* is better on a quiet box
+and its *variance* is worse on a busy one — and for a default on a laptop, variance is the number that
+matters. **So the calibration runner has to measure variance, not just the mean** (RESUME item 3): a
+count that wins by 5% quiet and loses 2x loaded is not a winner.
 
 ### The Q2_0 dispatch preferred a kernel 47% slower per thread, and the worker count follows the prefill (SparkOC, 2026-10-16 late)
 

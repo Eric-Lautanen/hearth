@@ -63,9 +63,16 @@
 > down is the other half: count 9 is a repeatable **+2.8 to +6.6% decode** on all six dense models
 > (count-isolated, same binary: 1.7B Q1_0 48.84 → 50.24, 4B Q1_0 22.01 → 22.13, 4B Q2_0 12.58 → 13.02,
 > 8B Q1_0 11.72 → 12.45, 8B Q2_0 5.83 → 6.22), and the *only* thing blocking it as a default is the
-> batched prefill's cliff. New hypothesis for that cliff: DRAM bandwidth, not CPU contention — the
-> batched path streams the whole weight file once per dispatch, so a 9th worker adds fetch footprint,
-> not bandwidth.
+> batched prefill's cliff. Two probes then killed the obvious suspects: it is not bandwidth (a
+> dispatch streams ~2.3 GB of weights in ~9.2 s ≈ 250 MB/s) and not DVFS (the perf counter reads mean
+> 108% at 8 workers against 103-105% at 9, boost peaks 123-125% in both, 36.8 C throughout). And pt
+> 18's "2.4x spread at 9" turns out to have been mostly the box: on a quiet machine, mirrored, 9
+> workers beats 8 at *every* prompt length measured (19/55/109 tokens: 1977→1831, 5039→4700,
+> 9396→8952 ms) — those pt-18 sweeps ran minutes after release builds with a browser and this harness
+> live. So the dense rule is **robustness, not speed**: at `physical` the pool has one runnable worker
+> per core and external load costs it little; at 9+ it is one over, so a second contender tips a core
+> into three threads and the max-over-workers dispatch pays for it in full. Count 9 has the better
+> mean quiet and the worse *variance* busy — for a laptop default, variance is the number that matters.
 
 ## Do these first (carry-over from pt 18/19)
 
@@ -88,13 +95,14 @@
    cause (parking it per-dispatch reduced the spread but left it, so the wait still yields and the park
    is not in the tree; see the tracker entry). The dense *decode* conversely wants 9 and gets +2.8-6.6%
    from it, which makes the count a live trade for the calibration runner (item 3) rather than a
-   hand-set rule. **Next test for the cliff: DRAM bandwidth.** A batched dispatch streams the whole
-   weight file, so a 9th worker adds fetch footprint rather than bandwidth, and the suspects are
-   `batched_rows_chunk`'s tile walk (`tile_size = 1048576 / row_bytes`, one L2-sized tile per worker —
-   two workers on one L2 slice would thrash it) and the `dot_fn2` pairing. Separate bandwidth from
-   contention by varying `tile_size` and the pairing at a *fixed* count of 9 and watching whether the
-   spread collapses. `HEARTH_THREADS` still overrides everything, and `HEARTH_THREADS=9` on a dense
-   model is +3-7% decode with a prefill that can be 20-50% slower, so it is not a default.
+   **The remaining question is the contention susceptibility, and it is a robustness question.** With
+   count = `physical` the pool has exactly one runnable worker per core, so external load costs it a
+   little; at 9+ the pool is one over and a second contender tips a core into three threads, which the
+   max-over-workers dispatch pays for in full (the same mechanism as the older 8B Q1_0 reading, 13.2
+   tok/s at 8 against 6.9 at 12, and 10 workers being a consistent 2.1x). Count 9 has the better mean
+   on a quiet box (prefill 1977→1831, 5039→4700, 9396→8952 ms at 19/55/109 prompt tokens) and the worse
+   variance on a busy one, so it stays a `HEARTH_THREADS=9` opt-in and not a default.
+   `HEARTH_THREADS` overrides everything.
 3. **The `benchk`-driven per-CPU calibration runner is still the unfinished half of Goal 1, and pt 18
    says what it has to model.** It is no longer just "pick the winning kernel per dtype": the worker
    count is one decision *per path* (item 2), so the record has to be a (kernel, count) pair per dtype
@@ -107,9 +115,12 @@
    compare within one.** `scripts/baseline-invariance.py` is the first piece and it is done: it takes
    `NAME=TARGET_DIR` pairs, runs `benchk` twice per baseline, and reports *arm drift* and *dispatch
    drift* separately — validated by catching both on the pre-change artifacts in `target/buffy-ab/`.
-   What remains is the count axis — which now has data (the dense decode wants 9, the batched prefill
-   wants 8, the hybrid wants quarter-past / ¾) — and persisting a winner: the record has to be a
-   (kernel, count, path) triple, and it has to refuse a switch inside the noise band.
+   What remains is the count axis — which now has data (the dense *mean* wants 9, the dense default
+   stays 8 for the robustness reason in item 2, the hybrid wants quarter-past / ¾) — and persisting a
+   winner: the record has to be a (kernel, count, path) triple, it has to refuse a switch inside the
+   noise band, and it has to **measure under contention as well as on a quiet box**. Count 9's mean is
+   better quiet and its variance is far worse loaded, and a default on a user's laptop has to be
+   judged on the loaded number.
 4. **Closed in pt 18: the Q2_0 rows were not noise — the dispatch was choosing the slower kernel.**
    With the kernel fixed and the count back at physical they read **+31% decode and −4 to −7% prefill**
    on all three dense Q2_0 models (mirrored, with the Q1_0 rows as an unchanged control). The "count
