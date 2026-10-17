@@ -84,18 +84,23 @@ this box, equal to the old hardcoded 8, and correct on a 4C or 32C host), and **
 its own ¾-of-logical rule (12)**. CPUID is safe on 1.99 (`__cpuid`/`__cpuid_count` are not unsafe),
 so there is no suppression anywhere.
 
-**6-model sweep at the new default** (one run each, warmed, `--temp 0 --max-tokens 50`, ±10–15%):
+**6-model sweep at the new default** (one run each, warmed, `--temp 0 --max-tokens 50`, ±10–15%).
+The `pt 17` column is the same tree plus the dispatch-wait yield (and the aarch64 `#[cfg]` gates,
+which are x86 no-ops), so it is also the check that the yield did not cost anything:
 
-| Model | tok/s | 2026-10-15 chart |
-| ----- | ----- | ---------------- |
-| Bonsai-1.7B-Q1_0 | 43.40 | 47.13 |
-| Ternary-Bonsai-1.7B-Q2_0 | 15.56 | 24.53 |
-| Bonsai-4B-Q1_0 | 18.66 | 18.84 |
-| Ternary-Bonsai-4B-Q2_0 | 7.82 | 12.41 |
-| Bonsai-8B-Q1_0 | 11.3–12.3 | 12.20 |
-| Ternary-Bonsai-8B-Q2_0 | 4.33 | 6.75 |
+| Model | pt 16 | pt 17 (final binary) | 2026-10-15 chart |
+| ----- | ----- | -------------------- | ---------------- |
+| Bonsai-1.7B-Q1_0 | 43.40 | 46.82 | 47.13 |
+| Ternary-Bonsai-1.7B-Q2_0 | 15.56 | 19.28 | 24.53 |
+| Bonsai-4B-Q1_0 | 18.66 | 21.56 | 18.84 |
+| Ternary-Bonsai-4B-Q2_0 | 7.82 | 8.91 | 12.41 |
+| Bonsai-8B-Q1_0 | 11.3–12.3 | 11.60 | 12.20 |
+| Ternary-Bonsai-8B-Q2_0 | 4.33 | 4.64 | 6.75 |
 
-All three Q1_0 rows match the chart; all three Q2_0 rows read ~36% under it, the same family-wide
+Every row is equal or better than pt 16, and the 1.7B/4B/8B Q1_0 rows are now at or above the chart
+(46.82, 21.56, 11.60 against 47.13, 18.84, 12.20).
+
+All three Q2_0 rows read ~36% under the chart, the same family-wide
 drift pt 15 already documented (±25% on both arms). It is not a v3 artifact: interleaved against
 the native binary, Ternary-Bonsai-4B-Q2_0 is **10.41 native against 8.15 v3 at 8 workers, and 10.3
 v3 at 12 workers** — v3 matches native once the thread counts match, so the gap to the chart is
