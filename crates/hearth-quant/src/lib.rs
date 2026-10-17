@@ -63,8 +63,14 @@ pub(crate) unsafe fn f16_bits_to_f32(bits: u16) -> f32 {
     _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(i32::from(bits))))
 }
 
+// The AVX-512 width policy and the CPUID fields it reads are x86_64-only by
+// construction: they exist to choose between x86 kernels, and another
+// architecture has no width to choose. Gated here rather than left to fall out
+// as dead code, which is what an aarch64 build otherwise reports.
+
 /// AMD family 19h (Zen 3 / Zen 4). The only AVX-512 part in it is Zen 4, whose
 /// 512-bit datapath is two 256-bit halves.
+#[cfg(target_arch = "x86_64")]
 pub(crate) const AMD_FAMILY_SPLIT_AVX512: u8 = 0x19;
 
 /// Effective CPUID family from leaf 1 `EAX`.
@@ -79,6 +85,7 @@ pub(crate) const AMD_FAMILY_SPLIT_AVX512: u8 = 0x19;
 ///
 /// Kept free of any hardware access so the decode can be tested for parts this
 /// machine is not.
+#[cfg(target_arch = "x86_64")]
 pub(crate) const fn cpuid_family(eax: u32) -> u8 {
     let base = ((eax >> 8) & 0xF) as u8;
     let ext = ((eax >> 20) & 0xFF) as u8;
@@ -90,6 +97,7 @@ pub(crate) const fn cpuid_family(eax: u32) -> u8 {
 }
 
 /// Whether a leaf-0 `EBX`/`ECX`/`EDX` triple reads `AuthenticAMD`.
+#[cfg(target_arch = "x86_64")]
 pub(crate) const fn cpuid_is_amd(ebx: u32, ecx: u32, edx: u32) -> bool {
     ebx == u32::from_le_bytes(*b"Auth")
         && edx == u32::from_le_bytes(*b"enti")
@@ -101,6 +109,7 @@ pub(crate) const fn cpuid_is_amd(ebx: u32, ecx: u32, edx: u32) -> bool {
 ///
 /// A part gets full-width AVX-512 unless it is an AMD part in family 19h, whose
 /// 512-bit datapath is two 256-bit halves. The features must still be present.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn avx512_full_width_for(
     is_amd: bool,
     family: u8,
@@ -485,16 +494,22 @@ mod cpu_decode {
 
     // Synthetic leaf-1 `EAX`: base family in bits 8..12, extended family in
     // bits 20..28. These are the values the real parts report.
+    #[cfg(target_arch = "x86_64")]
     const EAX_ZEN4: u32 = (0xF << 8) | (0xA << 20); // 19h - Ryzen 7 8840HS
+    #[cfg(target_arch = "x86_64")]
     const EAX_ZEN3: u32 = (0xF << 8) | (0xA << 20); // 19h too - same family
+    #[cfg(target_arch = "x86_64")]
     const EAX_ZEN5: u32 = (0xF << 8) | (0xB << 20); // 1Ah
+    #[cfg(target_arch = "x86_64")]
     const EAX_BULLDOZER: u32 = 0xF << 8; // 15h, extended 0
+    #[cfg(target_arch = "x86_64")]
     const EAX_INTEL: u32 = 6 << 8; // family 6
 
     /// The bug this module exists to prevent. A real Zen 4 part reports 0xF in
     /// the 4-bit family field, so any test written against that field — 19h or
     /// its decimal twin 25 — answers "no" on every Zen 4 machine. The
     /// reconstructed family is what actually matches.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn raw_family_field_can_never_match_19h() {
         let raw = (EAX_ZEN4 >> 8) & 0xF;
@@ -504,6 +519,7 @@ mod cpu_decode {
         assert_eq!(cpuid_family(EAX_ZEN4), AMD_FAMILY_SPLIT_AVX512);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn reconstructs_extended_families_and_passes_through_base_ones() {
         assert_eq!(cpuid_family(EAX_ZEN4), 0x19);
@@ -517,10 +533,12 @@ mod cpu_decode {
     }
 
     /// The decision the way the crate makes it: leaf-1 `EAX` in, kernel choice out.
+    #[cfg(target_arch = "x86_64")]
     fn full_width(is_amd: bool, eax: u32, has_f: bool, has_bw: bool) -> bool {
         avx512_full_width_for(is_amd, cpuid_family(eax), has_f, has_bw)
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn only_amd_family_19h_loses_full_width_avx512() {
         // This box: AuthenticAMD 19h with AVX-512 present.
@@ -538,6 +556,7 @@ mod cpu_decode {
         assert!(!full_width(false, EAX_INTEL, false, false));
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn decodes_the_vendor_string() {
         let amd = (

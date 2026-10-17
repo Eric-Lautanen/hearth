@@ -166,12 +166,18 @@ impl Aes128 {
 
     /// Encrypts one 16-byte block in place, via AES-NI where available.
     pub fn encrypt_block(&self, block: &mut [u8; 16]) {
-        if self.aes_ni {
-            // SAFETY: `aes_ni` is only ever true when the runtime probe in
-            // `new` reported the `aes` feature, which is exactly this call's
-            // requirement.
-            unsafe { crate::aesni::encrypt_block(&self.round_keys, block) };
-            return;
+        // The call itself has to sit behind the architecture gate: `aesni` does not
+        // exist elsewhere, and a branch the optimizer can prove dead is still a name
+        // the compiler has to resolve.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.aes_ni {
+                // SAFETY: `aes_ni` is only ever true when the runtime probe in
+                // `new` reported the `aes` feature, which is exactly this call's
+                // requirement.
+                unsafe { crate::aesni::encrypt_block(&self.round_keys, block) };
+                return;
+            }
         }
         self.encrypt_block_software(block);
     }

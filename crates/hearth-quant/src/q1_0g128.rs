@@ -9,8 +9,10 @@ use core::arch::x86_64::*;
 ///
 /// Compiled only for tests, with that kernel: nothing dispatched reads it, so a shipped
 /// build should not carry the table. `#[cfg(test)]` says that where a `#[allow(dead_code)]`
-/// said "unused, and I would rather not hear about it".
-#[cfg(test)]
+/// said "unused, and I would rather not hear about it". The x86_64 half of the gate follows
+/// the kernel itself: the AVX-512 VNNI body is the only reader, and it does not exist
+/// elsewhere.
+#[cfg(all(test, target_arch = "x86_64"))]
 const Q1V_SM: [[u8; 8]; 256] = {
     let mut table = [[0u8; 8]; 256];
     let mut b = 0usize;
@@ -1126,12 +1128,12 @@ fn dot_q1_0g128_q8_0_scalar(weight_row: &[u8], act_data: &[u8], n: usize) -> f32
 mod tests {
     use super::*;
     use crate::q8_0;
-    use std::time::Instant;
 
     /// Microbenchmark the active shuffle AVX2 kernel across model dimensions
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn bench_shuffle_kernel() {
+        use std::time::Instant;
         if !avx2_kernel_available() {
             eprintln!("Skipping AVX2 benchmark (no AVX2)");
             return;

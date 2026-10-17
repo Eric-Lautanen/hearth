@@ -154,15 +154,19 @@ impl Aes128Gcm {
     /// `GHASH` over `aad || pad || ciphertext || pad || len(aad) || len(ct)`
     /// (SP 800-38D §6.4).
     fn ghash(&self, aad: &[u8], ciphertext: &[u8]) -> u128 {
-        if self.pclmul {
-            // SAFETY: `pclmul` is only ever set from the runtime CPU probe in
-            // `new`, and `ghash_x86::multiply` requires exactly that feature.
-            self.ghash_with(aad, ciphertext, |x, y| unsafe {
-                crate::ghash_x86::multiply(x, y)
-            })
-        } else {
-            self.ghash_with(aad, ciphertext, multiply_software)
+        // Gated on the architecture rather than only on the probe: `ghash_x86` is
+        // x86_64-only, and an un-gated branch still has to name it.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.pclmul {
+                // SAFETY: `pclmul` is only ever set from the runtime CPU probe in
+                // `new`, and `ghash_x86::multiply` requires exactly that feature.
+                return self.ghash_with(aad, ciphertext, |x, y| unsafe {
+                    crate::ghash_x86::multiply(x, y)
+                });
+            }
         }
+        self.ghash_with(aad, ciphertext, multiply_software)
     }
 
     /// The GHASH structure, independent of which multiply is used, so the two

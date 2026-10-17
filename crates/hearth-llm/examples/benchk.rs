@@ -34,11 +34,6 @@ fn have(feature: &str) -> bool {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn have(_feature: &str) -> bool {
-    false
-}
-
 /// Print the CPU features and the AMD family the way `hearth_quant`'s AVX-512
 /// gate decodes it: the 4-bit base family field on its own, then the real
 /// family (base + extended when the base field is 0xF, which is how AMD reports
@@ -67,16 +62,23 @@ fn cpu_report() {
     );
 }
 
+/// The kernel the library's own dispatch picks for this dtype. Always present, on
+/// every architecture: it is the arm the hardware variants are measured against.
+fn dispatched_fn(dtype: GgmlDType) -> DotFn {
+    match dtype {
+        GgmlDType::PTQ1_0 => hearth_quant::dot_ptq1_0_q8_0_ptr,
+        GgmlDType::PQ2_0 | GgmlDType::Q2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
+        _ => hearth_quant::dot_q1_0g128_q8_0_ptr,
+    }
+}
+
+/// The kernels worth timing on this machine: the dispatched one, plus whichever
+/// x86 SIMD arms this CPU can actually run. Anything else has no second arm to
+/// compare against, so the harness would only print the same number twice.
 fn make_variants(dtype: GgmlDType) -> Vec<(&'static str, DotFn)> {
-    let mut v: Vec<(&'static str, DotFn)> = match dtype {
-        GgmlDType::PTQ1_0 => vec![("dispatched", hearth_quant::dot_ptq1_0_q8_0_ptr)],
-        GgmlDType::PQ2_0 | GgmlDType::Q2_0 => {
-            vec![("dispatched", hearth_quant::dot_q2_0_q8_0_ptr)]
-        }
-        _ => vec![("dispatched", hearth_quant::dot_q1_0g128_q8_0_ptr)],
-    };
     #[cfg(target_arch = "x86_64")]
     {
+        let mut v = vec![("dispatched", dispatched_fn(dtype))];
         if dtype == GgmlDType::PTQ1_0 {
             v.push(("scalar", hearth_quant::ptq1_0::dot_ptq1_0_q8_0_ptr_scalar));
             if have("avx2") {
@@ -100,8 +102,12 @@ fn make_variants(dtype: GgmlDType) -> Vec<(&'static str, DotFn)> {
                 ));
             }
         }
+        v
     }
-    v
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        vec![("dispatched", dispatched_fn(dtype))]
+    }
 }
 
 fn main() {

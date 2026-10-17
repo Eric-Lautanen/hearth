@@ -25,6 +25,7 @@ const Q2V: [[i8; 4]; 256] = {
 /// Pre-computed i16 LUT: same values as Q2V but sign-extended to i16.
 /// Eliminates `_mm256_cvtepi8_epi16` in the AVX2 dot kernel.
 /// 256 entries × 4 i16 × 2 bytes = 2 KB — stays hot in L1.
+#[cfg(target_arch = "x86_64")]
 const Q2V_I16: [[i16; 4]; 256] = {
     let mut table = [[0i16; 4]; 256];
     let mut b = 0usize;
@@ -43,6 +44,7 @@ const Q2V_I16: [[i16; 4]; 256] = {
 /// Q2V_U8: 2-bit packed values as u8 {0, 1, 2, 3} for vpdpbusd.
 /// vpdpbusd computes Σ u8 * i8; true Q2V = u8 - 1, so correction subtracts Σ act.
 /// 256 entries × 4 u8 = 1 KB.
+#[cfg(target_arch = "x86_64")]
 const Q2V_U8: [[u8; 4]; 256] = {
     let mut table = [[0u8; 4]; 256];
     let mut b = 0usize;

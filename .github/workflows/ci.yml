@@ -57,3 +57,65 @@ jobs:
             --target-dir target/baseline-asm -- --emit=asm
           asm=$(ls target/baseline-asm/release/deps/hearth_quant-*.s)
           python3 scripts/check-kernel-baseline.py "$asm"
+
+  # aarch64 has no runner in this matrix, and does not need one to catch the kind
+  # of break that stops a release: a reference to an x86-only module from a branch
+  # the optimizer can prove dead is still a name the compiler has to resolve, so
+  # `hearth-tls` did not build for aarch64 at all until its AES-NI and PCLMUL
+  # calls were gated on the architecture. `cargo check` does not link, so this
+  # runs on the x86 runners already here and still covers every target, clippy
+  # included. The three targets are the platforms a release has to reach: ARM
+  # Linux (Graviton, Raspberry Pi), Apple silicon, Windows on ARM.
+  arm-cross-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - aarch64-apple-darwin
+          - aarch64-pc-windows-msvc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          components: clippy
+
+      - name: cargo check (${{ matrix.target }})
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --workspace --all-targets --target ${{ matrix.target }}
+
+      - name: cargo clippy (${{ matrix.target }})
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+
+  # The cross-check proves aarch64 compiles; this proves it runs, which is the
+  # half that matters for the kernels. aarch64 has no SIMD backend yet, so every
+  # dispatched kernel there is the scalar fallback, and nothing had ever executed
+  # that path on an ARM instruction set. The crates listed are the CPU-only ones:
+  # the TLS/UI suites want sockets and a filesystem, and are covered natively.
+  arm-qemu-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-unknown-linux-gnu
+
+      - name: Cross linker and user-mode emulation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
+
+      - name: cargo test under qemu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
+        run: |
+          cargo test --target aarch64-unknown-linux-gnu \
+            -p hearth-core -p hearth-gguf -p hearth-quant \
+            -p hearth-tokenizer -p hearth-sampler -p hearth-llm \
+            -- --test-threads=1
