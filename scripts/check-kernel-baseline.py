@@ -12,10 +12,18 @@ banner still reporting `avx2` — the bug this script exists to catch.
 Usage: check-kernel-baseline.py <hearth_quant assembly>
 
 The listing comes from a deliberately weak baseline, so that any kernel which
-forgot to declare a feature shows its calls:
+forgot to declare a feature shows its calls. Both the library and its test build
+are checked:
 
     RUSTFLAGS="-C target-cpu=x86-64-v2" \
       cargo rustc -p hearth-quant --release --lib --target-dir target/baseline-asm -- --emit=asm
+    RUSTFLAGS="-C target-cpu=x86-64-v2" \
+      cargo rustc -p hearth-quant --release --tests --target-dir target/baseline-asm-tests -- --emit=asm
+
+The test build matters as much as the library one: a kernel only the tests reach is
+a kernel the library build never sees, and the Q1_0_G128 VNNI kernel sat there behind
+`#[cfg(test)]` while it measured +180% against the kernel it was meant to replace.
+Nothing re-measured it, because nothing could dispatch it.
 """
 import re
 import sys
@@ -32,6 +40,13 @@ SINGLE_INSN = re.compile(r"fn?madd|fn?msub|dpbusd|dpwssd")
 # probe must have the hardware conversion inlined.
 F16 = re.compile(r"f16_to_f32|f32_to_f16")
 HOT = re.compile(r"avx2|avx512|vnni", re.IGNORECASE)
+
+# A function inside a `tests` module is a harness, not a `#[target_feature]` body: it may
+# legitimately call `half`'s runtime-dispatched conversion, which is how `half` dispatches
+# and is correct at the weak baseline the harness itself is compiled at. Kernels are never
+# named `...tests...`, so every kernel the tests reach is still checked -- by this rule, and
+# unconditionally by SINGLE_INSN, which holds for every caller and needs no name scoping.
+HARNESS = re.compile(r"tests")
 
 LABEL = re.compile(r"^(_R\S+):$")
 CALL = re.compile(r"\bcallq?\s+(\S+)")
@@ -50,7 +65,11 @@ def main(path: str) -> int:
             if not call:
                 continue
             target = call.group(1)
-            if SINGLE_INSN.search(target) or (F16.search(target) and HOT.search(function)):
+            if SINGLE_INSN.search(target) or (
+                F16.search(target)
+                and HOT.search(function)
+                and not HARNESS.search(function)
+            ):
                 bad.append((function, target))
     if bad:
         print(f"{path}: {len(bad)} out-of-line intrinsic call(s) -- a kernel is missing fma/f16c:")

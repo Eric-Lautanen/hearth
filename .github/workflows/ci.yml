@@ -55,8 +55,14 @@ jobs:
           set -euo pipefail
           RUSTFLAGS="-C target-cpu=x86-64-v2" cargo rustc -p hearth-quant --release --lib \
             --target-dir target/baseline-asm -- --emit=asm
-          asm=$(ls target/baseline-asm/release/deps/hearth_quant-*.s)
-          python3 scripts/check-kernel-baseline.py "$asm"
+          python3 scripts/check-kernel-baseline.py "$(ls target/baseline-asm/release/deps/hearth_quant-*.s)"
+          # The test build as well: a kernel only the tests reach is a kernel the library
+          # build never sees, and the Q1_0_G128 VNNI kernel hid there -- `#[cfg(test)]`,
+          # measuring +180% against the kernel it was meant to replace, so it was never
+          # dispatched, so nothing ever re-measured it.
+          RUSTFLAGS="-C target-cpu=x86-64-v2" cargo rustc -p hearth-quant --release --tests \
+            --target-dir target/baseline-asm-tests -- --emit=asm
+          python3 scripts/check-kernel-baseline.py "$(ls target/baseline-asm-tests/release/deps/hearth_quant-*.s)"
 
   # aarch64 has no runner in this matrix, and does not need one to catch the kind
   # of break that stops a release: a reference to an x86-only module from a branch

@@ -3,6 +3,25 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers. Ref: llama.cpp-prism.
 
+### The kernel-baseline guard only built the library, so a test-only kernel was never checked (SparkOC, 2026-10-16 late)
+
+`scripts/check-kernel-baseline.py` is the guard for the whole missing-declaration class, and the
+`kernel-baseline` job fed it one listing: `cargo rustc -p hearth-quant --release --lib`. A kernel
+behind `#[cfg(test)]` is not in that listing. That is exactly where the Q1_0_G128 VNNI kernel sat,
+measuring +180% against the kernel it was meant to replace, with nothing able to dispatch it and so
+nothing ever re-measuring it. The job now builds `--tests` at the same weak baseline and checks that
+listing too.
+
+One exemption was needed: the F16 rule is scoped by function name, and a function inside a `tests`
+module legitimately calls `half`'s runtime-dispatched conversion (`f32_to_f16_x86_f16c`) — that is
+how `half` dispatches, and the harness itself is compiled at the weak baseline. Kernels are never
+named `...tests...`, so every kernel the tests reach is still checked, and the FMA/VNNI rule stays
+unconditional because it holds for every caller.
+
+Validated both ways: with `avx512vnni` removed from the test-only `_2sub` kernel, the test-build
+guard fails with `dot_q1_0g128_q8_0_vnni_avx512_2sub -> __mm512_dpbusd_epi32`; restored, both
+listings are clean.
+
 ### The Q1_0 VNNI kernel was never dispatched because of the same missing-declaration bug — and it is 6% faster (SparkOC, 2026-10-16 late)
 
 `hearth-quant/src/q1_0g128.rs` carried a 256-bit VNNI kernel as `#[cfg(test)]` with a note claiming a
@@ -42,7 +61,8 @@ group mean, and every group here is order-mirrored.
 `hearth-quant`'s 42 tests pass with it dispatched and the VNNI sums are bit-identical to shuffle. The
 `kernel-baseline` guard covers it now — with `avx512vl` removed it fails with
 `dot_q1_0g128_q8_0_vnni_avx512 -> __mm256_dpbusd_epi32`. It did not before because the kernel was
-`#[cfg(test)]` and the guard builds the lib: a bench-only kernel is a kernel nothing checks.
+`#[cfg(test)]` and the guard built only the lib, so the guard now builds the test target too (see the
+entry above): a bench-only kernel is a kernel nothing checks.
 
 ### aarch64 was a release platform with no CI coverage — and it did not build (SparkOC, 2026-10-16 late)
 
