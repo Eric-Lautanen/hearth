@@ -28,21 +28,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Both macOS architectures: a macOS 13 runner is Intel, a macOS 14
-          # runner is Apple silicon, and the bundle has to be built natively on
-          # each because an .app carries one architecture's binary.
+          # Runners are pinned, not "-latest", for two reasons: the macOS Intel
+          # image is a specifically named one, and `ubuntu-latest` migrates to
+          # Ubuntu 26 on 2026-10-19, which would silently raise the glibc floor
+          # of every published binary (an older build runs on a newer distro,
+          # never the reverse). `macos-15-intel` replaced the retired macos-13
+          # and is the last Intel image Actions will host (until Aug 2027);
+          # macos-14 is itself being retired, so arm64 moves up to macos-15.
+          # Both are built natively: an .app carries one architecture's binary.
           - name: windows-x86_64
             os: windows-latest
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - name: linux-arm64
             os: ubuntu-24.04-arm
           - name: macos-x86_64
-            os: macos-13
+            os: macos-15-intel
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
@@ -268,7 +273,7 @@ jobs:
           mkdir -p target/dist
           tar -czf "target/dist/hearth-v$version-linux-$arch.tar.gz" -C "$stage" .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.name }}
           # Listed rather than `hearth-*`: the WiX build also drops a .wixpdb
@@ -292,7 +297,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
           path: dist
