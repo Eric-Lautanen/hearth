@@ -206,3 +206,16 @@ After any LLM change also check `cargo check -p hearth-llm`. There is no accepte
 the clippy findings that used to live in the GPU stubs were fixed, not allowed, and the workspace
 is clean of them (`cargo clippy --workspace --all-targets -- -D warnings` passes).
 After any UI change: `cargo check -p hearth-ui` + `cargo fmt --check` + run `hearth-ui --no-browser` and hit `/`, `/api/models`, `/api/downloads`.
+
+### No credit for anything that did not contribute
+
+This repository has one author: the account that owns it. Nothing else may appear
+as a contributor, co-author, or credit — no tool, agent, model, vendor, service,
+or harness, whether or not it was used on the change. Something that did not
+contribute is not a contributor; something that did contribute still gets no
+credit line, because commits here carry no attribution at all.
+
+No `Co-Authored-By:` naming anything, no "generated with" / "built by" /
+"assisted by" footer, no emoji signature, no `CONTRIBUTORS` / `AUTHORS` /
+credits section (and no additions to one), no vendor state directory, and no
+`.gitignore` rule for one — the rule is itself a trace.
