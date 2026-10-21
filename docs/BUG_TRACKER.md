@@ -47,6 +47,13 @@ screenshotted at both counts. `cargo clippy --workspace --all-targets -- -D warn
 3 of them new (root de-duplication, list splitting, primary fallback). The published MSI
 still contains the old binary — this machine's install was updated by hand.
 
+**The post-change smoke benchmark is not a measurement.** 1.7B Q1_0 read 23.49 then
+17.02 tok/s (50 tokens, temp 0) against the 49.26 baseline — but `synth1` was holding
+**1134%** CPU and `train` 257% (1638% total) at the same moment, and neither `hearth-llm`
+nor `hearth-quant` differs from `HEAD~1` in this change. Nothing to revert; re-measure
+this row when the box is idle, and record `% Processor Performance` plus the top CPU
+consumers beside it.
+
 ### Release machinery, the Windows MSI, and four defects only an install finds (SparkOC, 2026-10-17)
 
 Shipped the release path for v0.2.0: versions bumped 0.1.0 → 0.2.0 across the nine
