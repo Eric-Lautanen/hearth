@@ -111,6 +111,8 @@ struct ReqInner {
     error: String,
     models: Vec<ModelEntry>,
     models_dir: String,
+    /// Every directory the engine searched (primary first).
+    models_dirs: Vec<String>,
     model: Option<LoadedModel>,
     loaded: bool,
     generating: bool,
@@ -125,6 +127,7 @@ impl RequestSlot {
                 error: String::new(),
                 models: Vec::new(),
                 models_dir: String::new(),
+                models_dirs: Vec::new(),
                 model: None,
                 loaded: false,
                 generating: false,
@@ -458,10 +461,21 @@ fn handle_service_event(ctx: &Arc<AppCtx>, v: Json) {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
+            let dirs = v
+                .get("dirs")
+                .and_then(|x| x.as_arr())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|d| Some(d.as_str()?.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| vec![dir.clone()]);
             if let Some(slot) = ctx.take_slot(id) {
                 let mut g = slot.inner.lock().unwrap();
                 g.models = models;
                 g.models_dir = dir;
+                g.models_dirs = dirs;
                 g.done = true;
                 g.ok = true;
             }
@@ -835,6 +849,10 @@ fn handle_models(ctx: &Arc<AppCtx>, stream: &mut TcpStream) {
         let mut v = Json::obj();
         v.set("ok", Json::Bool(true));
         v.set("dir", Json::str(g.models_dir.clone()));
+        v.set(
+            "dirs",
+            Json::Arr(g.models_dirs.iter().map(|d| Json::str(d.clone())).collect()),
+        );
         let items: Vec<Json> = g
             .models
             .iter()

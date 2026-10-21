@@ -13,7 +13,7 @@
 //! dependencies for this crate.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -169,26 +169,34 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
     ]
 }
 
-/// Resolve the project-root `models/` dir: explicit env wins, otherwise walk
-/// up from the executable (covers `target/release/hearth-ui.exe`), else
-/// `./models` relative to the launch CWD.
+/// Where new weights go. Shares the engine's own resolution
+/// (`hearth_core::paths`) so the downloader and the model list can never
+/// disagree about which directory is *the* directory.
 pub fn resolve_models_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("HEARTH_MODELS_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
+    hearth_core::paths::primary_models_dir()
+}
+
+/// The download dir first, then every other root the engine lists — a model
+/// the user already has in `%APPDATA%\hearth\models` counts as downloaded
+/// instead of being fetched a second time.
+fn roots_with(dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![dir.to_path_buf()];
+    for root in hearth_core::paths::models_roots() {
+        if !roots.iter().any(|seen| seen == &root) {
+            roots.push(root);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent();
-        for _ in 0..6 {
-            let Some(d) = dir else { break };
-            if d.join("models").is_dir() {
-                return d.join("models");
-            }
-            dir = d.parent();
-        }
-    }
-    PathBuf::from("models")
+    roots
+}
+
+/// Largest copy of `filename` across `roots` (0 when absent everywhere).
+fn best_len(roots: &[PathBuf], filename: &str) -> u64 {
+    roots
+        .iter()
+        .filter_map(|root| std::fs::metadata(root.join(filename)).ok())
+        .map(|m| m.len())
+        .max()
+        .unwrap_or(0)
 }
 
 fn sanitize_filename(name: &str) -> Option<String> {
@@ -299,9 +307,8 @@ impl Manager {
     }
 
     fn on_disk(&self, e: &CatalogEntry) -> u64 {
-        std::fs::metadata(self.inner.lock().unwrap().dir.join(&e.filename))
-            .map(|m| m.len())
-            .unwrap_or(0)
+        let dir = self.inner.lock().unwrap().dir.clone();
+        best_len(&roots_with(&dir), &e.filename)
     }
 
     /// Snapshot for `GET /api/downloads`.
@@ -312,14 +319,13 @@ impl Manager {
             all.extend(g.custom.clone());
             (g.dir.clone(), all)
         };
+        let roots = roots_with(&dir);
         let items: Vec<Json> = entries
             .iter()
             .map(|e| {
                 // Final file (completion truth) vs .part-or-final (shown bytes,
                 // so a leftover .part renders instead of an empty bar).
-                let have_final = std::fs::metadata(dir.join(&e.filename))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let have_final = best_len(&roots, &e.filename);
                 let shown = part_len(&dir, &e.filename).max(have_final);
                 let (mut phase, mut err) = {
                     let g = self.inner.lock().unwrap();

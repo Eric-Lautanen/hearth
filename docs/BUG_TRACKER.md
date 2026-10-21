@@ -3,6 +3,50 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### The installed UI listed 2 of 9 models — one scan root, fixed in shared code (2026-10-20)
+
+The operator installed the published `v0.2.0` MSI and the model dropdown offered **two**
+models. Both halves of the app resolved a *single* `models/` directory: `hearth-ui`'s
+downloader walked up from its exe on the first hit (so downloads landed in
+`%LOCALAPPDATA%\Programs\Hearth\models`) and the service's `default_models_dir()`
+returned that same directory, so the seven other weights in `%APPDATA%\hearth\models`
+and the fourteen in the source checkout were invisible. Nothing was wrong with the list
+endpoint, the frontend filter or the load path — the scan only ever looked at one folder.
+
+`hearth-core/src/paths.rs` is now the single answer for both crates.
+`models_roots()` returns every existing root — CWD `models/`, each ancestor of the
+executable (six levels, so `target/release/<exe>` finds the repo), `%APPDATA%\hearth\models`,
+`%LOCALAPPDATA%\hearth\models`, `$XDG_DATA_HOME`/`~/.local/share/hearth/models` on unix and
+`~/Library/Application Support/hearth/models` on macOS — each spelled absolute and
+de-duplicated through `canonicalize` (case-insensitive on Windows). `primary_models_dir()`
+decides where new downloads go: override → `models/` beside the exe → `./models` →
+per-user. `HEARTH_MODELS_DIR` still wins outright and now takes a list separated by `;`
+(unix `:`), so weights split across two disks both appear.
+
+- `list_models` walks every root, de-duplicates by filename (first root wins) and answers
+  with `dirs` (all roots searched) beside `dir` (the primary). The installed layout now
+  lists **9** models over 2 roots; adding the repo through the env list gives **14** —
+  the 2 install-dir files and the 14 repo files collapse correctly where they overlap.
+- The downloader only ever stat-ed `dir.join(filename)`, so a model already present in
+  `%APPDATA%` read as `idle` and starting it would have fetched a second copy. `on_disk`
+  and the snapshot now take the **largest copy across all roots**, and a start request for
+  something already there returns `done` without touching the network: five catalogue
+  entries read `done` in the installed layout where two did before.
+- The empty state lists every folder that was searched and mentions `HEARTH_MODELS_DIR`;
+  it used to name one path. The stray full stop that landed on its own line after a
+  `display:block` path span is now inside the span.
+
+Verified through the interface, not the source: the release build was copied over
+`%LOCALAPPDATA%\Programs\Hearth`, launched with `--no-browser` and
+`HEARTH_NO_AUTO_SHUTDOWN=1`, and `GET /api/models` answered 9 models over 2 roots (`/` and
+`/api/downloads` 200; a model living in `%APPDATA%` loaded as `qwen3`), 14 models with
+`HEARTH_MODELS_DIR="C:\github\hearth\models;<install>\models"`, and the rendered chat was
+screenshotted at both counts. `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --check`, `cargo check --workspace --all-targets` and the
+`aarch64-unknown-linux-gnu` check are clean; `cargo test -p hearth-core` is 7 passed,
+3 of them new (root de-duplication, list splitting, primary fallback). The published MSI
+still contains the old binary — this machine's install was updated by hand.
+
 ### Release machinery, the Windows MSI, and four defects only an install finds (SparkOC, 2026-10-17)
 
 Shipped the release path for v0.2.0: versions bumped 0.1.0 → 0.2.0 across the nine

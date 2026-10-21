@@ -273,7 +273,7 @@
   .hero .big .flame-big { color: var(--accent); }
   .hero .sub { font-size: 15px; }
   .hero .warn { color: var(--err); margin-top: 14px; font-size: 13.5px; }
-  .hero .dir { font-family: var(--mono); font-size: 12px; color: var(--faint); margin-top: 4px; }
+  .hero .dir { display: block; font-family: var(--mono); font-size: 12px; color: var(--faint); margin-top: 4px; }
   .chips {
     display: flex;
     flex-wrap: wrap;
@@ -709,7 +709,8 @@
 
 const S = {
   models: [],
-  modelsDir: "",
+  modelsDir: "",         // where new downloads go
+  modelsDirs: [],        // every folder that was searched for .gguf files
   selectedPath: null,
   loaded: null,          // LoadedModel info object or null
   loading: false,
@@ -930,6 +931,13 @@ function scrollBottom(force) {
 // Rendering
 // ---------------------------------------------------------------------------
 
+function searchedDirsHtml() {
+  const dirs = S.modelsDirs.length ? S.modelsDirs : (S.modelsDir ? [S.modelsDir] : []);
+  if (!dirs.length) return " any known folder.";
+  return dirs.map((d, i) =>
+    '<span class="dir">' + esc(d) + (i === dirs.length - 1 ? '.' : '') + '</span>').join("");
+}
+
 function heroEl() {
   const div = document.createElement("div");
   div.className = "hero";
@@ -940,8 +948,8 @@ function heroEl() {
       ? "Pick a model from the dropdown above to start chatting."
       : "Pick a model from the dropdown above — it loads automatically.") + '</div>' +
     (noModels
-      ? '<div class="warn">No .gguf models found' +
-        (S.modelsDir ? ' in <span class="dir">' + esc(S.modelsDir) + '</span>' : "") + '.</div>' +
+      ? '<div class="warn">No .gguf models found in' + searchedDirsHtml() +
+        '<div class="dir">HEARTH_MODELS_DIR adds more folders.</div></div>' +
         '<div><button class="chip" id="heroDl">Open model downloads</button></div>'
       : "") +
     (S.models.length
@@ -1061,6 +1069,7 @@ async function refreshModels() {
     if (!j.ok) throw new Error(j.error || "failed");
     S.models = j.models || [];
     S.modelsDir = j.dir || "";
+    S.modelsDirs = Array.isArray(j.dirs) && j.dirs.length ? j.dirs : (j.dir ? [j.dir] : []);
     renderModelOptions();
     renderChat();
   } catch (e) {

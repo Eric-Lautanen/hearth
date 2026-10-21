@@ -22,8 +22,9 @@
 //! Replies always carry the request `id` and `ok`. Streamed events reuse the
 //! `id` of the generate request that produced them.
 
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -320,9 +321,17 @@ impl Service {
             Cmd::Quit => {}
 
             Cmd::ListModels { id } => {
-                let dir = default_models_dir();
+                // Every root the loader accepts, not just one: an installed
+                // build keeps models in `<install>/models`, a dev tree in the
+                // repo, older ones in `%APPDATA%\hearth\models`. One filename
+                // in two places is listed once, first root wins.
+                let roots = hearth_core::paths::models_roots();
+                let mut seen = HashSet::new();
                 let mut models = Vec::new();
-                if let Ok(entries) = std::fs::read_dir(&dir) {
+                for dir in &roots {
+                    let Ok(entries) = std::fs::read_dir(dir) else {
+                        continue;
+                    };
                     for entry in entries.flatten() {
                         let path = entry.path();
                         let is_gguf = path
@@ -341,6 +350,10 @@ impl Service {
                         if name.is_empty() {
                             continue;
                         }
+                        let key = name.to_lowercase();
+                        if !seen.insert(key) {
+                            continue;
+                        }
                         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                         let mut item = Json::obj();
                         item.set("name", Json::str(name));
@@ -354,11 +367,21 @@ impl Service {
                     let kb = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     ka.cmp(kb)
                 });
+                let primary = hearth_core::paths::primary_models_dir();
                 let mut v = Json::obj();
                 v.set("id", Json::Num(id as f64));
                 v.set("ok", Json::Bool(true));
                 v.set("event", Json::str("models"));
-                v.set("dir", Json::str(dir));
+                v.set("dir", Json::str(primary.to_string_lossy().to_string()));
+                v.set(
+                    "dirs",
+                    Json::Arr(
+                        roots
+                            .iter()
+                            .map(|d| Json::str(d.to_string_lossy().to_string()))
+                            .collect(),
+                    ),
+                );
                 v.set("models", Json::Arr(models));
                 self.out.send(&v);
             }
@@ -586,53 +609,6 @@ impl Service {
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Default models directory (service side — the UI never resolves paths itself)
-// ---------------------------------------------------------------------------
-
-fn default_models_dir() -> String {
-    if let Ok(dir) = std::env::var("HEARTH_MODELS_DIR") {
-        if !dir.is_empty() {
-            return dir;
-        }
-    }
-    // 1. `models/` relative to the current working directory (cargo/dev runs).
-    if Path::new("models").is_dir() {
-        return "models".to_string();
-    }
-    // 2. Walk up from the executable's own directory looking for `models/`
-    //    (handles Explorer/shortcut launches where the CWD is
-    //    `<project>/target/release` or the exe was moved somewhere else).
-    //    Also check sibling directories so a portable layout of
-    //    `hearth-ui.exe + models/` works from anywhere.
-    if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent();
-        for _ in 0..6 {
-            let Some(d) = dir else { break };
-            let candidate = d.join("models");
-            if candidate.is_dir() {
-                return candidate.to_string_lossy().to_string();
-            }
-            let sibling = d
-                .parent()
-                .map(|p| p.join("models"))
-                .unwrap_or_else(|| PathBuf::from("models"));
-            if sibling.is_dir() {
-                return sibling.to_string_lossy().to_string();
-            }
-            dir = d.parent();
-        }
-    }
-    // 3. Last resort: per-user install directory.
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let p = format!("{}\\AppData\\Roaming\\hearth\\models", home);
-        if Path::new(&p).is_dir() {
-            return p;
-        }
-    }
-    "models".to_string()
 }
 
 // ---------------------------------------------------------------------------
