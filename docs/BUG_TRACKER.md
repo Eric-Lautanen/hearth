@@ -3,6 +3,40 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### One copy of the per-token FFN: `forward` and `forward_pair` share `ffn_block` (2026-11-25)
+
+Both forward paths carried their own residual, sandwich norm and gated-FFN body: one token
+through `mm` into the single-token scratch, two through `rotate_quantize_into` + `mm_batched`
+into the chunk buffers. Two copies of the same math in the hottest loop in the engine, kept
+in step by hand — and the stage timers had already drifted apart with them, because the pair
+path counted the residual and post-norm as `mix` while `forward` counted them as `ffn`,
+contradicting the `Q35Timers` doc.
+
+`ffn_block` is now the only copy. It takes an `FfnAt` (layer, position, row count) and an
+`FfnBufs` of borrowed slices: `forward` calls it with `rows = 1` on the single-token buffers,
+`forward_pair` with `rows = PREFILL_CHUNK` on the chunk buffers, and nothing inside branches
+on the caller. Pairing still happens exactly where it did — in the pool, which hands the x2
+kernel two rows when it is given two and the plain kernel when it is given one — so the
+paired weight pass is untouched; decode just reaches the same primitive through
+`rotate_quantize_into` + `mm_batched(seq_len = 1)`. `sc.ffn_gate`/`sc.ffn_up` are gone (one
+set of `chunk_*` buffers serves both row counts) and `chunk_down` exists so the FFN output is
+never aliased with the mix output.
+
+**Correctness**: greedy stdout byte-identical to the pre-refactor binary on 27B PTQ1_0
+(4-token and 1-token prompts), 9B PTQ1_0, 4B PQ2_0 and dense 8B Q2_0. The goldens were
+captured from the old build before the edit, so this covers the decode path that changed how
+it reaches the kernel as well as the pair path.
+
+**Cost**: none measurable. 27B 2.5 PTQ1_0, 74-token prompt: prefill 502.5 ms/token paired
+against 631.1 serial in the same window (508-514 paired before the refactor), decode 647.5
+ms/token against 643-660 before; hybrid decode 4B PQ2_0 8.86 tok/s (8.5 documented), 9B
+PTQ1_0 4.51. The stage split moved by the amount the accounting changed (residual and
+post-norm now count as `ffn` on both paths, which is what `Q35Timers` claims), not by new
+work.
+
+**Gates**: `clippy --workspace --all-targets -- -D warnings`, `fmt --check`,
+`check --workspace --all-targets`, and the same two for `aarch64-unknown-linux-gnu`.
+
 ### Paired hybrid prefill, second half: the mix projections pair too (1.30x prefill, 2026-11-25)
 
 The first half paired only the FFN. `gdn_layer` and `attn_layer` still projected one token

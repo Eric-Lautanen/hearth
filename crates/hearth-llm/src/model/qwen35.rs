@@ -413,8 +413,6 @@ struct FwdScratch {
     gdec: Vec<f32>,       // decay gates (dt_rank)
     beta: Vec<f32>,       // beta values (dt_rank)
     normed_out: Vec<f32>, // v_dim
-    ffn_gate: Vec<f32>,   // d_ffn
-    ffn_up: Vec<f32>,     // d_ffn
     act: Vec<f32>,        // layer output (d_model)
     // -- paired-prefill scratch: PREFILL_CHUNK tokens share one weight pass --
     chunk_hidden: Vec<f32>, // PREFILL_CHUNK * d_model
@@ -422,6 +420,7 @@ struct FwdScratch {
     chunk_act: Vec<f32>,    // PREFILL_CHUNK * d_model (batched mix and FFN output)
     chunk_gate: Vec<f32>,   // PREFILL_CHUNK * d_ffn
     chunk_up: Vec<f32>,     // PREFILL_CHUNK * d_ffn
+    chunk_down: Vec<f32>,   // PREFILL_CHUNK * d_model (ffn_down output)
     chunk_qkv: Vec<f32>,    // PREFILL_CHUNK * conv_dim (gdn qkv)
     chunk_zgate: Vec<f32>,  // PREFILL_CHUNK * v_dim (gdn z gate)
     chunk_q: Vec<f32>,      // PREFILL_CHUNK * 2*nq (attn q|gate, before the split)
@@ -440,6 +439,33 @@ struct FwdScratch {
 // ---------------------------------------------------------------------------
 // Core model
 // ---------------------------------------------------------------------------
+
+/// Where one [`Qwen35Core::ffn_block`] call sits: the layer, the position of its
+/// first row, and how many token rows the caller handed over. The row count is
+/// what makes the block shared — 1 for decode, `PREFILL_CHUNK` for prefill — so
+/// it is passed rather than guessed from a buffer length.
+struct FfnAt {
+    layer: usize,
+    pos: usize,
+    rows: usize,
+}
+
+/// Buffers for one [`Qwen35Core::ffn_block`] call, all borrowed from
+/// [`FwdScratch`] for `rows` token rows. `hidden` is the running residual stream
+/// (in and out) and `mix` is the attention/GDN branch already computed for the
+/// same rows, which the block folds in first so a caller's mix output buffer is
+/// never aliased with the FFN output.
+struct FfnBufs<'a> {
+    hidden: &'a mut [f32], // rows * d_model
+    mix: &'a [f32],        // rows * d_model
+    normed: &'a mut [f32], // rows * d_model
+    q8_d: &'a mut [u8],    // rows * q8_size(d_model)
+    q8_ffn: &'a mut [u8],  // rows * q8_size(d_ffn)
+    rot: &'a mut [f32],    // d_model rotation scratch
+    gate: &'a mut [f32],   // rows * d_ffn
+    up: &'a mut [f32],     // rows * d_ffn
+    down: &'a mut [f32],   // rows * d_model
+}
 
 pub struct Qwen35Core {
     config: ModelConfig,
@@ -806,14 +832,13 @@ impl Qwen35Core {
             gdec: vec![0.0; dt_rank],
             beta: vec![0.0; dt_rank],
             normed_out: vec![0.0; v_dim],
-            ffn_gate: vec![0.0; ffn_dim],
-            ffn_up: vec![0.0; ffn_dim],
             act: vec![0.0; d],
             chunk_hidden: vec![0.0; PREFILL_CHUNK * d],
             chunk_normed: vec![0.0; PREFILL_CHUNK * d],
             chunk_act: vec![0.0; PREFILL_CHUNK * d],
             chunk_gate: vec![0.0; PREFILL_CHUNK * ffn_dim],
             chunk_up: vec![0.0; PREFILL_CHUNK * ffn_dim],
+            chunk_down: vec![0.0; PREFILL_CHUNK * d],
             chunk_qkv: vec![0.0; PREFILL_CHUNK * conv_dim],
             chunk_zgate: vec![0.0; PREFILL_CHUNK * v_dim],
             chunk_q: vec![0.0; PREFILL_CHUNK * 2 * nq],
@@ -1173,6 +1198,131 @@ impl Qwen35Core {
         }
     }
 
+    // -- sandwich norm + FFN ------------------------------------------------
+
+    /// One layer's residual, sandwich norm and gated FFN, for `at.rows` token
+    /// rows.
+    ///
+    /// This is the only copy of that math. `forward` calls it with one row on the
+    /// single-token buffers, `forward_pair` with `PREFILL_CHUNK` rows on the chunk
+    /// buffers, and nothing inside branches on which one called it. Each row is
+    /// normed and quantized on its own; the weight passes are shared whenever more
+    /// than one row arrives, because `mm_batched` hands the pool two rows at a time
+    /// (`PREFILL_CHUNK = 2`) and the pool expands each weight row once for them.
+    fn ffn_block(&self, lyr: &Layer, at: FfnAt, b: FfnBufs<'_>) -> Result<(), String> {
+        let d = self.d_model;
+        let ffn_dim = self.config.d_ffn as usize;
+        let eps = self.config.rms_norm_eps;
+        let q8_d = q8_size(d);
+        let q8_ffn = q8_size(ffn_dim);
+        let n = at.rows;
+
+        // residual: hidden += the attention/GDN branch
+        for i in 0..n {
+            let hidden: &mut [f32] = &mut b.hidden[i * d..(i + 1) * d];
+            let mix: &[f32] = &b.mix[i * d..(i + 1) * d];
+            for (h, m) in hidden.iter_mut().zip(mix.iter()) {
+                *h += *m;
+            }
+        }
+        if at.layer == 0 {
+            dump_layer0(at.pos, "attn_residual-0", &b.hidden[..d]);
+        }
+        if std::env::var_os("HEARTH_Q35_DEBUG").is_some() && at.pos < 2 && at.layer < 6 {
+            let row: &[f32] = &b.hidden[..d];
+            let mean_abs = row.iter().map(|x| x.abs()).sum::<f32>() / row.len() as f32;
+            eprintln!(
+                "[q35dbg] pos={} layer={} is_gdn={} hidden_mean={:.4}",
+                at.pos, at.layer, self.layer_is_gdn[at.layer], mean_abs,
+            );
+        }
+
+        // Sandwich norm, one row per token: every projection below reads it.
+        for i in 0..n {
+            let hidden: &[f32] = &b.hidden[i * d..(i + 1) * d];
+            crate::ops::rms_norm(
+                hidden,
+                &lyr.post_attention_norm.0,
+                eps,
+                &mut b.normed[i * d..(i + 1) * d],
+            );
+        }
+        if self.no_ffn() {
+            return Ok(());
+        }
+        if at.layer == 0 {
+            dump_layer0(at.pos, "attn_post_norm-0", &b.normed[..d]);
+        }
+
+        // gate and up share the normed rows, then the gated product feeds down.
+        for i in 0..n {
+            let row: &[f32] = &b.normed[i * d..(i + 1) * d];
+            self.rotate_quantize_into(
+                row,
+                true,
+                &mut b.q8_d[i * q8_d..(i + 1) * q8_d],
+                &mut b.rot[..],
+            );
+        }
+        self.mm_batched(
+            &lyr.ffn_gate,
+            &b.q8_d[..n * q8_d],
+            q8_d,
+            n,
+            &mut b.gate[..n * ffn_dim],
+        )?;
+        self.mm_batched(
+            &lyr.ffn_up,
+            &b.q8_d[..n * q8_d],
+            q8_d,
+            n,
+            &mut b.up[..n * ffn_dim],
+        )?;
+        for i in 0..n {
+            let gate: &mut [f32] = &mut b.gate[i * ffn_dim..(i + 1) * ffn_dim];
+            crate::ops::silu(gate);
+            let up: &[f32] = &b.up[i * ffn_dim..(i + 1) * ffn_dim];
+            for (g, u) in gate.iter_mut().zip(up.iter()) {
+                *g *= *u;
+            }
+        }
+        if at.layer == 0 {
+            dump_layer0(at.pos, "ffn_down_in-0", &b.gate[..ffn_dim]);
+        }
+        for i in 0..n {
+            let row: &[f32] = &b.gate[i * ffn_dim..(i + 1) * ffn_dim];
+            self.rotate_quantize_into(
+                row,
+                true,
+                &mut b.q8_ffn[i * q8_ffn..(i + 1) * q8_ffn],
+                &mut b.rot[..],
+            );
+        }
+        self.mm_batched(
+            &lyr.ffn_down,
+            &b.q8_ffn[..n * q8_ffn],
+            q8_ffn,
+            n,
+            &mut b.down[..n * d],
+        )?;
+        if at.layer == 0 {
+            dump_layer0(at.pos, "post_ffn-0", &b.down[..d]);
+        }
+
+        // second residual: hidden += the FFN branch
+        for i in 0..n {
+            let hidden: &mut [f32] = &mut b.hidden[i * d..(i + 1) * d];
+            let down: &[f32] = &b.down[i * d..(i + 1) * d];
+            for (h, v) in hidden.iter_mut().zip(down.iter()) {
+                *h += *v;
+            }
+        }
+        if at.layer == 0 {
+            dump_layer0(at.pos, "ffn_out-0", &b.hidden[..d]);
+        }
+        Ok(())
+    }
+
     // -- forward ------------------------------------------------------------
     fn forward(
         &self,
@@ -1218,6 +1368,8 @@ impl Qwen35Core {
         }
 
         let ffn_dim = self.config.d_ffn as usize;
+        let q8_d = q8_size(d);
+        let q8_ffn = q8_size(ffn_dim);
         for layer in 0..self.layers.len() {
             let lyr = &self.layers[layer];
 
@@ -1254,80 +1406,25 @@ impl Qwen35Core {
                 t_stage = std::time::Instant::now();
             }
 
-            // residual
-            for i in 0..d {
-                sc.hidden[i] += sc.act[i];
-            }
-            if layer == 0 {
-                dump_layer0(pos, "attn_residual-0", &sc.hidden);
-            }
-
-            if std::env::var_os("HEARTH_Q35_DEBUG").is_some() && pos < 2 && layer < 6 {
-                let mean_abs = |v: &[f32]| v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
-                eprintln!(
-                    "[q35dbg] pos={} layer={} is_gdn={} hidden_mean={:.4}",
-                    pos,
+            self.ffn_block(
+                lyr,
+                FfnAt {
                     layer,
-                    self.layer_is_gdn[layer],
-                    mean_abs(&sc.hidden),
-                );
-            }
-
-            // sandwich norm + FFN
-            let hidden_ref: &[f32] = &sc.hidden;
-            let normed_ref: &mut [f32] = &mut sc.normed;
-            crate::ops::rms_norm(hidden_ref, &lyr.post_attention_norm.0, eps, normed_ref);
-            if self.no_ffn() {
-                for v in sc.act.iter_mut() {
-                    *v = 0.0;
-                }
-                continue;
-            }
-            self.mm(
-                &lyr.ffn_gate,
-                &sc.normed,
-                &mut sc.ffn_gate,
-                &mut sc.tmp_f32,
-                &mut sc.proj_q8,
-                true,
+                    pos,
+                    rows: 1,
+                },
+                FfnBufs {
+                    hidden: &mut sc.hidden,
+                    mix: &sc.act,
+                    normed: &mut sc.normed,
+                    q8_d: &mut sc.chunk_q8_d[..q8_d],
+                    q8_ffn: &mut sc.chunk_q8_ffn[..q8_ffn],
+                    rot: &mut sc.chunk_rot,
+                    gate: &mut sc.chunk_gate[..ffn_dim],
+                    up: &mut sc.chunk_up[..ffn_dim],
+                    down: &mut sc.chunk_down[..d],
+                },
             )?;
-            self.mm(
-                &lyr.ffn_up,
-                &sc.normed,
-                &mut sc.ffn_up,
-                &mut sc.tmp_f32,
-                &mut sc.proj_q8,
-                true,
-            )?;
-            crate::ops::silu(&mut sc.ffn_gate);
-            for i in 0..ffn_dim {
-                sc.ffn_gate[i] *= sc.ffn_up[i];
-            }
-            if layer == 0 {
-                dump_layer0(pos, "attn_post_norm-0", &sc.normed);
-                if pos == 0 {
-                    dump_layer0(pos, "ffn_down_in-0", &sc.ffn_gate);
-                }
-            }
-            self.mm(
-                &lyr.ffn_down,
-                &sc.ffn_gate,
-                &mut sc.act,
-                &mut sc.tmp_f32,
-                &mut sc.proj_q8,
-                true,
-            )?;
-            if layer == 0 {
-                dump_layer0(pos, "post_ffn-0", &sc.act);
-            }
-
-            // second residual: hidden += ffn_branch
-            for i in 0..d {
-                sc.hidden[i] += sc.act[i];
-            }
-            if layer == 0 {
-                dump_layer0(pos, "ffn_out-0", &sc.hidden);
-            }
             if self.timers_on {
                 sc.timers.ffn_us += t_stage.elapsed().as_micros();
                 t_stage = std::time::Instant::now();
@@ -1409,9 +1506,7 @@ impl Qwen35Core {
         let sc = &mut *self.scratch.lock().unwrap();
         let d = self.d_model;
         let eps = self.config.rms_norm_eps;
-        let ffn_dim = self.config.d_ffn as usize;
         let q8_d = q8_size(d);
-        let q8_ffn = q8_size(ffn_dim);
         let conv_dim = self.conv_dim;
         let v_dim = self.v_dim;
         let nq = self.n_heads * self.head_dim;
@@ -1571,87 +1666,30 @@ impl Qwen35Core {
                 }
             }
 
-            // residual: hidden += mix branch
-            for i in 0..PREFILL_CHUNK {
-                let hidden: &mut [f32] = &mut sc.chunk_hidden[i * d..(i + 1) * d];
-                let act: &[f32] = &sc.chunk_act[i * d..(i + 1) * d];
-                for (h, a) in hidden.iter_mut().zip(act.iter()) {
-                    *h += *a;
-                }
-            }
-
-            // Sandwich norm, one row per token: it feeds the FFN below.
-            for i in 0..PREFILL_CHUNK {
-                let hidden: &[f32] = &sc.chunk_hidden[i * d..(i + 1) * d];
-                crate::ops::rms_norm(
-                    hidden,
-                    &lyr.post_attention_norm.0,
-                    eps,
-                    &mut sc.chunk_normed[i * d..(i + 1) * d],
-                );
-            }
-
             if self.timers_on {
                 sc.timers.mix_us += t_stage.elapsed().as_micros();
                 t_stage = std::time::Instant::now();
             }
 
-            if self.no_ffn() {
-                continue;
-            }
-
-            // Feed-forward, both rows per weight pass: gate, up, then down.
-            for i in 0..PREFILL_CHUNK {
-                self.rotate_quantize_into(
-                    &sc.chunk_normed[i * d..(i + 1) * d],
-                    true,
-                    &mut sc.chunk_q8_d[i * q8_d..(i + 1) * q8_d],
-                    &mut sc.chunk_rot,
-                );
-            }
-            self.mm_batched(
-                &lyr.ffn_gate,
-                &sc.chunk_q8_d,
-                q8_d,
-                PREFILL_CHUNK,
-                &mut sc.chunk_gate,
+            self.ffn_block(
+                lyr,
+                FfnAt {
+                    layer,
+                    pos,
+                    rows: PREFILL_CHUNK,
+                },
+                FfnBufs {
+                    hidden: &mut sc.chunk_hidden,
+                    mix: &sc.chunk_act,
+                    normed: &mut sc.chunk_normed,
+                    q8_d: &mut sc.chunk_q8_d,
+                    q8_ffn: &mut sc.chunk_q8_ffn,
+                    rot: &mut sc.chunk_rot,
+                    gate: &mut sc.chunk_gate,
+                    up: &mut sc.chunk_up,
+                    down: &mut sc.chunk_down,
+                },
             )?;
-            self.mm_batched(
-                &lyr.ffn_up,
-                &sc.chunk_q8_d,
-                q8_d,
-                PREFILL_CHUNK,
-                &mut sc.chunk_up,
-            )?;
-
-            for i in 0..PREFILL_CHUNK {
-                let gate = &mut sc.chunk_gate[i * ffn_dim..(i + 1) * ffn_dim];
-                crate::ops::silu(gate);
-                let up = &sc.chunk_up[i * ffn_dim..(i + 1) * ffn_dim];
-                for (g, u) in gate.iter_mut().zip(up.iter()) {
-                    *g *= *u;
-                }
-                self.rotate_quantize_into(
-                    gate,
-                    true,
-                    &mut sc.chunk_q8_ffn[i * q8_ffn..(i + 1) * q8_ffn],
-                    &mut sc.chunk_rot,
-                );
-            }
-            self.mm_batched(
-                &lyr.ffn_down,
-                &sc.chunk_q8_ffn,
-                q8_ffn,
-                PREFILL_CHUNK,
-                &mut sc.chunk_act,
-            )?;
-            for i in 0..PREFILL_CHUNK {
-                let hidden: &mut [f32] = &mut sc.chunk_hidden[i * d..(i + 1) * d];
-                let act: &[f32] = &sc.chunk_act[i * d..(i + 1) * d];
-                for (h, a) in hidden.iter_mut().zip(act.iter()) {
-                    *h += *a;
-                }
-            }
 
             if self.timers_on {
                 sc.timers.ffn_us += t_stage.elapsed().as_micros();

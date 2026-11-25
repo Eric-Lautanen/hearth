@@ -11,8 +11,10 @@
 > sequential `gdn_scan`/`attn_scan` (conv, L2 norm, gates, delta rule, KV append,
 > attention) that is the decode body verbatim. 27B prefill 650 → 511 ms/token (1.27-1.30×,
 > mix stage 290 → 253 ms/token, FFN 1.36×), greedy output byte-identical on 27B/9B/4B
-> hybrids and a dense control, decode untouched. Detail: `docs/BUG_TRACKER.md`, newest
-> entry first.
+> hybrids and a dense control, decode untouched. Then the duplicated per-token FFN was
+> folded into one `ffn_block` that both paths call (1 row for decode, `PREFILL_CHUNK` for
+> prefill), again byte-identical with no measurable cost. Detail: `docs/BUG_TRACKER.md`,
+> newest entry first.
 
 Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md`,
 `packaging/SIGNING.md`.
@@ -59,7 +61,9 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
 5. **Paired prefill is done; do not re-derive the split.** `forward_pair` pairs every
    projection (mix, `ssm_out`, `attn_output`, FFN) and runs `gdn_scan`/`attn_scan` per token
    in order, which is why the output is bit-identical. `HEARTH_Q35_NOPAIR=1` reverts.
-   `gdn_out_q8` holds the grouped-order Hadamard permutation for `ssm_out`.
+   `gdn_out_q8` holds the grouped-order Hadamard permutation for `ssm_out`, and the whole
+   per-token FFN exists once in `ffn_block` (called with `rows = 1` from `forward`, `rows =
+   PREFILL_CHUNK` from `forward_pair`), so do not reintroduce a second copy of it.
 6. **Kernel rules that made past fixes findable**: a `#[target_feature]` body names every
    feature it uses and its dispatch gate names the same set; `.cargo/config.toml` pins
    `x86-64-v3` and must not drop below what any dispatched body uses. A new quant format
