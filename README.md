@@ -126,6 +126,9 @@ download button (top-right), or manually from HuggingFace (`<repo>/resolve/main/
 | `Ternary-Bonsai-2-9B-PQ2_0.gguf` | 2.3 GiB | [Ternary-Bonsai-2-9B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf) |
 | `Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5.5 GiB | [Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
 | `Ternary-Bonsai-2-27B-PQ2_0.gguf` | 6.7 GiB | [Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
+| `Ternary-Bonsai-2.5-27B-PTQ1_0.gguf` | 5.6 GiB | [Ternary-Bonsai-2.5-27B-GGUF](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF) |
+| `Ternary-Bonsai-2.5-27B-PQ2_0.gguf` | 6.8 GiB | [Ternary-Bonsai-2.5-27B-GGUF](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF) |
+| `Ternary-Bonsai-2.5-27B-Q2_0.gguf` | 7.1 GiB | [Ternary-Bonsai-2.5-27B-GGUF](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF) |
 
 **Build** (first build takes 2–5 min; `lto=fat`, x86_64 baseline `x86-64-v3`;
 add `RUSTFLAGS="-C target-cpu=native"` for a max-perf local-only binary):

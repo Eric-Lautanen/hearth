@@ -89,6 +89,8 @@ Running anything in parallel on this 8C/16T CPU causes thermal throttling and SM
   - `Bonsai-8B.gguf` (Q1_0) — 36 layers, d=4096, ffn=12288
   - `Ternary-Bonsai-8B-Q2_0.gguf` — 36 layers, d=4096, ffn=12288
   - Plus Ternary-Bonsai-2 `2B/4B/9B/27B` in `PTQ1_0` + `PQ2_0` (hybrid `qwen35`, 27B = 64 layers, slow ~1 tok/s — stream progress, don't buffer)
+  - `Ternary-Bonsai-2.5-27B-{PTQ1_0,PQ2_0,Q2_0}.gguf` — agentic refresh of the 27B (same `qwen35`,
+    64 layers, vocab 248320, Hadamard 1/1024; header-verified). MTP and `mmproj` packs are not supported.
 - No reference fork. Do not add one back.
 
 ## Hearth commands

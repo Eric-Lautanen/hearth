@@ -3,6 +3,48 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Ternary Bonsai 2.5 27B added — verified against the loader, no engine change (Buffy, 2026-11-25)
+
+PrismML shipped `prism-ml/bonsai-25-27b` → `prism-ml/Ternary-Bonsai-2.5-27B-GGUF`: the
+agentic refresh of the 27B line (same Qwen3.8-27B base, ternary g128, 262K context), with
+`PTQ1_0`, `PQ2_0` and `Q2_0` base packs plus `-mtp` draft-head variants and a vision
+`mmproj`. The model card claims the format and rotated basis are unchanged; that claim is
+not evidence for a loader, so all three packs were checked from their real headers.
+
+**Header verification** (12 MB ranged fetch per file, `--dump-info`): `general.architecture
+= qwen35`, 64 blocks, `embedding_length 5120`, `feed_forward_length 17408`, 24 heads × 256,
+4 KV heads, `ssm.state_size 128` / `group_count 16` / `time_step_rank 48` / `conv_kernel
+4`, vocab 248320 with eos 248046 — every value identical to `Ternary-Bonsai-2-27B`. The
+Hadamard metadata matches too (`version 1`, `block_size 1024`, transform
+`normalized-sylvester-walsh-hadamard`, sign widths 5120/6144/17408, `gdn_v_grouped`,
+`axis input-last-dimension`, latent `token_embd`), and so do the tensor names
+(`attn_qkv`, `attn_gate`, `ssm_{a,alpha,beta,conv1d,dt.bias,norm,out}`,
+`post_attention_norm`), shapes and dtypes. **No `hearth-llm` change was needed**, and none
+was made — a loader edit here would have been an unmeasured change to a hot path.
+
+Added to the built-in downloader catalog (`crates/hearth-ui/src/downloads.rs`) with the
+served `content-length` as the size, so the completion check is exact:
+`ternary-bonsai-2.5-27b-ptq1_0` 5,993,834,848 B; `-pq2_0` 7,253,354,848 B; `-q2_0`
+7,673,194,848 B. README model table and the AGENTS key-paths list carry the same three
+filenames. The `-mtp` packs and `mmproj` are **not** listed: Hearth has no draft head and
+no vision tower, and a catalog entry the engine cannot exploit is a download for nothing.
+
+**Measured, not assumed.** `PTQ1_0` loads (`max_seq` capped to 10240, 1.25 GiB KV cache at
+16 attention layers) and decodes. Interleaved 20-token pairs, `--temp 0 --prompt-raw`,
+same binary and window: 2.5 = 1.24, 0.92 tok/s; Bonsai 2 = 1.31, 0.71 tok/s. Parity inside
+this box's spread, so no speed claim and no new performance-table row.
+
+Operational note: this is a reasoning model whose template defaults to `reasoning_effort
+xhigh`, so a 20-50 token cap lands mid-thought. Its template is multimodal and too complex
+for the Jinja subset (`{%- set`, `namespace`, `reasoning_effort` filters), so the
+tokenizer falls back to the synthetic Qwen3 template — the same path Bonsai 2 takes, and
+`Template kind: Qwen3` is what the CLI reports.
+
+Checks: `cargo check -p hearth-ui`, `cargo clippy -p hearth-ui --all-targets -- -D
+warnings`, `cargo fmt --check` clean; release UI served `/`, `/api/models`,
+`/api/downloads` 200 with the three new labels, `PTQ1_0` reading `done` from disk and the
+other two `idle`.
+
 ### The installed UI listed 2 of 9 models — one scan root, fixed in shared code (2026-10-20)
 
 The operator installed the published `v0.2.0` MSI and the model dropdown offered **two**

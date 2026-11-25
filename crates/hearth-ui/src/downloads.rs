@@ -166,6 +166,30 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             "Ternary Bonsai 2 27B · PQ2_0",
             "Flagship quality. Needs patience and RAM.",
         ),
+        entry(
+            "ternary-bonsai-2.5-27b-ptq1_0",
+            "Ternary-Bonsai-2.5-27B-GGUF",
+            "Ternary-Bonsai-2.5-27B-PTQ1_0.gguf",
+            5_993_834_848,
+            "Ternary Bonsai 2.5 27B · PTQ1_0",
+            "Agentic 27B, 1-bit. Smallest of the three packs.",
+        ),
+        entry(
+            "ternary-bonsai-2.5-27b-pq2_0",
+            "Ternary-Bonsai-2.5-27B-GGUF",
+            "Ternary-Bonsai-2.5-27B-PQ2_0.gguf",
+            7_253_354_848,
+            "Ternary Bonsai 2.5 27B · PQ2_0",
+            "Same agentic 27B in 2-bit slots.",
+        ),
+        entry(
+            "ternary-bonsai-2.5-27b-q2_0",
+            "Ternary-Bonsai-2.5-27B-GGUF",
+            "Ternary-Bonsai-2.5-27B-Q2_0.gguf",
+            7_673_194_848,
+            "Ternary Bonsai 2.5 27B · Q2_0",
+            "Stock-llama.cpp 2-bit pack. Largest of the three.",
+        ),
     ]
 }
 
