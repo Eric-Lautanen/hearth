@@ -3,6 +3,62 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Paired hybrid prefill, second half: the mix projections pair too (1.30x prefill, 2026-11-25)
+
+The first half paired only the FFN. `gdn_layer` and `attn_layer` still projected one token
+at a time, and the stage timers showed it: the `gdn/attn` stage did not move when FFN pairing
+landed. Same mistake, same answer — the *scans* are ordered state, the *projections* are
+per-token matmuls.
+
+Both layers are now split. `gdn_layer` keeps its weight passes and calls a new `gdn_scan`
+(conv, L2-normed q/k, decay and beta gates, delta rule, gated RMS norm) that is the decode
+body verbatim; `attn_layer` does the same around a new `attn_scan` (q|gate split, head norms,
+RoPE, KV append, attention, sigmoid gate). `forward_pair` norms and quantizes both rows, runs
+`attn_qkv` / `attn_gate` / `attn_q` / `attn_k` / `attn_v` through `mm_batched`, walks the two
+scans in token order, then pairs `ssm_out` and `attn_output` the same way. Each scan is fed
+one token's projections through the single-token scratch (a few KB against a 30M-MAC weight
+pass), so the recurrence exists once. The grouped-order Hadamard permutation of `ssm_out`
+moved into `gdn_out_q8`, shared by both paths. `ssm_alpha`/`ssm_beta` stay serial
+`matvec_dense`: dense f32 weights, ~32k MACs each, below a pool dispatch.
+`HEARTH_Q35_NOPAIR` still reverts everything.
+
+**Measured** (Ternary Bonsai 2.5 27B PTQ1_0, paired against `HEARTH_Q35_NOPAIR`, alternating
+mode order, warm runs):
+
+| prompt | token-by-token | paired | |
+| --- | --- | --- | --- |
+| 59 tokens, ms/token | 657.1 / 643.1 | **509.4 / 515.5** | **1.27x** |
+| 74 tokens, ms/token | 663.9 / 728.5 | **514.1 / 508.5** | **1.30x** (best pair) |
+| gdn/attn, 59 tokens | 17.33 / 16.89 s | **14.81 / 15.07 s** | **1.15x** |
+| ffn, 59 tokens | 19.98 / 19.60 s | 14.50 / 14.60 s | 1.36x (the FFN half) |
+
+The mix row is the honest one. At 290 ms/token that stage was scan + projection and pairing
+halves only the projection, so 290 → 253 ms/token puts the weight passes at ~74 ms (26%) and
+the GDN recurrence plus attention at the other 216 ms. Against the 545/546 ms/token recorded
+for the FFN-only commit above (76 tokens versus 74 here), this half adds ~6%; total prefill is
+1.27-1.30x the serial path.
+
+**Correctness**: greedy stdout byte-identical (whole output, not a prefix) for 27B PTQ1_0
+with a 4-token and a 1-token prompt, 9B PTQ1_0, 4B PQ2_0, and dense 8B Q2_0 as a control —
+covers both scan kinds, the trailing-single-token path and the folded `ssm_out`.
+
+**No decode regression**: six-model sweep with a warmup run each, 50 tokens, `--temp 0
+--prompt-raw`: 1.7B Q1_0 47.98, 1.7B Q2_0 26.60, 4B Q1_0 22.80, 4B Q2_0 11.99, 8B Q1_0
+13.08, 8B Q2_0 6.64 tok/s against the 46.86 / 26.46 / 24.13 / 12.35 / 12.89 / 6.69 baseline,
+all inside the documented spread. Stage timers put decode at 643-660 ms/token in both arms.
+
+**Portability**: no new dependencies, no new intrinsics. x86_64 and
+`aarch64-unknown-linux-gnu` `check` + `clippy --workspace --all-targets` clean, `fmt --check`
+clean.
+
+**Don't trust the first run.** The first paired 59-token run read 605.8 ms/token against
+504.6 for the second, with `embed` 27 ms against 3 ms — the cold read of 5.5 GB of weights.
+Without a warmup the "gain" swings between 1.08x and 1.31x.
+
+**Still sequential**: the scans, 216 ms/token of the 511. The delta rule is `hd x hd` state
+work per v-head with a column-strided inner loop, and attention walks every cached key per
+head — together now the majority of prefill.
+
 ### Paired hybrid prefill: two prompt tokens per FFN weight pass (+21% prefill, 2026-11-25)
 
 The hybrid prefill was strictly token-by-token, and the stage timers said why that is the

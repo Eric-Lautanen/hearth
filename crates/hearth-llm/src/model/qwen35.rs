@@ -57,6 +57,10 @@ use crate::pool::{BatchedDotRowsParams, ThreadPool};
 /// and that variant measured 3.2x slower than the x2 path when it was tried; the
 /// scratch buffers are sized from this constant, so raising it is a real change
 /// to the prefill, not a tuning knob.
+///
+/// Every projection whose input is a per-token activation uses it — the mix block
+/// (qkv, z gate, q/k/v), `ssm_out`, the attention output and the FFN — while the
+/// ordered state (conv/scan, KV append) stays one token at a time.
 const PREFILL_CHUNK: usize = 2;
 
 /// Q8_0 row width: 32-element blocks of a 2-byte scale plus 32 signed bytes.
@@ -414,13 +418,20 @@ struct FwdScratch {
     act: Vec<f32>,        // layer output (d_model)
     // -- paired-prefill scratch: PREFILL_CHUNK tokens share one weight pass --
     chunk_hidden: Vec<f32>, // PREFILL_CHUNK * d_model
-    chunk_normed: Vec<f32>, // PREFILL_CHUNK * d_model (post-attention norm input)
-    chunk_act: Vec<f32>,    // PREFILL_CHUNK * d_model (batched FFN output)
+    chunk_normed: Vec<f32>, // PREFILL_CHUNK * d_model (attn_norm, then post_attention_norm)
+    chunk_act: Vec<f32>,    // PREFILL_CHUNK * d_model (batched mix and FFN output)
     chunk_gate: Vec<f32>,   // PREFILL_CHUNK * d_ffn
     chunk_up: Vec<f32>,     // PREFILL_CHUNK * d_ffn
+    chunk_qkv: Vec<f32>,    // PREFILL_CHUNK * conv_dim (gdn qkv)
+    chunk_zgate: Vec<f32>,  // PREFILL_CHUNK * v_dim (gdn z gate)
+    chunk_q: Vec<f32>,      // PREFILL_CHUNK * 2*nq (attn q|gate, before the split)
+    chunk_k: Vec<f32>,      // PREFILL_CHUNK * n_kv_heads*head_dim
+    chunk_v: Vec<f32>,      // PREFILL_CHUNK * n_kv_heads*head_dim
+    chunk_mix: Vec<f32>,    // PREFILL_CHUNK * max(v_dim, nq) scan output
     chunk_q8_d: Vec<u8>,    // PREFILL_CHUNK * q8_size(d_model)
     chunk_q8_ffn: Vec<u8>,  // PREFILL_CHUNK * q8_size(d_ffn)
-    chunk_rot: Vec<f32>,    // max(d_model, d_ffn) rotation scratch
+    chunk_q8_mix: Vec<u8>,  // PREFILL_CHUNK * q8_size(max(v_dim, nq))
+    chunk_rot: Vec<f32>,    // widest rotation scratch (d_model, d_ffn, v_dim, nq)
     proj_q8: Vec<u8>,       // activation q8 scratch
     /// Stage totals, accumulated only when `timers_on`.
     timers: Q35Timers,
@@ -773,6 +784,9 @@ impl Qwen35Core {
         let nq = n_heads * head_dim;
         let nkv = n_kv * head_dim;
         let ffn_dim = config.d_ffn as usize;
+        // Widest row a mix-block scan produces: `v_dim` for a GDN layer, `nq`
+        // for a full-attention one.
+        let mix_width = nq.max(v_dim);
         let scratch = FwdScratch {
             hidden: vec![0.0; d],
             normed: vec![0.0; d],
@@ -800,9 +814,16 @@ impl Qwen35Core {
             chunk_act: vec![0.0; PREFILL_CHUNK * d],
             chunk_gate: vec![0.0; PREFILL_CHUNK * ffn_dim],
             chunk_up: vec![0.0; PREFILL_CHUNK * ffn_dim],
+            chunk_qkv: vec![0.0; PREFILL_CHUNK * conv_dim],
+            chunk_zgate: vec![0.0; PREFILL_CHUNK * v_dim],
+            chunk_q: vec![0.0; PREFILL_CHUNK * 2 * nq],
+            chunk_k: vec![0.0; PREFILL_CHUNK * nkv],
+            chunk_v: vec![0.0; PREFILL_CHUNK * nkv],
+            chunk_mix: vec![0.0; PREFILL_CHUNK * mix_width],
             chunk_q8_d: vec![0u8; PREFILL_CHUNK * q8_size(d)],
             chunk_q8_ffn: vec![0u8; PREFILL_CHUNK * q8_size(ffn_dim)],
-            chunk_rot: vec![0.0; d.max(ffn_dim)],
+            chunk_q8_mix: vec![0u8; PREFILL_CHUNK * q8_size(mix_width)],
+            chunk_rot: vec![0.0; d.max(ffn_dim).max(mix_width)],
             proj_q8: Vec::new(),
             timers: Q35Timers::default(),
         };
@@ -1364,15 +1385,17 @@ impl Qwen35Core {
     }
 
     // -- GDN layer ----------------------------------------------------------
-    /// Prefill `PREFILL_CHUNK` prompt tokens with one FFN weight pass.
+    /// Prefill `PREFILL_CHUNK` prompt tokens, sharing every weight pass between
+    /// them.
     ///
-    /// Everything that touches recurrent state — the GDN conv/scan and the
-    /// full-attention KV append — is walked strictly in token order, so the sums
-    /// are the ones the decode path produces. The feed-forward block is per-token
-    /// by nature, which is what makes it batchable: both rows go through a single
-    /// weight pass and the paired kernels expand each row once for the two
-    /// activations. That block is half of prefill on a 27B, so this removes half
-    /// of its weight traffic without changing a single sum.
+    /// Everything that touches recurrent state — the GDN conv/delta-rule scan and
+    /// the full-attention KV append — is walked strictly in token order, so the
+    /// sums are the ones the decode path produces. Everything that is a matmul
+    /// from a per-token activation is batchable: the mix block (qkv, z gate,
+    /// q/k/v), the `ssm_out` and attention-output projections and the whole
+    /// feed-forward block each expand a weight row once for both tokens. Those are
+    /// the weight-bound stages of prefill, so this halves their traffic without
+    /// changing a single sum.
     ///
     /// `logits` receives the last token's row only, which is what the sampler
     /// consumes.
@@ -1389,6 +1412,13 @@ impl Qwen35Core {
         let ffn_dim = self.config.d_ffn as usize;
         let q8_d = q8_size(d);
         let q8_ffn = q8_size(ffn_dim);
+        let conv_dim = self.conv_dim;
+        let v_dim = self.v_dim;
+        let nq = self.n_heads * self.head_dim;
+        let nkv = self.n_kv_heads * self.head_dim;
+        let q8_v = q8_size(v_dim);
+        let q8_nq = q8_size(nq);
+        let q8_mix = q8_size(nq.max(v_dim));
         let t_total = std::time::Instant::now();
         let mut t_stage = std::time::Instant::now();
 
@@ -1422,39 +1452,143 @@ impl Qwen35Core {
         for layer in 0..self.layers.len() {
             let lyr = &self.layers[layer];
 
-            // Structural mix, one token at a time: conv/scan and the KV append
-            // are ordered state, so they cannot be run out of order.
+            // Mix block. Every projection in it reads the same per-token norm,
+            // so both rows are normed and quantized first, then share one weight
+            // pass apiece. Only the ordered state stays per token: the conv and
+            // delta-rule scan of a GDN layer, the KV append and attention of a
+            // full one. Those run the decode path verbatim (`gdn_scan` /
+            // `attn_scan`), fed one token's projections through the single-token
+            // scratch — a few KB against a 30M-MAC weight pass.
             for i in 0..PREFILL_CHUNK {
-                {
-                    let hidden: &[f32] = &sc.chunk_hidden[i * d..(i + 1) * d];
-                    crate::ops::rms_norm(hidden, &lyr.attn_norm.0, eps, &mut sc.normed);
-                }
-                if self.layer_is_gdn[layer] {
-                    self.gdn_layer(layer, pos + i, lyr, sc, caches)?;
-                    if self.no_gdn() {
-                        sc.act.fill(0.0);
+                let hidden: &[f32] = &sc.chunk_hidden[i * d..(i + 1) * d];
+                crate::ops::rms_norm(
+                    hidden,
+                    &lyr.attn_norm.0,
+                    eps,
+                    &mut sc.chunk_normed[i * d..(i + 1) * d],
+                );
+                self.rotate_quantize_into(
+                    &sc.chunk_normed[i * d..(i + 1) * d],
+                    true,
+                    &mut sc.chunk_q8_d[i * q8_d..(i + 1) * q8_d],
+                    &mut sc.chunk_rot,
+                );
+            }
+
+            if self.layer_is_gdn[layer] {
+                let qkv_w = lyr.attn_qkv.as_ref().ok_or("qwen35: gdn missing qkv")?;
+                let gate_w = lyr.attn_gate.as_ref().ok_or("qwen35: gdn missing gate")?;
+                let out_w = lyr.ssm_out.as_ref().ok_or("qwen35: gdn missing out")?;
+                self.mm_batched(
+                    qkv_w,
+                    &sc.chunk_q8_d,
+                    q8_d,
+                    PREFILL_CHUNK,
+                    &mut sc.chunk_qkv,
+                )?;
+                self.mm_batched(
+                    gate_w,
+                    &sc.chunk_q8_d,
+                    q8_d,
+                    PREFILL_CHUNK,
+                    &mut sc.chunk_zgate,
+                )?;
+                for i in 0..PREFILL_CHUNK {
+                    sc.qkv
+                        .copy_from_slice(&sc.chunk_qkv[i * conv_dim..(i + 1) * conv_dim]);
+                    sc.zgate
+                        .copy_from_slice(&sc.chunk_zgate[i * v_dim..(i + 1) * v_dim]);
+                    if layer == 0 {
+                        dump_layer0(pos + i, "linear_attn_qkv_mixed-0", &sc.qkv);
                     }
-                } else {
-                    self.attn_layer(layer, lyr, pos + i, sc, caches)?;
-                    if self.no_attn() {
-                        sc.act.fill(0.0);
-                    }
+                    self.gdn_alpha_beta(
+                        lyr,
+                        &sc.chunk_normed[i * d..(i + 1) * d],
+                        &mut sc.abuf,
+                        &mut sc.bbuf,
+                    )?;
+                    self.gdn_scan(layer, pos + i, lyr, sc, caches)?;
+                    sc.chunk_mix[i * v_dim..(i + 1) * v_dim].copy_from_slice(&sc.normed_out);
                 }
-                {
-                    let hidden: &mut [f32] = &mut sc.chunk_hidden[i * d..(i + 1) * d];
-                    for (h, a) in hidden.iter_mut().zip(sc.act.iter()) {
-                        *h += *a;
-                    }
-                }
-                {
-                    let hidden: &[f32] = &sc.chunk_hidden[i * d..(i + 1) * d];
-                    crate::ops::rms_norm(
-                        hidden,
-                        &lyr.post_attention_norm.0,
-                        eps,
-                        &mut sc.chunk_normed[i * d..(i + 1) * d],
+                for i in 0..PREFILL_CHUNK {
+                    self.gdn_out_q8(
+                        &sc.chunk_mix[i * v_dim..(i + 1) * v_dim],
+                        &mut sc.chunk_rot,
+                        &mut sc.chunk_q8_mix[i * q8_mix..i * q8_mix + q8_v],
                     );
                 }
+                self.mm_batched(
+                    out_w,
+                    &sc.chunk_q8_mix,
+                    q8_mix,
+                    PREFILL_CHUNK,
+                    &mut sc.chunk_act,
+                )?;
+                if self.no_gdn() {
+                    sc.chunk_act.fill(0.0);
+                }
+                if layer == 0 {
+                    dump_layer0(pos, "linear_attn_out-0", &sc.chunk_act[..d]);
+                }
+            } else {
+                let qw = lyr.attn_q.as_ref().ok_or("qwen35: attn missing q")?;
+                let kw = lyr.attn_k.as_ref().ok_or("qwen35: attn missing k")?;
+                let vw = lyr.attn_v.as_ref().ok_or("qwen35: attn missing v")?;
+                let ow = lyr
+                    .attn_output
+                    .as_ref()
+                    .ok_or("qwen35: attn missing output")?;
+                self.mm_batched(qw, &sc.chunk_q8_d, q8_d, PREFILL_CHUNK, &mut sc.chunk_q)?;
+                self.mm_batched(kw, &sc.chunk_q8_d, q8_d, PREFILL_CHUNK, &mut sc.chunk_k)?;
+                self.mm_batched(vw, &sc.chunk_q8_d, q8_d, PREFILL_CHUNK, &mut sc.chunk_v)?;
+                for i in 0..PREFILL_CHUNK {
+                    sc.q_buf
+                        .copy_from_slice(&sc.chunk_q[i * 2 * nq..(i + 1) * 2 * nq]);
+                    sc.k_buf
+                        .copy_from_slice(&sc.chunk_k[i * nkv..(i + 1) * nkv]);
+                    sc.v_buf
+                        .copy_from_slice(&sc.chunk_v[i * nkv..(i + 1) * nkv]);
+                    self.attn_scan(layer, lyr, pos + i, sc, caches)?;
+                    sc.chunk_mix[i * nq..(i + 1) * nq].copy_from_slice(&sc.attn_out[..nq]);
+                }
+                for i in 0..PREFILL_CHUNK {
+                    self.rotate_quantize_into(
+                        &sc.chunk_mix[i * nq..(i + 1) * nq],
+                        true,
+                        &mut sc.chunk_q8_mix[i * q8_mix..i * q8_mix + q8_nq],
+                        &mut sc.chunk_rot,
+                    );
+                }
+                self.mm_batched(
+                    ow,
+                    &sc.chunk_q8_mix,
+                    q8_mix,
+                    PREFILL_CHUNK,
+                    &mut sc.chunk_act,
+                )?;
+                if self.no_attn() {
+                    sc.chunk_act.fill(0.0);
+                }
+            }
+
+            // residual: hidden += mix branch
+            for i in 0..PREFILL_CHUNK {
+                let hidden: &mut [f32] = &mut sc.chunk_hidden[i * d..(i + 1) * d];
+                let act: &[f32] = &sc.chunk_act[i * d..(i + 1) * d];
+                for (h, a) in hidden.iter_mut().zip(act.iter()) {
+                    *h += *a;
+                }
+            }
+
+            // Sandwich norm, one row per token: it feeds the FFN below.
+            for i in 0..PREFILL_CHUNK {
+                let hidden: &[f32] = &sc.chunk_hidden[i * d..(i + 1) * d];
+                crate::ops::rms_norm(
+                    hidden,
+                    &lyr.post_attention_norm.0,
+                    eps,
+                    &mut sc.chunk_normed[i * d..(i + 1) * d],
+                );
             }
 
             if self.timers_on {
@@ -1554,21 +1688,8 @@ impl Qwen35Core {
         sc: &mut FwdScratch,
         caches: &mut Qwen35Caches,
     ) -> Result<(), String> {
-        let eps = self.config.rms_norm_eps;
         let qkv_w = lyr.attn_qkv.as_ref().ok_or("qwen35: gdn missing qkv")?;
         let gate_w = lyr.attn_gate.as_ref().ok_or("qwen35: gdn missing gate")?;
-        let conv = lyr.ssm_conv1d.as_ref().ok_or("qwen35: gdn missing conv")?;
-        let dt_bias = lyr
-            .ssm_dt_bias
-            .as_ref()
-            .ok_or("qwen35: gdn missing dt bias")?;
-        let ssm_a = lyr.ssm_a.as_ref().ok_or("qwen35: gdn missing a")?;
-        let alpha_w = lyr.ssm_alpha.as_ref().ok_or("qwen35: gdn missing alpha")?;
-        let beta_w = lyr.ssm_beta.as_ref().ok_or("qwen35: gdn missing beta")?;
-        let ssm_norm = lyr
-            .ssm_norm
-            .as_ref()
-            .ok_or("qwen35: gdn missing ssm norm")?;
         let out_w = lyr.ssm_out.as_ref().ok_or("qwen35: gdn missing out")?;
 
         // Projections (folded weights: rotate the activation).
@@ -1591,14 +1712,68 @@ impl Qwen35Core {
         if layer == 0 {
             dump_layer0(pos, "linear_attn_qkv_mixed-0", &sc.qkv);
         }
-        // alpha/beta read sc.normed through small serial matvecs.
-        {
-            let normed_ref: &[f32] = &sc.normed;
-            let abuf_ref: &mut [f32] = &mut sc.abuf;
-            self.matvec_dense(alpha_w, normed_ref, abuf_ref);
-            let bbuf_ref: &mut [f32] = &mut sc.bbuf;
-            self.matvec_dense(beta_w, normed_ref, bbuf_ref);
+        self.gdn_alpha_beta(lyr, &sc.normed, &mut sc.abuf, &mut sc.bbuf)?;
+        self.gdn_scan(layer, pos, lyr, sc, caches)?;
+        if layer == 0 {
+            dump_layer0(pos, "final_output-0", &sc.normed_out);
         }
+
+        // ssm_out: the gated-norm row is quantized for the folded order (see
+        // `gdn_out_q8`) and dotted in one pass like any other projection.
+        sc.proj_q8.resize(q8_size(self.v_dim), 0);
+        self.gdn_out_q8(&sc.normed_out, &mut sc.tmp_f32, &mut sc.proj_q8);
+        self.mm_q8(out_w, &sc.proj_q8, &mut sc.act)?;
+        if layer == 0 {
+            dump_layer0(pos, "linear_attn_out-0", &sc.act);
+        }
+        Ok(())
+    }
+
+    /// `ssm_alpha` / `ssm_beta`: dense f32 weights (`dt_rank` rows of `d_model`),
+    /// so they stay serial matvecs on both prefill paths — ~32k MACs each is
+    /// below the cost of a pool dispatch, and below the noise of the weight pass
+    /// they sit next to.
+    fn gdn_alpha_beta(
+        &self,
+        lyr: &Layer,
+        x: &[f32],
+        abuf: &mut [f32],
+        bbuf: &mut [f32],
+    ) -> Result<(), String> {
+        let alpha_w = lyr.ssm_alpha.as_ref().ok_or("qwen35: gdn missing alpha")?;
+        let beta_w = lyr.ssm_beta.as_ref().ok_or("qwen35: gdn missing beta")?;
+        self.matvec_dense(alpha_w, x, abuf);
+        self.matvec_dense(beta_w, x, bbuf);
+        Ok(())
+    }
+
+    /// Everything between the projections and `ssm_out` for one token: the causal
+    /// depthwise conv, the L2-normalized q/k, the decay and beta gates, the
+    /// delta-rule recurrence and the gated RMS norm.
+    ///
+    /// This is ordered state, so both prefill paths run it once per token, in
+    /// token order. It reads `sc.qkv` / `sc.zgate` / `sc.abuf` / `sc.bbuf` and
+    /// writes `sc.attn_out` and `sc.normed_out`, which is exactly the decode
+    /// path.
+    fn gdn_scan(
+        &self,
+        layer: usize,
+        pos: usize,
+        lyr: &Layer,
+        sc: &mut FwdScratch,
+        caches: &mut Qwen35Caches,
+    ) -> Result<(), String> {
+        let eps = self.config.rms_norm_eps;
+        let conv = lyr.ssm_conv1d.as_ref().ok_or("qwen35: gdn missing conv")?;
+        let dt_bias = lyr
+            .ssm_dt_bias
+            .as_ref()
+            .ok_or("qwen35: gdn missing dt bias")?;
+        let ssm_a = lyr.ssm_a.as_ref().ok_or("qwen35: gdn missing a")?;
+        let ssm_norm = lyr
+            .ssm_norm
+            .as_ref()
+            .ok_or("qwen35: gdn missing ssm norm")?;
 
         // Causal depthwise conv + silu.
         caches.conv.prepare(layer, &mut sc.conv_win);
@@ -1759,46 +1934,38 @@ impl Qwen35Core {
             dump_layer0(pos, "final_output-0", &sc.normed_out);
         }
 
-        // ssm_out is Hadamard-folded with gdn_v_grouped: the activation is in
-        // tiled head order [hd, nk, rep] and must be permuted to the grouped
-        // order [hd, rep, nk] the fold was computed in, before signs + WHT.
-        if self.had_block_size > 0 && !self.no_had() {
-            let nk = self.n_groups;
-            let rep = n_v / nk;
-            let perm: &mut [f32] = &mut sc.tmp_f32[..self.v_dim];
-            if rep > 1 {
-                for h in 0..n_v {
-                    let kg = h % nk;
-                    let r = h / nk;
-                    let dst = (kg * rep + r) * hd;
-                    perm[dst..dst + hd].copy_from_slice(&sc.normed_out[h * hd..(h + 1) * hd]);
-                }
-            } else {
-                perm.copy_from_slice(&sc.normed_out);
-            }
-            hadamard_rotate(perm, self.signs_for(self.v_dim), self.had_block_size);
-            // quantize_q8_0 APPENDS to the Vec, so the scratch must be cleared
-            // first — otherwise the kernel dots against a stale activation from
-            // an earlier (different-width) matmul.
-            sc.proj_q8.clear();
-            hearth_quant::quantize_q8_0(perm, &mut sc.proj_q8);
-            self.mm_q8(out_w, &sc.proj_q8, &mut sc.act)?;
-            if layer == 0 {
-                dump_layer0(pos, "linear_attn_out-0", &sc.act);
-            }
-            return Ok(());
-        }
-
-        // Non-folded (or Q2_0-style) ssm_out: ordinary rotated matmul.
-        self.mm(
-            out_w,
-            &sc.normed_out,
-            &mut sc.act,
-            &mut sc.tmp_f32,
-            &mut sc.proj_q8,
-            true,
-        )?;
         Ok(())
+    }
+
+    /// Quantize one token's gated-norm `ssm_out` input.
+    ///
+    /// `ssm_out` is Hadamard-folded with `gdn_v_grouped`: the activation is in
+    /// tiled head order [hd, nk, rep] and must be permuted to the grouped order
+    /// [hd, rep, nk] the fold was computed in, before signs + WHT. Without the
+    /// fold the row is quantized like any other projection input, through
+    /// `rotate_quantize_into`, so the bytes match the single-token `mm`.
+    /// `scratch` holds the permutation / rotation copy and must be `v_dim` wide.
+    fn gdn_out_q8(&self, src: &[f32], scratch: &mut [f32], q8: &mut [u8]) {
+        if self.had_block_size == 0 || self.no_had() {
+            self.rotate_quantize_into(src, true, q8, scratch);
+            return;
+        }
+        let nk = self.n_groups;
+        let rep = self.dt_rank / nk;
+        let hd = self.state_size;
+        let perm = &mut scratch[..src.len()];
+        if rep > 1 {
+            for h in 0..self.dt_rank {
+                let kg = h % nk;
+                let r = h / nk;
+                let dst = (kg * rep + r) * hd;
+                perm[dst..dst + hd].copy_from_slice(&src[h * hd..(h + 1) * hd]);
+            }
+        } else {
+            perm.copy_from_slice(src);
+        }
+        hadamard_rotate(perm, self.signs_for(self.v_dim), self.had_block_size);
+        hearth_quant::quantize_q8_0_into(perm, q8);
     }
 
     // -- gated full attention layer ------------------------------------------
@@ -1810,24 +1977,13 @@ impl Qwen35Core {
         sc: &mut FwdScratch,
         caches: &mut Qwen35Caches,
     ) -> Result<(), String> {
-        let eps = self.config.rms_norm_eps;
         let hd = self.head_dim;
         let n_heads = self.n_heads;
-        let n_kv = self.n_kv_heads;
         let nq = n_heads * hd;
-        let _ = n_kv;
 
         let qw = lyr.attn_q.as_ref().ok_or("qwen35: attn missing q")?;
         let kw = lyr.attn_k.as_ref().ok_or("qwen35: attn missing k")?;
         let vw = lyr.attn_v.as_ref().ok_or("qwen35: attn missing v")?;
-        let q_norm = lyr
-            .attn_q_norm
-            .as_ref()
-            .ok_or("qwen35: attn missing q norm")?;
-        let k_norm = lyr
-            .attn_k_norm
-            .as_ref()
-            .ok_or("qwen35: attn missing k norm")?;
         let ow = lyr
             .attn_output
             .as_ref()
@@ -1858,6 +2014,46 @@ impl Qwen35Core {
             &mut sc.proj_q8,
             true,
         )?;
+        self.attn_scan(layer, lyr, pos, sc, caches)?;
+        self.mm(
+            ow,
+            &sc.attn_out[..nq],
+            &mut sc.act,
+            &mut sc.tmp_f32,
+            &mut sc.proj_q8,
+            true,
+        )?;
+        Ok(())
+    }
+
+    /// Everything between the q/k/v projections and the output projection for one
+    /// token: the q|gate split, the head RMS norms, RoPE, the KV append, the
+    /// attention itself and its sigmoid gate.
+    ///
+    /// The KV append is ordered state, so both prefill paths run this once per
+    /// token, in token order. It reads `sc.q_buf` / `sc.k_buf` / `sc.v_buf` and
+    /// writes `sc.attn_out[..nq]`, which is exactly the decode path.
+    fn attn_scan(
+        &self,
+        layer: usize,
+        lyr: &Layer,
+        pos: usize,
+        sc: &mut FwdScratch,
+        caches: &mut Qwen35Caches,
+    ) -> Result<(), String> {
+        let eps = self.config.rms_norm_eps;
+        let hd = self.head_dim;
+        let n_heads = self.n_heads;
+        let n_kv = self.n_kv_heads;
+        let nq = n_heads * hd;
+        let q_norm = lyr
+            .attn_q_norm
+            .as_ref()
+            .ok_or("qwen35: attn missing q norm")?;
+        let k_norm = lyr
+            .attn_k_norm
+            .as_ref()
+            .ok_or("qwen35: attn missing k norm")?;
 
         // Split q|gate. Per head ascending: copy gate out first (its source
         // region is untouched by q compaction of this or earlier heads), then
@@ -1868,17 +2064,17 @@ impl Qwen35Core {
             sc.q_buf.copy_within(src..src + hd, h * hd);
         }
 
-        // Head norms.
-        let mut tmp = vec![0.0f32; hd];
+        // Head norms. `tmp_f32` is the rotation scratch and far wider than one
+        // head, so this needs no per-token allocation.
         for h in 0..n_heads {
             let s = h * hd;
-            crate::ops::rms_norm(&sc.q_buf[s..s + hd], &q_norm.0, eps, &mut tmp);
-            sc.q_buf[s..s + hd].copy_from_slice(&tmp);
+            crate::ops::rms_norm(&sc.q_buf[s..s + hd], &q_norm.0, eps, &mut sc.tmp_f32[..hd]);
+            sc.q_buf[s..s + hd].copy_from_slice(&sc.tmp_f32[..hd]);
         }
         for h in 0..n_kv {
             let s = h * hd;
-            crate::ops::rms_norm(&sc.k_buf[s..s + hd], &k_norm.0, eps, &mut tmp);
-            sc.k_buf[s..s + hd].copy_from_slice(&tmp);
+            crate::ops::rms_norm(&sc.k_buf[s..s + hd], &k_norm.0, eps, &mut sc.tmp_f32[..hd]);
+            sc.k_buf[s..s + hd].copy_from_slice(&sc.tmp_f32[..hd]);
         }
 
         // Partial RoPE (MRoPE sections collapse to standard RoPE for text).
@@ -1937,15 +2133,6 @@ impl Qwen35Core {
         for i in 0..nq {
             sc.attn_out[i] /= 1.0 + (-sc.attn_gate[i]).exp();
         }
-
-        self.mm(
-            ow,
-            &sc.attn_out[..nq],
-            &mut sc.act,
-            &mut sc.tmp_f32,
-            &mut sc.proj_q8,
-            true,
-        )?;
         Ok(())
     }
 
@@ -2001,8 +2188,8 @@ impl Qwen35Core {
         let greedy = sampler_config.temperature == 0.0;
 
         // Prefill: paired where the length allows it. The recurrence is still
-        // walked in token order (see `forward_pair`); only the per-token FFN
-        // shares a weight pass. `HEARTH_Q35_NOPAIR` restores the old path.
+        // walked in token order (see `forward_pair`); only the projections share
+        // a weight pass. `HEARTH_Q35_NOPAIR` restores the old path.
         self.timers_reset();
         let mut at = 0usize;
         while at < input_ids.len() {
