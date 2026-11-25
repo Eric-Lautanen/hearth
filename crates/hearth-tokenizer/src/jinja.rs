@@ -1421,7 +1421,7 @@ impl Interp {
                 if let Some(def) = self.macros.get(name).cloned() {
                     return self.invoke_macro(&def, &values, &named);
                 }
-                call_builtin(name, &values)
+                call_builtin(name, &values, &named)
             }
             Expr::Attr(obj, method) => {
                 let receiver = self.eval(obj)?;
@@ -1682,9 +1682,11 @@ fn test(value: &Value, name: &str) -> bool {
     }
 }
 
-fn call_builtin(name: &str, args: &[Value]) -> R<Value> {
+fn call_builtin(name: &str, args: &[Value], kwargs: &[(String, Value)]) -> R<Value> {
     match name {
-        "namespace" => Ok(Value::map(Vec::new())),
+        // Every namespace field arrives as a keyword argument, and templates both
+        // read and assign them (`ns.last_query_index`), so the map keeps them.
+        "namespace" => Ok(Value::map(kwargs.to_vec())),
         "range" => {
             let (start, stop) = match args {
                 [stop] => (0, stop.as_int().unwrap_or(0)),
@@ -2007,6 +2009,19 @@ mod tests {
         // Verified against jinja2 3.1 with trim_blocks/lstrip_blocks, which is
         // the environment the reference render uses.
         assert_eq!(eval_jinja2(template, &c).unwrap(), "a bc");
+    }
+
+    #[test]
+    fn test_namespace_fields_and_mapping_filters() {
+        let c = ctx(&[("user", "u")], true);
+        let template = "{%- set ns = namespace(a=1, b='x') %}\
+                        {%- set ns.a = ns.a + 1 %}\
+                        {%- for key, value in ns|items %}{{ key }}={{ value }};{% endfor %}\
+                        {{- ns|tojson }}";
+        assert_eq!(
+            eval_jinja2(template, &c).unwrap(),
+            "a=2;b=x;{\"a\": 2, \"b\": \"x\"}"
+        );
     }
 
     #[test]
