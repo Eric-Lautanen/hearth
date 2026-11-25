@@ -146,19 +146,21 @@ pub(crate) fn hybrid_worker_count(has_q2_weights: bool) -> usize {
 /// tok/s at 10, 12.9 at 9, 11.7 at 8; dense 8B Q2_0 7.0 at 9 against 6.5 at 8 - so
 /// the count is a real trade and the conservative side of it is the physical count,
 /// until the batched path's instability is understood. The hybrids keep the quarter:
-/// their prefill is token-by-token, so they only ever run the stable path.
+/// their prefill batches only the FFN block, two tokens at a time, so most of it
+/// still runs the stable single-token path.
 fn dense_worker_count_for(logical: usize, physical: usize) -> usize {
     physical.min(logical)
 }
 
 /// The hybrid path's policy, with the core counts passed in for the same reason.
 ///
-/// `Q2_0`/`PQ2_0` take the quarter past physical: the hybrid's prefill is
-/// token-by-token, so it has the single-token path's appetite for threads and none
-/// of the batched path's instability (hybrid 4B PQ2_0, 109-token prompt: 13346 ms
-/// at 10 against 13940 at 8, decode 8.5 tok/s against 7.9, both tight across
-/// repeats). `PTQ1_0` has no fast kernel and goes the other way, hiding the pool's
-/// barrier behind more threads (6.7 tok/s at 12 against 5.9 at 8).
+/// `Q2_0`/`PQ2_0` take the quarter past physical: the hybrid's prefill walks the
+/// recurrence in token order and pairs only the FFN block (`qwen35.rs::forward_pair`),
+/// so it mostly has the single-token path's appetite for threads (hybrid 4B PQ2_0,
+/// 109-token prompt: 13346 ms at 10 against 13940 at 8, decode 8.5 tok/s against
+/// 7.9, both tight across repeats). `PTQ1_0` has no fast kernel and goes the other
+/// way, hiding the pool's barrier behind more threads (6.7 tok/s at 12 against 5.9
+/// at 8).
 fn hybrid_worker_count_for(logical: usize, physical: usize, has_q2_weights: bool) -> usize {
     if has_q2_weights {
         (physical + physical / 4).min(logical)

@@ -626,9 +626,10 @@ impl LlamaModel {
                 // exists (`hearth_quant::dot_ptq1_0_q8_0x2_ptr`, bit-identical to
                 // two single calls), but this is the *dense* batch path and every
                 // PTQ1_0 model in the catalog is a qwen35 hybrid that never calls
-                // `matmul_batch` — wiring it here would be a no-op that reads like
-                // a prefill speedup. The kernel belongs in the hybrid prefill,
-                // which is still token-by-token; see docs/RESUME.md.
+                // `matmul_batch`: wiring it here would be a no-op that reads like
+                // a prefill speedup. The hybrid prefill pairs it itself, in
+                // `qwen35.rs::mm_batched` at `PREFILL_CHUNK` = 2 (1.41x on the FFN
+                // block of a 27B PTQ1_0; see docs/BUG_TRACKER.md).
                 _ => None,
             };
             let _q8_hold;

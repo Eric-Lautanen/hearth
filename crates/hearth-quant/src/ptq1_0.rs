@@ -519,13 +519,18 @@ pub unsafe fn dot_ptq1_0_q8_0x2_avx2(
 /// Bit-identical to two calls to [`dot_ptq1_0_q8_0_ptr`]; falls back to exactly
 /// that on targets without AVX2.
 ///
-/// **No caller yet, by design.** Every PTQ1_0 model in the catalog is a `qwen35`
-/// hybrid, and the hybrid prefill runs strictly token-by-token
-/// (`qwen35.rs`: "Prefill: token by token (GDN recurrence is inherently
-/// sequential)") through single-token kernels. The dense `matmul_batch` path
-/// that consumes `DotFn2` never sees a PTQ1_0 weight, so wiring this there would
-/// be inert. This exists as the tested primitive a batched hybrid prefill needs:
-/// read each weight row once, dot it against two tokens' Q8 activations.
+/// **Caller:** the `qwen35` hybrid prefill. `Qwen35Model::mm_batched`
+/// (`qwen35.rs`) hands this to `ThreadPool::par_dot_rows_batched` as `dot_fn2`,
+/// and the prefill loop walks the prompt in `PREFILL_CHUNK` (2) token chunks, so
+/// a weight row is expanded once and dotted against both tokens' Q8 activations.
+/// The recurrent state (GDN conv/scan, KV append) still advances in token order
+/// around that pass, which is why the sums match the decode path.
+/// `HEARTH_Q35_NOPAIR=1`, or a trailing odd token, takes the token-at-a-time
+/// `forward` instead and leaves this kernel unused.
+///
+/// The *dense* `matmul_batch` path still passes `None` for PTQ1_0 (`matmul.rs`):
+/// every PTQ1_0 model in the catalog is a hybrid and never reaches it, so wiring
+/// this there would be inert.
 ///
 /// # Safety
 /// `w_ptr` valid for n/128*28 bytes; `a0_ptr` and `a1_ptr` each valid for
