@@ -3,6 +3,55 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### GDN recurrence: contiguous state layout and the pool over v-heads (decode 1.14x, prefill 1.20x, 2026-11-25)
+
+The scan was the largest single-threaded stage in the engine: ~225 ms of the 27B's 650 ms
+decode and ~260 ms/token of prefill, all on the calling thread while 11 workers idled. Two
+causes, both structural. `state[col + i * hd]` walked the delta-rule column with a 512 B
+stride, so every float fetched its own 64-byte line; and the 48 v-heads are independent but
+were walked in a plain `for`, so the stage had no parallelism at all.
+
+`GdnState` now stores each head `[j][i]`, which makes a column one contiguous run, and the
+recurrence is dispatched over v-heads (`gdn_scan_heads` + `GdnHeadCtx`, the same
+ctx-as-`usize` idiom `ops.rs` uses). Each worker rebuilds only its own `begin..end` window
+as slices — a whole-array `&mut` per worker would alias even though the heads inside are
+disjoint. Nothing inside a head changed: same elements, same ascending `i`, so the sums are
+the serial loop's to the bit.
+
+Geometry, for the record: 48 v-heads, `state_size` 128, 16 groups, `conv_dim` 10240
+(`v_dim` 6144), 48 GDN layers — 3 MB of state per layer, 144 MB total, 4 heads per worker
+at 12 threads.
+
+**Measured** (Ternary Bonsai 2.5 27B PTQ1_0, pre-change binary kept alongside and run
+interleaved, warmups before each reading):
+
+| | before | after | |
+| --- | --- | --- | --- |
+| decode `gdn/attn`, ms/token | 311-315 | **210-224** | **1.45x** |
+| decode total, ms/token | 698 | **588-593** | **1.18x** |
+| decode, 50 tokens | 1.47 tok/s | **1.67** | **1.14x** |
+| prefill `gdn/attn`, 74 tokens | 260 ms/token | **161-169** | **1.57x** |
+| prefill total, 74 tokens | 531 ms/token | **436-451** | **1.20x** |
+| prefill `ffn` (untouched) | 258 ms/token | 258-268 | unchanged |
+
+Decode on the smaller hybrids, same protocol: 4B PTQ1_0 7.44 → **9.77** tok/s (1.31x), 9B
+PTQ1_0 4.03 → **5.19** (1.29x). They gain more because the scan is a larger share of a
+smaller model.
+
+**Correctness**: greedy stdout byte-identical to the pre-change binary on 27B PTQ1_0
+(4-token and 1-token prompts), 9B PTQ1_0, 4B PQ2_0, 4B PTQ1_0 and dense 8B Q2_0.
+
+**What is left**: the scan is still 210-224 ms of decode. At 48 heads over 12 workers that
+is 4 heads and ~12 MB of state access per layer, so ~5 GB/s aggregate — far below this
+box's DRAM bandwidth and below what one core managed on the strided layout. The suspects
+are the per-layer dispatch cadence (~48 `par_for` calls per token on top of ~450 matmul
+dispatches) and a working set that does not stay in L2, not the layout. Count bytes per
+layer against dispatches before changing anything else.
+
+**Load caveat**: one `before` run read 0.61 tok/s and one read 880 ms/token prefill; both
+were the machine under other load, not the binaries, and were discarded rather than
+averaged in.
+
 ### One copy of the per-token FFN: `forward` and `forward_pair` share `ffn_block` (2026-11-25)
 
 Both forward paths carried their own residual, sandwich norm and gated-FFN body: one token

@@ -40,7 +40,7 @@ use super::kv_budget;
 use super::tensor::TensorEntry;
 use crate::config::ModelConfig;
 use crate::kvcache::KVCache;
-use crate::pool::{BatchedDotRowsParams, ThreadPool};
+use crate::pool::{BatchedDotRowsParams, ParForFn, ThreadPool};
 
 // ---------------------------------------------------------------------------
 // Hadamard transform
@@ -258,11 +258,17 @@ struct Layer {
 // Runtime state
 // ---------------------------------------------------------------------------
 
-/// GDN recurrent state: per layer, per v-head a [k_dim x v_dim] matrix.
+/// GDN recurrent state: per layer, per v-head an `[hd x hd]` matrix, stored
+/// `[j][i]` so that a delta-rule column is one contiguous run.
+///
+/// The recurrence walks columns (`j` outer, `i` inner), so the transposed layout
+/// is what makes both of its passes sequential: the old `[i][j]` order read one
+/// float per 64-byte line on a 128-wide head, which is where most of the stage's
+/// time went. The values are the same, only permuted.
 struct GdnState {
     n_v_heads: usize,
     dim: usize,
-    s: Vec<f32>, // [layer][head][k][v]
+    s: Vec<f32>, // [layer][head][j][i]
 }
 
 impl GdnState {
@@ -465,6 +471,86 @@ struct FfnBufs<'a> {
     gate: &'a mut [f32],   // rows * d_ffn
     up: &'a mut [f32],     // rows * d_ffn
     down: &'a mut [f32],   // rows * d_model
+}
+
+/// Context for [`gdn_scan_heads`]: one layer's delta-rule work, split so every
+/// worker owns whole v-heads. `state`, `gdec`, `beta` and `out` are the per-head
+/// slices a worker writes; `q`, `k` and `v` are read-only.
+struct GdnHeadCtx {
+    state: *mut f32,  // n_v * hd * hd
+    q: *const f32,    // n_groups * hd
+    k: *const f32,    // n_groups * hd
+    v: *const f32,    // n_v * hd
+    gdec: *const f32, // n_v, log decay per head
+    beta: *const f32, // n_v
+    out: *mut f32,    // n_v * hd
+    n_v: usize,
+    hd: usize,
+    n_groups: usize,
+    scale_q: f32,
+}
+
+/// Delta-rule update and read-back for v-heads `begin..end`.
+///
+/// The state is laid out `[j][i]`, so the column this walks is one contiguous run
+/// instead of a cache line per element. `i` stays the inner, ascending index, which
+/// is the sum order the serial loop used — that is why the result does not move.
+///
+/// # Safety
+/// `ctx` must point to a live [`GdnHeadCtx`] that outlives the call. The pool calls
+/// this once per worker with disjoint `begin..end` windows, so each worker's
+/// `state`/`out`/`gdec`/`beta` slices belong to it alone; `q`/`k`/`v` are read-only
+/// and must cover every head index a window can reach.
+unsafe fn gdn_scan_heads(_worker: usize, begin: usize, end: usize, ctx: usize) {
+    if begin >= end {
+        return;
+    }
+    let c = &*(ctx as *const GdnHeadCtx);
+    let hd = c.hd;
+    let per_head = hd * hd;
+    let heads = end - begin;
+    // Rebuild only this worker's window: a whole-array `&mut` per worker would
+    // alias the other workers' views even though the heads inside differ.
+    let state = std::slice::from_raw_parts_mut(c.state.add(begin * per_head), heads * per_head);
+    let gdec = std::slice::from_raw_parts(c.gdec.add(begin), heads);
+    let beta = std::slice::from_raw_parts(c.beta.add(begin), heads);
+    let out = std::slice::from_raw_parts_mut(c.out.add(begin * hd), heads * hd);
+    let q = std::slice::from_raw_parts(c.q, c.n_groups * hd);
+    let k = std::slice::from_raw_parts(c.k, c.n_groups * hd);
+    let v = std::slice::from_raw_parts(c.v, c.n_v * hd);
+
+    for (hi, h) in (begin..end).enumerate() {
+        let kg = h % c.n_groups;
+        let decay = gdec[hi].exp();
+        let b = beta[hi];
+        let q_off = kg * hd;
+        let k_off = kg * hd;
+        let v_off = h * hd;
+        let s_base = hi * per_head;
+
+        // delta_j = v[j] - sum_i S[i][j]*k[i]  (decay applies to S first)
+        for j in 0..hd {
+            let col = s_base + j * hd;
+            let mut dot = 0.0f32;
+            for i in 0..hd {
+                dot += state[col + i] * k[k_off + i];
+            }
+            let bd = b * (v[v_off + j] - dot);
+            for i in 0..hd {
+                state[col + i] = state[col + i] * decay + k[k_off + i] * bd;
+            }
+        }
+        // o_j = sum_i S[i][j] * q[i] * scale (tiled head order, matching ggml)
+        let out_off = hi * hd;
+        for j in 0..hd {
+            let col = s_base + j * hd;
+            let mut acc = 0.0f32;
+            for i in 0..hd {
+                acc += state[col + i] * q[q_off + i];
+            }
+            out[out_off + j] = acc * c.scale_q;
+        }
+    }
 }
 
 pub struct Qwen35Core {
@@ -1891,40 +1977,29 @@ impl Qwen35Core {
         // Recurrence per v-head. Head mapping follows ggml's tiling semantics:
         // v-head h pairs with k-group h % n_groups (ggml_repeat tiles the head
         // axis), and the trained alpha/beta rows are indexed by the same h.
+        //
+        // The heads are independent — each owns its slice of the state, its gates
+        // and its output row — so they go to the pool, which is the only change:
+        // inside a head the work is the same elements summed in the same ascending
+        // `i`, so the result is bit-identical to the serial loop.
         let scale_q = 1.0 / (hd as f32).sqrt();
         let state = caches.gdn.layer_slice(layer);
-        for h in 0..n_v {
-            let kg = h % self.n_groups;
-            let decay = sc.gdec[h].exp();
-            let b = sc.beta[h];
-            let q_off = kg * hd;
-            let k_off = kg * hd;
-            let v_off = h * hd;
-            let s_base = h * hd * hd;
-
-            // delta_j = v[j] - sum_i S[i][j]*k[i]  (decay applies to S first)
-            for j in 0..hd {
-                let mut dot = 0.0f32;
-                let col = s_base + j;
-                for i in 0..hd {
-                    dot += state[col + i * hd] * k_n[k_off + i];
-                }
-                let bd = b * (v_conv[v_off + j] - dot);
-                for i in 0..hd {
-                    state[col + i * hd] = state[col + i * hd] * decay + k_n[k_off + i] * bd;
-                }
-            }
-            // o_j = sum_i S[i][j] * q[i] * scale (tiled head order, matching ggml)
-            let out_off = h * hd;
-            for j in 0..hd {
-                let mut acc = 0.0f32;
-                let col = s_base + j;
-                for i in 0..hd {
-                    acc += state[col + i * hd] * q_n[q_off + i];
-                }
-                sc.attn_out[out_off + j] = acc * scale_q;
-            }
-        }
+        let ctx = GdnHeadCtx {
+            state: state.as_mut_ptr(),
+            q: q_n.as_ptr(),
+            k: k_n.as_ptr(),
+            v: v_conv.as_ptr(),
+            gdec: sc.gdec.as_ptr(),
+            beta: sc.beta.as_ptr(),
+            out: sc.attn_out.as_mut_ptr(),
+            n_v,
+            hd,
+            n_groups: self.n_groups,
+            scale_q,
+        };
+        let func: ParForFn = gdn_scan_heads;
+        self.pool
+            .par_for(n_v, func, &ctx as *const GdnHeadCtx as usize);
 
         if q35dbg {
             let mean_abs = |v: &[f32]| v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;

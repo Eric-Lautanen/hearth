@@ -13,8 +13,10 @@
 > mix stage 290 → 253 ms/token, FFN 1.36×), greedy output byte-identical on 27B/9B/4B
 > hybrids and a dense control, decode untouched. Then the duplicated per-token FFN was
 > folded into one `ffn_block` that both paths call (1 row for decode, `PREFILL_CHUNK` for
-> prefill), again byte-identical with no measurable cost. Detail: `docs/BUG_TRACKER.md`,
-> newest entry first.
+> prefill), again byte-identical with no measurable cost. Last, the GDN recurrence: state
+> laid out `[j][i]` per head so a delta-rule column is contiguous, and the 48 v-heads spread
+> over the pool — 1.57× the prefill scan stage, decode 1.47 → 1.67 tok/s on the 27B (1.3× on
+> the 4B/9B). Detail: `docs/BUG_TRACKER.md`, newest entry first.
 
 Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md`,
 `packaging/SIGNING.md`.
@@ -43,12 +45,14 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
 
 ## Open inference items (most valuable first)
 
-1. **The scans are now the majority of prefill** — 216 of 511 ms/token, against 246 for the
-   FFN. The delta rule is `hd x hd` state work per v-head with a column-strided inner loop
-   (`state[col + i * hd]`), and attention walks every cached key per head. Candidate: keep
-   the recurrence but make the state layout row-major per head so both the decay and the
-   `q`/`k` products are contiguous, then measure; do not vectorize before the layout
-   changes, because the strided read is the cost.
+1. **The scan is still the biggest stage after the FFN** — 161-169 of 436-451 ms/token
+   prefill, and 210-224 ms of ~590 decode, against 258 for the FFN. Layout and head split
+   are done: `GdnState` is `[j][i]` per head and `gdn_scan_heads` runs the 48 heads across the
+   pool, worth 1.57x on the prefill stage and 1.14-1.31x end to end. What remains is not the
+   strided read: 4 heads per worker per layer and ~12 MB of state access is ~5 GB/s
+   aggregate, so suspect the dispatch cadence (one `par_for` per GDN layer, ~48/token on top
+   of ~450 matmul dispatches) and an L2-resident working set. Count bytes per layer against
+   dispatches before changing anything.
 2. **aarch64 has no SIMD backend**; every kernel is the scalar fallback. NEON first suits
    the `Q2V_U8` LUT dot (`vqtbl`) and the f32 glue in `ops.rs`. Needs a real ARM runner
    before any number means anything.
