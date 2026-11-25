@@ -281,12 +281,11 @@ fn main() -> Result<(), String> {
     );
     // The engine walks the rayon formats with rayon's global pool, which is sized
     // from the logical core count; here each thread count gets its own pool so the
-    // curve can be read, and the last row is what runs today.
+    // curve can be read at all.
     println!(
         "pooled formats use ThreadPool::par_dot_rows (the decode dispatch); the rayon \
-         formats use a local pool per row count,\nso for them the {} -thread row is what the \
-         engine does today\n",
-        args.threads.iter().copied().max().unwrap_or(1)
+         formats get a local pool per\nrow count here, while the engine walks them with \
+         rayon's global pool (one worker per logical core)\n"
     );
 
     let act_f32 = activation_f32(args.cols);
