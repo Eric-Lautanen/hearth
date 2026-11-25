@@ -9,7 +9,10 @@
 > README model table and AGENTS key paths. `-mtp` (draft head) and `mmproj` (vision) are
 > deliberately unlisted. PTQ1_0 loads and decodes; interleaved 20-token pairs put it at
 > parity with Bonsai 2 (1.24/0.92 vs 1.31/0.71 tok/s), so no speed claim and no perf-table
-> row. Detail: `docs/BUG_TRACKER.md`, newest entry first.
+> row. Then a paired hybrid prefill (two prompt tokens per FFN weight pass) cut the 27B's
+> prefill from 663 to 546 ms/token — 1.41× on the FFN stage — with byte-identical output on
+> both a PTQ1_0 and a PQ2_0 hybrid; the recurrent projections are the remaining half.
+> Detail: `docs/BUG_TRACKER.md`, newest entry first.
 
 Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md`,
 `packaging/SIGNING.md`.
@@ -41,9 +44,14 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
 3. **Speculative decoding: measure acceptance `a` first.** The 27B's decode is ~720 ms/token
    and the 2B's ~50 ms, but 3 of every 4 `qwen35` layers are recurrent, so a rejected draft
    must rewind conv+SSM state, not just a KV cache.
-4. **Chunked prefill: measure `f` first.** `dot_ptq1_0_q8_0x2_ptr` is the tested primitive
-   (bit-identical to two single calls, currently unreferenced — do not re-wire it into
-   `matmul_batch`); an x4 variant regressed 3.2×.
+4. **Paired prefill is in; the projections are the next half.** `qwen35::forward_pair` runs
+   two prompt tokens through one FFN weight pass (`PREFILL_CHUNK = 2`; `HEARTH_Q35_NOPAIR`
+   reverts). On the 2.5 27B the FFN stage went 26.0 → 18.45 s for 76 tokens and total prefill
+   663 → 546 ms/token, with byte-identical greedy output. What remains is `gdn_layer` and
+   `attn_layer`, which still project one token at a time: split each into a batchable
+   `project` (qkv/gate/alpha/beta, attn q/k/v/o) and a sequential `scan` (conv, delta rule,
+   KV append), then call `mm_batched` there too. Same primitive, no new kernels. Do not
+   widen the chunk — the x4 variant of the paired kernel regressed 3.2×.
 5. **Kernel rules that made past fixes findable**: a `#[target_feature]` body names every
    feature it uses and its dispatch gate names the same set; `.cargo/config.toml` pins
    `x86-64-v3` and must not drop below what any dispatched body uses. A new quant format

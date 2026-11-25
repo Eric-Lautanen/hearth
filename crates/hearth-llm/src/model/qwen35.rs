@@ -40,7 +40,7 @@ use super::kv_budget;
 use super::tensor::TensorEntry;
 use crate::config::ModelConfig;
 use crate::kvcache::KVCache;
-use crate::pool::ThreadPool;
+use crate::pool::{BatchedDotRowsParams, ThreadPool};
 
 // ---------------------------------------------------------------------------
 // Hadamard transform
@@ -48,6 +48,22 @@ use crate::pool::ThreadPool;
 
 /// Normalized Sylvester Walsh-Hadamard: H[i][j] = s * (-1)^popcount(i & j),
 /// s = 1/sqrt(n). In-place butterfly, O(n log n).
+/// Prompt tokens per batched prefill pass.
+///
+/// Two is the width the paired dot kernels implement (`dot_*_q8_0x2_ptr`): one
+/// weight-row expansion serves both activations, and every format the hybrids
+/// ship has one (PTQ1_0, PQ2_0/Q2_0, Q1_0_G128), each falling back to two single
+/// calls on targets without the SIMD arm. A wider chunk would need an x4 kernel,
+/// and that variant measured 3.2x slower than the x2 path when it was tried; the
+/// scratch buffers are sized from this constant, so raising it is a real change
+/// to the prefill, not a tuning knob.
+const PREFILL_CHUNK: usize = 2;
+
+/// Q8_0 row width: 32-element blocks of a 2-byte scale plus 32 signed bytes.
+fn q8_size(dim: usize) -> usize {
+    dim.div_ceil(32) * 34
+}
+
 fn walsh_hadamard_in_place(x: &mut [f32]) {
     let n = x.len();
     debug_assert!(n.is_power_of_two());
@@ -396,7 +412,16 @@ struct FwdScratch {
     ffn_gate: Vec<f32>,   // d_ffn
     ffn_up: Vec<f32>,     // d_ffn
     act: Vec<f32>,        // layer output (d_model)
-    proj_q8: Vec<u8>,     // activation q8 scratch
+    // -- paired-prefill scratch: PREFILL_CHUNK tokens share one weight pass --
+    chunk_hidden: Vec<f32>, // PREFILL_CHUNK * d_model
+    chunk_normed: Vec<f32>, // PREFILL_CHUNK * d_model (post-attention norm input)
+    chunk_act: Vec<f32>,    // PREFILL_CHUNK * d_model (batched FFN output)
+    chunk_gate: Vec<f32>,   // PREFILL_CHUNK * d_ffn
+    chunk_up: Vec<f32>,     // PREFILL_CHUNK * d_ffn
+    chunk_q8_d: Vec<u8>,    // PREFILL_CHUNK * q8_size(d_model)
+    chunk_q8_ffn: Vec<u8>,  // PREFILL_CHUNK * q8_size(d_ffn)
+    chunk_rot: Vec<f32>,    // max(d_model, d_ffn) rotation scratch
+    proj_q8: Vec<u8>,       // activation q8 scratch
     /// Stage totals, accumulated only when `timers_on`.
     timers: Q35Timers,
 }
@@ -426,6 +451,8 @@ pub struct Qwen35Core {
     kill_emb_inv: bool,
     kill_gdn: bool,
     kill_attn: bool,
+    /// `HEARTH_Q35_NOPAIR` — keep prefill strictly token-by-token (A/B switch).
+    pair_off: bool,
     /// `HEARTH_Q35_TIMERS` — cache the env lookup (it takes a process-wide lock
     /// on Windows and this is consulted on every stage of every token).
     timers_on: bool,
@@ -768,6 +795,14 @@ impl Qwen35Core {
             ffn_gate: vec![0.0; ffn_dim],
             ffn_up: vec![0.0; ffn_dim],
             act: vec![0.0; d],
+            chunk_hidden: vec![0.0; PREFILL_CHUNK * d],
+            chunk_normed: vec![0.0; PREFILL_CHUNK * d],
+            chunk_act: vec![0.0; PREFILL_CHUNK * d],
+            chunk_gate: vec![0.0; PREFILL_CHUNK * ffn_dim],
+            chunk_up: vec![0.0; PREFILL_CHUNK * ffn_dim],
+            chunk_q8_d: vec![0u8; PREFILL_CHUNK * q8_size(d)],
+            chunk_q8_ffn: vec![0u8; PREFILL_CHUNK * q8_size(ffn_dim)],
+            chunk_rot: vec![0.0; d.max(ffn_dim)],
             proj_q8: Vec::new(),
             timers: Q35Timers::default(),
         };
@@ -798,6 +833,7 @@ impl Qwen35Core {
             kill_emb_inv: std::env::var_os("HEARTH_Q35_NOEMBINV").is_some(),
             kill_gdn: std::env::var_os("HEARTH_Q35_NOGDN").is_some(),
             kill_attn: std::env::var_os("HEARTH_Q35_NOATTN").is_some(),
+            pair_off: std::env::var_os("HEARTH_Q35_NOPAIR").is_some(),
             timers_on: std::env::var_os("HEARTH_Q35_TIMERS").is_some(),
             layers,
             layer_is_gdn,
@@ -865,6 +901,11 @@ impl Qwen35Core {
 
     fn no_gdn(&self) -> bool {
         self.kill_gdn
+    }
+
+    /// True when `HEARTH_Q35_NOPAIR` asked for the token-by-token prefill.
+    fn pairing_disabled(&self) -> bool {
+        self.pair_off
     }
 
     fn no_attn(&self) -> bool {
@@ -1005,6 +1046,93 @@ impl Qwen35Core {
             row_bytes,
             n_cols,
             dot_fn: dot,
+        });
+        Ok(())
+    }
+
+    /// Rotate (when the weight is folded) and quantize one activation row into a
+    /// caller-owned Q8 slot, so several rows can share one batched weight pass.
+    /// `rot` must be at least `x.len()` wide; it is the same copy-then-rotate the
+    /// single-token `mm` does, so the bytes are identical to what that path feeds
+    /// the kernel.
+    fn rotate_quantize_into(&self, x: &[f32], had: bool, q8: &mut [u8], rot: &mut [f32]) {
+        let folded = had && self.had_block_size > 0 && !self.no_had() && !self.no_had_mm();
+        if folded {
+            let tmp = &mut rot[..x.len()];
+            tmp.copy_from_slice(x);
+            hadamard_rotate(tmp, self.signs_for(x.len()), self.had_block_size);
+            hearth_quant::quantize_q8_0_into(tmp, q8);
+        } else {
+            hearth_quant::quantize_q8_0_into(x, q8);
+        }
+    }
+
+    /// One weight pass over `seq_len` pre-quantized activation rows, laid out
+    /// token-major with `stride` bytes each (`out[s * n_rows + row]`). The pool
+    /// picks the paired kernel when the format has one, so a row is expanded
+    /// once for two tokens instead of twice.
+    fn mm_batched(
+        &self,
+        w: &W,
+        q8: &[u8],
+        stride: usize,
+        seq_len: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        let entry = &w.0;
+        let n_rows = entry.n_rows();
+        let n_cols = entry.n_cols();
+        if q8.len() < stride * seq_len {
+            return Err(format!(
+                "qwen35: batched activation too small ({} < {})",
+                q8.len(),
+                stride * seq_len
+            ));
+        }
+        if out.len() != n_rows * seq_len {
+            return Err(format!(
+                "qwen35: batched out width mismatch (w rows {} x {} vs out {})",
+                n_rows,
+                seq_len,
+                out.len()
+            ));
+        }
+        let (dot, dot2): (crate::pool::DotFn, Option<crate::pool::DotFn2>) = match entry.dtype {
+            GgmlDType::PTQ1_0 => (
+                hearth_quant::dot_ptq1_0_q8_0_ptr,
+                Some(hearth_quant::dot_ptq1_0_q8_0x2_ptr),
+            ),
+            GgmlDType::PQ2_0 | GgmlDType::Q2_0 => (
+                hearth_quant::dot_q2_0_q8_0_ptr,
+                Some(hearth_quant::dot_q2_0_q8_0x2_ptr),
+            ),
+            GgmlDType::Q1_0 | GgmlDType::Q10G128 => (
+                hearth_quant::dot_q1_0g128_q8_0_ptr,
+                Some(hearth_quant::dot_q1_0g128_q8_0x2_ptr),
+            ),
+            GgmlDType::Q8_0 => (hearth_quant::dot_q8_0_q8_0_ptr, None),
+            other => {
+                return Err(format!(
+                    "qwen35: unsupported weight dtype {} (needs a q8 dot kernel)",
+                    other.name()
+                ))
+            }
+        };
+        let w_base = entry.data().as_ptr() as usize;
+        let a_ptr = q8.as_ptr() as usize;
+        let out_ptr = out.as_mut_ptr() as usize;
+        let row_bytes = entry.dtype.byte_size(n_cols);
+        self.pool.par_dot_rows_batched(BatchedDotRowsParams {
+            n: n_rows,
+            seq_len,
+            q8_stride: stride,
+            w_base,
+            a_ptr,
+            out_ptr,
+            row_bytes,
+            n_cols,
+            dot_fn: dot,
+            dot_fn2: dot2,
         });
         Ok(())
     }
@@ -1236,6 +1364,188 @@ impl Qwen35Core {
     }
 
     // -- GDN layer ----------------------------------------------------------
+    /// Prefill `PREFILL_CHUNK` prompt tokens with one FFN weight pass.
+    ///
+    /// Everything that touches recurrent state — the GDN conv/scan and the
+    /// full-attention KV append — is walked strictly in token order, so the sums
+    /// are the ones the decode path produces. The feed-forward block is per-token
+    /// by nature, which is what makes it batchable: both rows go through a single
+    /// weight pass and the paired kernels expand each row once for the two
+    /// activations. That block is half of prefill on a 27B, so this removes half
+    /// of its weight traffic without changing a single sum.
+    ///
+    /// `logits` receives the last token's row only, which is what the sampler
+    /// consumes.
+    fn forward_pair(
+        &self,
+        pair: [u32; PREFILL_CHUNK],
+        pos: usize,
+        caches: &mut Qwen35Caches,
+        logits: &mut [f32],
+    ) -> Result<(), String> {
+        let sc = &mut *self.scratch.lock().unwrap();
+        let d = self.d_model;
+        let eps = self.config.rms_norm_eps;
+        let ffn_dim = self.config.d_ffn as usize;
+        let q8_d = q8_size(d);
+        let q8_ffn = q8_size(ffn_dim);
+        let t_total = std::time::Instant::now();
+        let mut t_stage = std::time::Instant::now();
+
+        // Embeddings: one row lookup per token, same inverse fold as decode.
+        let emb_rows = self.token_embd.0.n_rows();
+        for (i, &token) in pair.iter().enumerate() {
+            if token as usize >= emb_rows {
+                return Err(format!("qwen35: token id {} out of range", token));
+            }
+            hearth_quant::dequantize(
+                self.token_embd.0.dtype,
+                self.token_embd.0.row_data(token as usize),
+                &mut sc.chunk_hidden[i * d..(i + 1) * d],
+            )?;
+        }
+        if self.had_embed_inverse && self.had_block_size > 0 && !self.no_had() && !self.no_emb_inv()
+        {
+            for i in 0..PREFILL_CHUNK {
+                hadamard_unrotate(
+                    &mut sc.chunk_hidden[i * d..(i + 1) * d],
+                    self.signs_for(d),
+                    self.had_block_size,
+                );
+            }
+        }
+        if self.timers_on {
+            sc.timers.embed_us += t_stage.elapsed().as_micros();
+            t_stage = std::time::Instant::now();
+        }
+
+        for layer in 0..self.layers.len() {
+            let lyr = &self.layers[layer];
+
+            // Structural mix, one token at a time: conv/scan and the KV append
+            // are ordered state, so they cannot be run out of order.
+            for i in 0..PREFILL_CHUNK {
+                {
+                    let hidden: &[f32] = &sc.chunk_hidden[i * d..(i + 1) * d];
+                    crate::ops::rms_norm(hidden, &lyr.attn_norm.0, eps, &mut sc.normed);
+                }
+                if self.layer_is_gdn[layer] {
+                    self.gdn_layer(layer, pos + i, lyr, sc, caches)?;
+                    if self.no_gdn() {
+                        sc.act.fill(0.0);
+                    }
+                } else {
+                    self.attn_layer(layer, lyr, pos + i, sc, caches)?;
+                    if self.no_attn() {
+                        sc.act.fill(0.0);
+                    }
+                }
+                {
+                    let hidden: &mut [f32] = &mut sc.chunk_hidden[i * d..(i + 1) * d];
+                    for (h, a) in hidden.iter_mut().zip(sc.act.iter()) {
+                        *h += *a;
+                    }
+                }
+                {
+                    let hidden: &[f32] = &sc.chunk_hidden[i * d..(i + 1) * d];
+                    crate::ops::rms_norm(
+                        hidden,
+                        &lyr.post_attention_norm.0,
+                        eps,
+                        &mut sc.chunk_normed[i * d..(i + 1) * d],
+                    );
+                }
+            }
+
+            if self.timers_on {
+                sc.timers.mix_us += t_stage.elapsed().as_micros();
+                t_stage = std::time::Instant::now();
+            }
+
+            if self.no_ffn() {
+                continue;
+            }
+
+            // Feed-forward, both rows per weight pass: gate, up, then down.
+            for i in 0..PREFILL_CHUNK {
+                self.rotate_quantize_into(
+                    &sc.chunk_normed[i * d..(i + 1) * d],
+                    true,
+                    &mut sc.chunk_q8_d[i * q8_d..(i + 1) * q8_d],
+                    &mut sc.chunk_rot,
+                );
+            }
+            self.mm_batched(
+                &lyr.ffn_gate,
+                &sc.chunk_q8_d,
+                q8_d,
+                PREFILL_CHUNK,
+                &mut sc.chunk_gate,
+            )?;
+            self.mm_batched(
+                &lyr.ffn_up,
+                &sc.chunk_q8_d,
+                q8_d,
+                PREFILL_CHUNK,
+                &mut sc.chunk_up,
+            )?;
+
+            for i in 0..PREFILL_CHUNK {
+                let gate = &mut sc.chunk_gate[i * ffn_dim..(i + 1) * ffn_dim];
+                crate::ops::silu(gate);
+                let up = &sc.chunk_up[i * ffn_dim..(i + 1) * ffn_dim];
+                for (g, u) in gate.iter_mut().zip(up.iter()) {
+                    *g *= *u;
+                }
+                self.rotate_quantize_into(
+                    gate,
+                    true,
+                    &mut sc.chunk_q8_ffn[i * q8_ffn..(i + 1) * q8_ffn],
+                    &mut sc.chunk_rot,
+                );
+            }
+            self.mm_batched(
+                &lyr.ffn_down,
+                &sc.chunk_q8_ffn,
+                q8_ffn,
+                PREFILL_CHUNK,
+                &mut sc.chunk_act,
+            )?;
+            for i in 0..PREFILL_CHUNK {
+                let hidden: &mut [f32] = &mut sc.chunk_hidden[i * d..(i + 1) * d];
+                let act: &[f32] = &sc.chunk_act[i * d..(i + 1) * d];
+                for (h, a) in hidden.iter_mut().zip(act.iter()) {
+                    *h += *a;
+                }
+            }
+
+            if self.timers_on {
+                sc.timers.ffn_us += t_stage.elapsed().as_micros();
+                t_stage = std::time::Instant::now();
+            }
+        }
+
+        let last = PREFILL_CHUNK - 1;
+        {
+            let hidden: &[f32] = &sc.chunk_hidden[last * d..(last + 1) * d];
+            crate::ops::rms_norm(hidden, &self.output_norm.0, eps, &mut sc.normed);
+        }
+        let out_w = self.output.as_ref().unwrap_or(&self.token_embd);
+        self.mm(
+            out_w,
+            &sc.normed,
+            logits,
+            &mut sc.tmp_f32,
+            &mut sc.proj_q8,
+            true,
+        )?;
+        if self.timers_on {
+            sc.timers.head_us += t_stage.elapsed().as_micros();
+            sc.timers.total_us += t_total.elapsed().as_micros();
+        }
+        Ok(())
+    }
+
     fn gdn_layer(
         &self,
         layer: usize,
@@ -1690,13 +2000,24 @@ impl Qwen35Core {
         let mut total_tokens = 0usize;
         let greedy = sampler_config.temperature == 0.0;
 
-        // Prefill: token by token (GDN recurrence is inherently sequential).
+        // Prefill: paired where the length allows it. The recurrence is still
+        // walked in token order (see `forward_pair`); only the per-token FFN
+        // shares a weight pass. `HEARTH_Q35_NOPAIR` restores the old path.
         self.timers_reset();
-        for (i, &tid) in input_ids.iter().enumerate() {
+        let mut at = 0usize;
+        while at < input_ids.len() {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            self.forward(tid, i, &mut caches, &mut logits)?;
+            if at + PREFILL_CHUNK <= input_ids.len() && !self.pairing_disabled() {
+                let mut pair = [0u32; PREFILL_CHUNK];
+                pair.copy_from_slice(&input_ids[at..at + PREFILL_CHUNK]);
+                self.forward_pair(pair, at, &mut caches, &mut logits)?;
+                at += PREFILL_CHUNK;
+            } else {
+                self.forward(input_ids[at], at, &mut caches, &mut logits)?;
+                at += 1;
+            }
         }
         self.timers_report("prefill", prompt_tokens);
         self.timers_reset();

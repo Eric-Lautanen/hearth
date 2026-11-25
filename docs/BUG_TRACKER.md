@@ -3,6 +3,55 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Paired hybrid prefill: two prompt tokens per FFN weight pass (+21% prefill, 2026-11-25)
+
+The hybrid prefill was strictly token-by-token, and the stage timers said why that is the
+wrong shape for a prompt: on the 27B at 700 ms/token, `gdn/attn` was 46% and `ffn` 50%, and
+prefill cost per token was *the same as decode*. Both stages are weight-bound, so the only
+lever is reusing a weight row across tokens. The pieces already existed — `DotFn2`,
+`par_dot_rows_batched`, `batched_rows_chunk`, and x2 kernels for PTQ1_0, PQ2_0/Q2_0 and
+Q1_0_G128 with two-call fallbacks — but nothing on the hybrid path called them, because the
+recurrence looked like it made the whole forward sequential. It does not: the GDN conv/scan
+and the KV append are ordered state, while the feed-forward block is per-token and
+independent.
+
+`qwen35::forward_pair` walks `PREFILL_CHUNK = 2` tokens in order for everything that touches
+state (so the recurrence is bit-identical to decode), then feeds both rows' rotated,
+quantized activations through **one** weight pass for `ffn_gate`, `ffn_up` and `ffn_down` via
+`mm_batched`. Only the last token's row goes through the head, which is all the sampler uses.
+`HEARTH_Q35_NOPAIR` restores the old path for A/B runs. Chunk stays at two: the paired
+kernel is the width that exists, and the x4 attempt regressed 3.2x.
+
+**Measured** (Ternary Bonsai 2.5 27B PTQ1_0, 76-token prompt, alternating modes in one
+window, two runs each):
+
+| stage | token-by-token | paired | |
+| --- | --- | --- | --- |
+| ffn, 76 tokens | 25.54 / 26.47 s | **18.44 / 18.45 s** | **1.41x** |
+| gdn/attn, 76 tokens | 22.08 / 22.96 s | 22.10 / 22.10 s | unchanged (as intended) |
+| prefill, ms/token | 651 / 675 | **545 / 546** | **1.21x** |
+| decode ffn, us/token | 330 / 333 | 326 / 337 | unchanged (decode path untouched) |
+
+**Correctness**: greedy output is byte-identical before and after on a PTQ1_0 hybrid (9B,
+40 tokens) and a PQ2_0 hybrid (4B, 40 tokens), comparing the full decoded text, not a
+prefix. That is the check that matters here — the paired kernels decode each weight block
+once and accumulate twice, and the pooled dispatch writes `out[s * n + row]`, so a
+transposed or mis-strided result would show up as different tokens immediately.
+
+**Portability**: no new dependencies and no new intrinsics; the batched path picks the x2
+kernel per weight dtype and every one of them falls back to two single dots when the SIMD
+arm is absent. `cargo check`/`clippy --target aarch64-unknown-linux-gnu --workspace
+--all-targets` are clean, as are the x86_64 gate and `cargo fmt --check`.
+
+**No decode regression**: six-model sweep, 50 tokens, `--temp 0 --prompt-raw`: 1.7B Q1_0
+46.86, 1.7B Q2_0 26.46, 4B Q1_0 24.13, 4B Q2_0 12.35, 8B Q1_0 12.89, 8B Q2_0 6.69 tok/s —
+all at or above the README table, which this change does not touch (decode never enters
+`forward_pair`).
+
+**Still sequential, and now the majority of prefill**: `gdn_layer`'s projections (qkv, gate,
+alpha, beta, ssm_out) and `attn_layer`'s q/k/v/o. Splitting each into a batchable projection
+and a sequential scan is the next step; the primitive is already there.
+
 ### Ternary Bonsai 2.5 27B added — verified against the loader, no engine change (Buffy, 2026-11-25)
 
 PrismML shipped `prism-ml/bonsai-25-27b` → `prism-ml/Ternary-Bonsai-2.5-27B-GGUF`: the
