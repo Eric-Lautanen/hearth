@@ -1,3 +1,4 @@
+use hearth_gguf::GgmlDType;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -244,6 +245,23 @@ pub struct ThreadPool {
     parked: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     num_threads: usize,
+}
+
+/// The q8-activation row kernel `par_dot_rows` dispatches for a weight dtype,
+/// or `None` for formats the decode path does not route through the pool
+/// (they walk rows with rayon instead).
+///
+/// The mapping lives in exactly one place so `kernel-bench` measures the kernel
+/// the engine dispatches rather than a copy of this table that can drift away
+/// from it.
+pub fn dot_rows_fn(dtype: GgmlDType) -> Option<DotFn> {
+    Some(match dtype {
+        GgmlDType::Q2_0 | GgmlDType::PQ2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
+        GgmlDType::PTQ1_0 => hearth_quant::dot_ptq1_0_q8_0_ptr,
+        GgmlDType::Q10G128 | GgmlDType::Q1_0 => hearth_quant::dot_q1_0g128_q8_0_ptr,
+        GgmlDType::Q8_0 => hearth_quant::dot_q8_0_q8_0_ptr,
+        _ => return None,
+    })
 }
 
 /// Row-parallel dot-product dispatch parameters. Grouped so the pool API

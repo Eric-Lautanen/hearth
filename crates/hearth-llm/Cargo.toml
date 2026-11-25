@@ -22,3 +22,6 @@ wide = { workspace = true }
 [[bin]]
 name = "hearth-chat-cli"
 path = "src/bin/hearth-chat-cli.rs"
+[[bin]]
+name = "kernel-bench"
+path = "src/bin/kernel-bench.rs"

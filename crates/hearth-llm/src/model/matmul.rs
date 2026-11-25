@@ -46,6 +46,13 @@ pub(crate) struct FusedQkvParams<'a> {
     pub x_q8: Option<&'a [u8]>,
 }
 
+/// The pooled row kernel for `dtype`, with a message naming the format when the
+/// dispatch table has no entry. Reaching the error means an arm above ran for a
+/// format the table does not cover, which is a bug rather than a model problem.
+fn pooled_dot_fn(dtype: GgmlDType) -> Result<crate::pool::DotFn, String> {
+    crate::pool::dot_rows_fn(dtype).ok_or_else(|| format!("no pooled kernel for {dtype:?}"))
+}
+
 impl LlamaModel {
     pub(crate) fn matmul(
         &self,
@@ -170,7 +177,7 @@ impl LlamaModel {
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    dot_fn: hearth_quant::dot_q2_0_q8_0_ptr,
+                    dot_fn: pooled_dot_fn(entry.dtype)?,
                 });
             }
             GgmlDType::PTQ1_0 => {
@@ -194,7 +201,7 @@ impl LlamaModel {
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    dot_fn: hearth_quant::dot_ptq1_0_q8_0_ptr,
+                    dot_fn: pooled_dot_fn(entry.dtype)?,
                 });
             }
             GgmlDType::Q10G128 => {
@@ -217,7 +224,7 @@ impl LlamaModel {
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                    dot_fn: pooled_dot_fn(entry.dtype)?,
                 });
             }
             GgmlDType::Q1_0 => {
@@ -241,7 +248,7 @@ impl LlamaModel {
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                    dot_fn: pooled_dot_fn(entry.dtype)?,
                 });
             }
             GgmlDType::Q8_0 => {
@@ -264,7 +271,7 @@ impl LlamaModel {
                     out_ptr,
                     row_bytes,
                     n_cols,
-                    dot_fn: hearth_quant::dot_q8_0_q8_0_ptr,
+                    dot_fn: pooled_dot_fn(entry.dtype)?,
                 });
             }
             GgmlDType::Q4K => {
@@ -443,7 +450,7 @@ impl LlamaModel {
                     out_ptr: out_a_ptr,
                     row_bytes,
                     n_cols,
-                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                    dot_fn: pooled_dot_fn(entry_a.dtype)?,
                 });
                 self.pool.par_dot_rows(crate::pool::DotRowsParams {
                     n: n_rows_b,
@@ -452,7 +459,7 @@ impl LlamaModel {
                     out_ptr: out_b_ptr,
                     row_bytes,
                     n_cols,
-                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                    dot_fn: pooled_dot_fn(entry_a.dtype)?,
                 });
             }
             _ => {
@@ -536,7 +543,7 @@ impl LlamaModel {
                     out_ptr: oq,
                     row_bytes,
                     n_cols,
-                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                    dot_fn: pooled_dot_fn(eq.dtype)?,
                 });
                 self.pool.par_dot_rows(crate::pool::DotRowsParams {
                     n: nr_k,
@@ -545,7 +552,7 @@ impl LlamaModel {
                     out_ptr: ok,
                     row_bytes,
                     n_cols,
-                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                    dot_fn: pooled_dot_fn(eq.dtype)?,
                 });
                 self.pool.par_dot_rows(crate::pool::DotRowsParams {
                     n: nr_v,
@@ -554,7 +561,7 @@ impl LlamaModel {
                     out_ptr: ov,
                     row_bytes,
                     n_cols,
-                    dot_fn: hearth_quant::dot_q1_0g128_q8_0_ptr,
+                    dot_fn: pooled_dot_fn(eq.dtype)?,
                 });
             }
             _ => {

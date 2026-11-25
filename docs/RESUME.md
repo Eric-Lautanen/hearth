@@ -20,7 +20,10 @@
 > `namespace`, macros, filters, `is` tests, slicing, whitespace control) and the silent
 > synthetic fallback is gone — all 15 packs now render byte-identically to jinja2 3.1, and
 > the 2.5 27B gets its card prompt (67 tokens with `--show-think`) instead of the synthetic
-> 33. Detail: `docs/BUG_TRACKER.md`, newest entry first.
+> 33. Then `kernel-bench`: a per-format row-kernel microbenchmark (weight GB/s and Gweights/s
+> per thread count, median of five passes over a buffer past L3), sharing one dispatch table
+> with `matmul` — it put Q5_0/Q5_1 at 0.35 vs PTQ1_0's 6.5 Gweights/s per thread and showed 16
+> threads losing to 12 on every pooled format. Detail: `docs/BUG_TRACKER.md`, newest entry first.
 
 Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md`,
 `packaging/SIGNING.md`.
@@ -53,6 +56,14 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    `tools` field. Before wiring tools through the UI, add the field and a fixture case
    rendered by the reference engine, or the first real tool call goes out in a format
    nobody checked.
+
+7. **Quote `kernel-bench` numbers, not tok/s, for kernel work.** A kernel claim should name the
+   GB/s, the format and the thread count, plus the whole-model tok/s it was meant to move. Before
+   trusting a stage number, check the kernel's curve: PTQ1_0 tops out at 11.2 GB/s (12 threads),
+   Q1_0_G128 at 25.3 (12), Q8_0 at 48.7 (12), and above eight threads the cells move by up to 40%
+   between runs. The one open finding it recorded is Q5_0/Q5_1 at 0.35 Gweights/s single-thread,
+   a per-element `% 2` unpack into a `[f32; 32]` before the SIMD madd; nothing in the catalog is
+   Q5, so it is a rewrite-for-a-LUT-kernel job only if such a model ever lands.
 
 ## Open inference items (most valuable first)
 

@@ -3,6 +3,78 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Per-kernel microbenchmark: `kernel-bench`, GB/s and weights/s per format per thread count (2026-11-25)
+
+Every kernel claim in this file was inferred from whole-model tok/s, which mixes the kernel with
+prefill pairing, KV traffic, sampling, the thread-count policy and whatever else the machine was
+doing — the same binary spans 10-15% between readings on frequency scaling alone, and one cold run
+in this session read 0.61 tok/s where a warm one read 1.50. `kernel-bench` measures the thing a
+kernel change actually moves: one row kernel walked over a weight buffer sized past L3, so the
+weights stream from DRAM the way decode reads them.
+
+```text
+cargo run --release -p hearth-llm --bin kernel-bench
+cargo run --release -p hearth-llm --bin kernel-bench -- --format ptq1_0 --threads 1,4,8
+```
+
+It reports, per format and per thread count, the best and median pass in ms, weight GB/s and
+Gweights/s from the *median* (a spin-wait pool can hand back one easy pass no other pass
+reproduces, and a claim built on that pass is the noise this exists to remove), and the speedup
+over one thread. Defaults are 32768 rows x 5120 cols — 35 MB even for PTQ1_0, past this box's 16 MB
+L3 — and five passes per cell.
+
+The kernel is not chosen in the binary: `pool::dot_rows_fn(dtype)` is now the one table, and the
+five pooled arms of `matmul` call it too, so the bench cannot measure a kernel the engine does not
+dispatch. The six formats the engine walks with rayon (Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q6_K) get a
+local rayon pool per row count; the engine uses rayon's global pool, so their 16-thread row is
+what runs today.
+
+**Weight GB/s by thread count** (median of five passes, 32768 x 5120, this box):
+
+| format | 1 | 2 | 4 | 6 | 8 | 12 | 16 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| PTQ1_0 | 1.43 | 2.84 | 5.68 | 8.38 | 8.22 | **11.18** | 7.40 |
+| Q2_0 | 2.55 | 5.18 | 7.39 | 13.82 | 13.98 | **17.98** | 13.16 |
+| PQ2_0 | 2.53 | 4.78 | 9.49 | 10.33 | 13.19 | **18.93** | 13.62 |
+| Q1_0 | 3.05 | 6.34 | 13.18 | 18.12 | 16.71 | **27.14** | 8.68 |
+| Q1_0_G128 | 3.19 | 6.08 | 11.84 | 19.00 | 24.52 | **25.25** | 9.96 |
+| Q8_0 | 9.17 | 16.29 | 35.76 | 47.87 | 44.91 | **48.65** | 41.22 |
+| Q4_0 | 3.87 | 7.75 | 15.22 | 20.28 | 27.96 | **32.22** | 31.90 |
+| Q4_1 | 0.54 | 0.87 | 2.02 | 2.87 | 3.66 | 5.36 | **5.95** |
+| Q5_0 | 0.25 | 0.48 | 0.98 | 1.40 | 1.88 | 2.72 | **3.35** |
+| Q5_1 | 0.27 | 0.45 | 0.93 | 1.38 | 1.79 | 2.62 | **3.01** |
+| Q4_K | 0.87 | 1.48 | 2.87 | 4.33 | 5.17 | **6.58** | 5.80 |
+| Q6_K | 0.59 | 1.06 | 2.16 | 3.11 | 4.13 | 6.02 | **6.94** |
+
+Single-thread weights/s, for reading the kernels against each other: PTQ1_0 6.5, Q2_0 9.6,
+Q1_0 21.7, Q1_0_G128 22.7, Q8_0 8.6, Q4_0 6.9, Q4_1 0.87, Q5_0 0.37, Q5_1 0.35, Q4_K 1.55,
+Q6_K 0.72 (Gweights/s).
+
+**What the numbers say**
+
+- **Q5_0/Q5_1 are 18-63x behind per weight** — 0.35-0.37 Gweights/s single-thread against
+  PTQ1_0's 6.5 and Q1_0_G128's 22.7.
+  `q5_0::dot_q5_0_f32` unpacks each 32-element block into a `[f32; 32]` stack array with a per-element
+  `i % 2` branch, then does the SIMD madd over it, and `q5_1` is the same shape. Nothing in the
+  catalog is Q5, so this is recorded rather than fixed; the fix is a LUT kernel like `q2_0`'s, not a
+  retune.
+- **The Prism ordering matches decode**: the Q2_0 LUT kernel reads 2.55 GB/s at one thread where
+  PTQ1_0's dense-trit kernel reads 1.43, and the whole-model numbers put Q2_0 ahead of PTQ1_0 on
+  the same geometry. The claim now has a per-kernel number behind it instead of a tok/s difference.
+- **Q8_0 is the fastest per byte** (9.2 GB/s single, 48 at twelve): the q8 x q8 path does not pay
+  a dequant step at all.
+- **Sixteen threads is never right for the pooled formats**, and is catastrophic for Q1_0 (27.1 ->
+  8.7 GB/s): the pool's barrier on 16 logical threads over 8 physical cores costs more than the
+  extra memory parallelism buys. That is the 8-physical dense policy measured on a kernel instead
+  of inferred.
+- **Variance**: single-thread cells reproduced within 5% across two full runs; above eight threads
+  the same cell moved by up to 40% (PTQ1_0 at four threads read 4.4 then 5.7 GB/s). Treat the
+  >8-thread columns as a shape, not a ranking, and re-run before quoting one.
+
+Bottom line for future claims: a kernel-change claim should quote a `kernel-bench` GB/s at a named
+thread count, plus the whole-model tok/s it was supposed to move. If the kernel number moves and
+tok/s does not, the stage is not the bottleneck; if neither moves, the change did not do anything.
+
 ### The 2.5 packs render their own template: `set`, `namespace`, macros and `reasoning_effort` (2026-11-25)
 
 Every 2.5 pack ships the Qwen3.5 chat template. It uses `{% set %}`, `namespace(...)`,

@@ -3,7 +3,7 @@ pub mod generate;
 pub mod kvcache;
 pub mod model;
 pub mod ops;
-mod pool;
+pub mod pool;
 
 pub use config::ModelConfig;
 pub use generate::{GenerateRequest, GenerateResponse, Token};
