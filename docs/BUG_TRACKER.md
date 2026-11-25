@@ -3,6 +3,56 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### 27B decode: where its 565 ms goes, stage bytes against the kernel ceiling (2026-11-25)
+
+`kernel-bench` gave a ceiling; this closes the loop by asking whether the model reaches it. Byte
+counts come from the GGUF per tensor (PTQ1_0 is 28 B per 128 weights, 4 B for the f32 tensors),
+not from file size divided by layer count, and stage times from `HEARTH_Q35_TIMERS=1` on 20 tokens,
+12 workers by policy (`hybrid_worker_count_for(16, 8, false)`).
+
+| stage | bytes/token | ms/token | GB/s | Gweights/s | share of 11.6 GB/s ceiling |
+| --- | --- | --- | --- | --- | --- |
+| ffn (64 layers) | 3.743 GB | 345.8 | 10.83 | 49.5 | 93% |
+| gdn/attn | 1.680 GB + 0.302 GB state | 193.9 | 10.22 | — | 88% |
+| head (`output.weight`) | 0.278 GB | 24.2 | 11.50 | 52.5 | 99% |
+| attn_norm, embed | 0.003 GB | 1.08 | — | — | — |
+| **decode** | **6.00 GB** | **564.9** | **10.63** | **46.1** | **92%** |
+
+565 and 574 ms/token across two warm runs (1.77 tok/s). A 5-token run reads 684 ms — cold start,
+not steady state — so short runs overstate the per-token cost by 20% and should not be quoted.
+
+Per-layer tensors: GDN 26.09 MiB (24.06 MiB of PTQ1_0 plus 1.92 MiB of **f32** `ssm_alpha` and
+`ssm_beta` at 960 KiB each), attention 21.88 MiB, ffn 55.78 MiB. The f32 pair is 96.5 MB per token
+that a f16 or ternary encoding would halve for ~1.5% of decode. The state term is the 151 MB GDN
+recurrence read and written once per token (per-head 64 KB stays in L2 across its three uses, so
+302 MB of DRAM traffic, not 604) — it is why the gdn/attn stage cannot be read as a weight kernel.
+
+**The ceiling is arithmetic, not bandwidth.** On the same machine at 12 workers, Q8_0 moves
+47.1 GB/s where PTQ1_0 does 11.2-12.7, and both land at 44-58 Gweights/s. Same weights/s across a
+5x spread in bytes per weight means neither kernel waits on DRAM, and the memory system sustains
+four times what the 27B asks: decode pulls 10.6 GB/s of a ~60 GB/s streaming capability. GB/s per
+thread count is flat from 6.6 MiB to 140 MiB of weights (11.90 / 11.88 / 12.71 / 11.24), so the
+large buffer is not being helped by L3 and the small one is not being hurt by startup.
+
+**Dispatch is bounded below the noise floor.** Fitting `t = F + B/R` through that size sweep puts
+the fixed cost per dispatch under 0.05 ms (a 6.6 MiB kernel finishes in 0.578 ms at 11.9 GB/s;
+throughput does not rise with buffer size), so ~200 matmuls cost under 10 ms of the 565. The
+shortfall against the ceiling is 31-65 ms depending on which ceiling reading is used, of which the
+GDN scan is ~8-10 ms (151 M state elements through serial `dot +=` chains) and serial norms plus
+embedding 1.1 ms; the rest is inside the bench's own ±7%.
+
+**Verdict: decode runs at ~92% of the PTQ1_0 kernel ceiling, so the constraint is per-weight decode
+arithmetic, not bandwidth and not dispatch.** Chasing memory layout, thread counts or pool barriers
+buys nothing here; the lever is cycles per weight in `dot_ptq1_0_q8_0`. The 1-thread column says
+where that room is: PTQ1_0 6.75 Gweights/s against Q2_0's 9.60 Gweights/s on 21% *more* bytes per
+weight, i.e. the table-driven decode is 42% cheaper per weight than the ternary one. A 20% faster
+kernel is worth ~70 ms/token (565 -> ~495, 1.77 -> 2.02 tok/s), all of it in the ffn's 61% share.
+
+Not measured, so not ruled out: the model streams 5.6 GB of mmap'd file pages where the bench
+streams an anonymous buffer, so TLB or huge-page backing could hide a few percent (a `--mmap FILE`
+mode on `kernel-bench` would test it), and the scan cost above is a first-principles estimate — a
+sub-stage timer around `gdn_scan_heads` would replace it with a reading.
+
 ### Per-kernel microbenchmark: `kernel-bench`, GB/s and weights/s per format per thread count (2026-11-25)
 
 Every kernel claim in this file was inferred from whole-model tok/s, which mixes the kernel with

@@ -23,7 +23,10 @@
 > 33. Then `kernel-bench`: a per-format row-kernel microbenchmark (weight GB/s and Gweights/s
 > per thread count, median of five passes over a buffer past L3), sharing one dispatch table
 > with `matmul` — it put Q5_0/Q5_1 at 0.35 vs PTQ1_0's 6.5 Gweights/s per thread and showed 16
-> threads losing to 12 on every pooled format. Detail: `docs/BUG_TRACKER.md`, newest entry first.
+> threads losing to 12 on every pooled format. Mapping its ceiling onto the 27B's stages says
+> decode runs at ~92% of the PTQ1_0 kernel ceiling (ffn 10.83, gdn/attn 10.22, head 11.50 GB/s
+> against 11.6), so the constraint is per-weight decode arithmetic, not bandwidth or dispatch.
+> Detail: `docs/BUG_TRACKER.md`, newest entry first.
 
 Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md`,
 `packaging/SIGNING.md`.
@@ -57,8 +60,15 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    rendered by the reference engine, or the first real tool call goes out in a format
    nobody checked.
 
-7. **Quote `kernel-bench` numbers, not tok/s, for kernel work.** A kernel claim should name the
-   GB/s, the format and the thread count, plus the whole-model tok/s it was meant to move. Before
+7. **Quote `kernel-bench` numbers, not tok/s, for kernel work.** Decode already sits at ~92% of
+   the PTQ1_0 ceiling (10.63 GB/s against 11.2-12.7), and the ceiling is arithmetic, not memory:
+   Q8_0 moves 47 GB/s on the same 12 workers while PTQ1_0 does 12, both at 44-58 Gweights/s, and
+   DRAM usage is ~18% of what this box can stream. So do not spend a session on layout, thread
+   counts or pool barriers for the 27B — the only lever left is cycles per weight in
+   `dot_ptq1_0_q8_0` (6.75 Gweights/s at one thread against Q2_0's 9.60 on more bytes per
+   weight, so a table-driven ternary decode is the shape to try; 20% there is ~70 ms/token).
+   A kernel claim should name the GB/s, the format and the thread count, plus the whole-model
+   tok/s it was meant to move. Before
    trusting a stage number, check the kernel's curve: PTQ1_0 tops out at 11.2 GB/s (12 threads),
    Q1_0_G128 at 25.3 (12), Q8_0 at 48.7 (12), and above eight threads the cells move by up to 40%
    between runs. The one open finding it recorded is Q5_0/Q5_1 at 0.35 Gweights/s single-thread,
