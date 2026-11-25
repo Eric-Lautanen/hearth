@@ -1592,20 +1592,11 @@ impl LlamaModel {
     pub fn debug_template_info(&self) {
         let tok = self.tokenizer.lock().unwrap();
         let has_gguf_template = tok.chat_template.is_some();
-        let using_gguf = has_gguf_template
-            && tok.chat_template.as_ref().is_some_and(|t| {
-                !t.contains("{% set")
-                    && !t.contains("namespace")
-                    && !t.contains("| ")
-                    && !t.contains("is defined")
-            });
-        if using_gguf {
-            eprintln!("Template source: GGUF chat_template (direct evaluation)");
-        } else if has_gguf_template {
-            eprintln!(
-                "Template source: synthetic ({:?}) — GGUF template too complex",
-                tok.template_kind
-            );
+        if has_gguf_template {
+            // The template is rendered whole by the Jinja evaluator. If it ever
+            // uses a construct the evaluator cannot handle, `apply_template`
+            // says so and falls back to the synthetic prompt at that point.
+            eprintln!("Template source: GGUF chat_template (rendered by the Jinja evaluator)");
         } else {
             eprintln!(
                 "Template source: synthetic ({:?}) — no GGUF template",

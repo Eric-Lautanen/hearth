@@ -549,27 +549,19 @@ impl Tokenizer {
 
     /// Build a chat prompt from system prompt, history pairs, and latest user message.
     ///
-    /// Always routes through the Jinja2 template evaluator:
-    /// - If the GGUF file provides a simple `tokenizer.chat_template`, that is used directly.
-    /// - Otherwise, a synthetic Jinja2 template is generated based on the detected
-    ///   TemplateKind, so there is exactly one code path for prompt building.
+    /// Always routes through the Jinja2 evaluator (`jinja::eval_jinja2`):
+    /// - If the GGUF file carries a `tokenizer.chat_template`, that template is
+    ///   what gets rendered, so a model is prompted the way its card documents it.
+    /// - Otherwise a synthetic template for the detected `TemplateKind` is used;
+    ///   there is one code path for prompt building either way.
+    ///
+    /// A template the evaluator cannot render is reported and the synthetic
+    /// template is used instead, so an unsupported construct degrades to the old
+    /// prompt rather than sending the model a half-rendered one.
     ///
     /// `thinking` controls whether reasoning/thinking sections are shown in the
-    /// output (applied via ThinkFilter at the consumer level; some templates
-    /// also use this parameter in their chat template).
-    /// Check if a GGUF chat_template is simple enough for our Jinja2 evaluator.
-    /// Our evaluator handles: {{ }}, {% for %}, {% if %}, {% endif %}, {% endfor %}
-    /// It does NOT handle: {% set %}, filters (|), namespace, `is defined`, etc.
-    fn is_template_simple_enough(template: &str) -> bool {
-        !template.contains("{% set")
-            && !template.contains("{%- set")
-            && !template.contains("{% elif")
-            && !template.contains("namespace")
-            && !template.contains("| ")
-            && !template.contains("is defined")
-            && !template.contains("is not")
-    }
-
+    /// output (applied via ThinkFilter at the consumer level; templates also
+    /// branch on it, as `enable_thinking`).
     pub fn apply_template(
         &self,
         system: &str,
@@ -596,13 +588,8 @@ impl Tokenizer {
             content: user.to_string(),
         });
 
-        // Template selection:
-        // 1. Use the GGUF chat_template directly if it's simple enough for our evaluator
-        // 2. Fall back to a synthetic template for the detected format
-        let template = match &self.chat_template {
-            Some(t) if Self::is_template_simple_enough(t) => t.as_str(),
-            _ => Self::synthetic_template(self.template_kind),
-        };
+        let synthetic = Self::synthetic_template(self.template_kind);
+        let template = self.chat_template.as_deref().unwrap_or(synthetic);
 
         let ctx = jinja::TemplateContext {
             messages,
@@ -614,8 +601,21 @@ impl Tokenizer {
             // the model open its own <think> block; when false we pre-close it
             // so the model skips reasoning and answers directly.
             enable_thinking: thinking,
+            // Left undefined unless a caller asks for a specific effort, which is
+            // what the reference render does: the template's `|default('xhigh')`
+            // then supplies the card's documented value.
+            reasoning_effort: None,
         };
-        jinja::eval_jinja2(template, &ctx)
+        match jinja::eval_jinja2(template, &ctx) {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                eprintln!(
+                    "[template] {err}; rendering the synthetic {:?} template instead",
+                    self.template_kind
+                );
+                jinja::eval_jinja2(synthetic, &ctx).unwrap_or_default()
+            }
+        }
     }
 }
 

@@ -3,6 +3,62 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### The 2.5 packs render their own template: `set`, `namespace`, macros and `reasoning_effort` (2026-11-25)
+
+Every 2.5 pack ships the Qwen3.5 chat template. It uses `{% set %}`, `namespace(...)`,
+macros, filters, `is` tests, reverse slices, inline conditionals and `reasoning_effort`, and
+the evaluator understood `{{ }}`, `{% for %}` and `{% if %}` — so `apply_template` swapped in
+the synthetic Qwen3 template for anything it could not parse
+(`is_template_simple_enough`), silently. The flagship was therefore prompted in a format no
+2.5 model was trained on: no reasoning-effort system line, no macro-rendered content, and
+assistant turns with no `reasoning_content` handling.
+
+`crates/hearth-tokenizer/src/jinja.rs` is now a small Jinja2 interpreter rather than a string
+scanner: a value model (undefined/null/bool/int/string/list/map, where a namespace is a
+shared `Rc<RefCell<Map>>`), a scope stack, an expression parser (`or`/`and`/`not`,
+comparisons, `in`/`not in`, `is`/`is not`, `~`, arithmetic with filters binding tighter than
+`+`, attribute/subscript/slice access, calls with keyword arguments, inline `a if c else b`),
+a recursive-descent template parser (`for` with `else`, `if`/`elif`/`else`, `set`, `set
+ns.attr`, `macro`), and filters (`trim`, `length`, `tojson`, `items`, `string`, `safe`,
+`default`, `join`, `first`, `last`, `lower`, `upper`, `replace`). Whitespace control lives
+where Jinja puts it: `{%-`/`-}}`, `-%}`, plus `trim_blocks` and `lstrip_blocks` — the
+environment `transformers` builds for `apply_chat_template`.
+
+Two things fell out of the diffing. `trim_blocks` right-trim was only applied when another
+tag followed, so a template ending in text kept a newline Jinja drops; the first fixture
+caught it. And the gate itself: a GGUF `tokenizer.chat_template` is now always what renders.
+If a construct is unsupported the render fails with its message, `apply_template` prints it
+and falls back to the synthetic template, so the failure is loud instead of silent, and
+`debug_template_info` stopped claiming "GGUF template too complex".
+
+**Verified** by diffing the rendered prompt against the reference engine — jinja2 3.1 in
+`ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)`, what
+`apply_chat_template` uses — not against a hand-written expectation. Every pack in `models/`
+(15 files: the four dense, 2-2B/4B/9B/27B, 2.5-27B) renders byte-identically to the reference
+for a system+user prompt, and five committed fixtures
+(`crates/hearth-tokenizer/tests/fixtures/qwen35_25/`) pin the 2.5 template for system+user,
+empty system, thinking off, a two-turn history and `reasoning_effort=low`.
+`cargo run -p hearth-tokenizer --example render_prompt -- <model> --system … --user …`
+reproduces it for any GGUF.
+
+What the flagship sees now, 27B PTQ1_0: with `--show-think` the same question goes from 33 to
+67 prompt tokens — the card's `<|im_start|>system
+Reasoning effort is set to xhigh. …<|im_end|>`
+line and an open ` thinking` block, instead of the synthetic ChatML prompt ending `
+
+
+
+`.
+With thinking off it is the 132-byte render the card documents, which is the same text the
+synthetic template produced — that is why the 2-2B/4B/9B packs and the dense models do not
+change.
+
+**Benchmarks**, six-model dense sweep (warmup each, 50 tokens, `--prompt-raw` so no template is
+in the measurement): 51.76 / 25.16 / 23.35 / 11.07 / 12.02 / 6.00 tok/s against the
+47.98 / 26.60 / 22.80 / 11.99 / 13.08 / 6.64 baseline. Two first-pass readings came in low
+(19.72, 10.96) and returned 23.35/21.24 and 12.02/12.56 on re-run; no forward-path code
+changed.
+
 ### GDN recurrence: contiguous state layout and the pool over v-heads (decode 1.14x, prefill 1.20x, 2026-11-25)
 
 The scan was the largest single-threaded stage in the engine: ~225 ms of the 27B's 650 ms

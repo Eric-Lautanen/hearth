@@ -16,7 +16,11 @@
 > prefill), again byte-identical with no measurable cost. Last, the GDN recurrence: state
 > laid out `[j][i]` per head so a delta-rule column is contiguous, and the 48 v-heads spread
 > over the pool — 1.57× the prefill scan stage, decode 1.47 → 1.67 tok/s on the 27B (1.3× on
-> the 4B/9B). Detail: `docs/BUG_TRACKER.md`, newest entry first.
+> the 4B/9B). Then the chat template: the evaluator became a real Jinja2 subset (`set`,
+> `namespace`, macros, filters, `is` tests, slicing, whitespace control) and the silent
+> synthetic fallback is gone — all 15 packs now render byte-identically to jinja2 3.1, and
+> the 2.5 27B gets its card prompt (67 tokens with `--show-think`) instead of the synthetic
+> 33. Detail: `docs/BUG_TRACKER.md`, newest entry first.
 
 Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md`,
 `packaging/SIGNING.md`.
@@ -42,6 +46,13 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    `qwen35: missing blk.0.attn_qkv.weight`.
 5. **Re-baseline the README performance table** before changing a number in it. The 27B cells
    came from a busy window; the same model's paired runs spread 1.3× inside one session.
+
+6. **Tool calling is the next template gap, and it is unchecked.** The 2.5 template's
+   `tools` branch (`|tojson`, `tool_call.function`, `{% for k, v in …|items %}`, the
+   `<tool_call>` XML format) parses, but no fixture exercises it: `TemplateContext` has no
+   `tools` field. Before wiring tools through the UI, add the field and a fixture case
+   rendered by the reference engine, or the first real tool call goes out in a format
+   nobody checked.
 
 ## Open inference items (most valuable first)
 
