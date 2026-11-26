@@ -3,6 +3,39 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### The ffn's 42 ms is 24 ms of MAC displacement and 15 ms of rotation (2026-11-26)
+
+`ffn_block` now carries five sub-timers, printed as subset rows of `ffn` and summing to it exactly
+(so nothing can hide between them). 27B PTQ1_0 decode, 30 tokens, two runs that agreed to 1 ms:
+
+| ffn sub-stage | ms/token | of ffn | bytes | rate |
+| --- | --- | --- | --- | --- |
+| quantize normed row (d 5120) | 3.4 | 1.3% | - | 96 Mvalues/s |
+| **gate+up pass** | **168.0** | 62% | 2.49 GB | 14.8 GB/s (68 Gw/s) |
+| silu + gating multiply | 1.1 | 0.4% | - | - |
+| quantize gated row (d_ffn 17408) | 11.6 | 4.3% | - | 96 Mvalues/s |
+| **down pass** | **85.7** | 32% | 1.25 GB | 14.6 GB/s (66 Gw/s) |
+| rest (sandwich norm, residuals, dumps) | 0.8 | 0.3% | - | - |
+| **ffn** | **270.7** | | 3.74 GB | 13.8 GB/s |
+
+Against 228.5 ms for the same 3.74 GB as one contiguous read (16.28 GB/s), the 42 ms splits into:
+
+- **+24 ms is the weight passes themselves** — 14.6-14.8 GB/s against a 16.28 GB/s read-only stream.
+  Part of that is not overhead at all: the 228.5 ms figure streams bytes without doing the work, while
+  these passes run 17.1 Gweights of MACs, and the same 19.5 MB tensor in `kernel-bench` gives 79 Gw/s
+  against the 68 Gw/s measured here. A kernel-shaped floor is ~15% above the byte floor, so that part
+  was never reachable.
+- **+15.1 ms is the rotate+quantize**, and it is the one term that is removable: 1.44 M values per
+  token at 96 Mvalues/s, serial and scalar, 77% of it in the 17408-wide gated row. It depends on
+  nothing in the pool.
+- silu and the gating multiply are 1.1 ms, the sandwich norm and two residuals 0.8 ms. Both are too
+  small to be worth a change.
+
+So the 30-53 ms was never one thing: ~15 ms is the rotation, and most of the rest is arithmetic the
+228.5 ms figure never included. The next target is therefore the rotate+quantize — SIMD first, since
+the block math can stay bit-identical — not another weight-pass or pool change, unless a sub-timer
+*inside* `mm_q8_two` shows something.
+
 ### Park/wake is not the 0.45 ms either (2026-11-25)
 
 The last open explanation for the 27B's ffn sitting above the 228.5 ms single-pass stream was that a

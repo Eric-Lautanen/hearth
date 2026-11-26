@@ -379,6 +379,20 @@ struct Q35Timers {
     gates_us: u128,
     /// Sandwich norm + FFN branch + both residuals for one layer.
     ffn_us: u128,
+    /// Sub-timers of `ffn_us`, in the order `ffn_block` runs them: the rotation and
+    /// quantization of the normed row that feeds gate/up, the fused gate+up weight
+    /// pass, `silu` plus the gating multiply, the rotation and quantization of the
+    /// gated row that feeds down, and the down weight pass.
+    ///
+    /// The two weight passes are the ones that read the 3.74 GB, so they are what a
+    /// kernel rate can be compared against. Whatever `ffn_us` holds beyond their sum
+    /// and the two quantizations — `ffn rest` in the report — is the sandwich norm,
+    /// the two residuals and the debug dumps.
+    ffn_qin_us: u128,
+    ffn_gu_us: u128,
+    ffn_act_us: u128,
+    ffn_qmid_us: u128,
+    ffn_down_us: u128,
     /// `output_norm` plus the language-model head.
     head_us: u128,
     total_us: u128,
@@ -392,13 +406,24 @@ impl Q35Timers {
             "[q35timing] {}: {} tokens, {:.3} ms/token",
             label, tokens, per_token
         );
-        let rows: [(&str, u128); 8] = [
+        let ffn_parts = self.ffn_qin_us
+            + self.ffn_gu_us
+            + self.ffn_act_us
+            + self.ffn_qmid_us
+            + self.ffn_down_us;
+        let rows: [(&str, u128); 14] = [
             ("embed", self.embed_us),
             ("attn_norm", self.norm_us),
             ("gdn/attn", self.mix_us),
             ("gdn scan", self.scan_us),
             ("gdn gates", self.gates_us),
             ("ffn", self.ffn_us),
+            ("ffn q in", self.ffn_qin_us),
+            ("ffn gate/up", self.ffn_gu_us),
+            ("ffn act", self.ffn_act_us),
+            ("ffn q mid", self.ffn_qmid_us),
+            ("ffn down", self.ffn_down_us),
+            ("ffn rest", self.ffn_us.saturating_sub(ffn_parts)),
             ("head", self.head_us),
             ("TOTAL", self.total_us),
         ];
@@ -410,7 +435,10 @@ impl Q35Timers {
                 us as f64 * 100.0 / total as f64
             );
         }
-        eprintln!("[q35timing]   (gdn scan and gdn gates are subsets of gdn/attn, not stages)");
+        eprintln!(
+            "[q35timing]   (gdn scan and gdn gates are subsets of gdn/attn; ffn q in, gate/up, act, \
+             q mid, down and rest are subsets of ffn, not stages)"
+        );
     }
 }
 
@@ -1440,7 +1468,13 @@ impl Qwen35Core {
     /// normed and quantized on its own; the weight passes are shared whenever more
     /// than one row arrives, because `mm_batched` hands the pool two rows at a time
     /// (`PREFILL_CHUNK = 2`) and the pool expands each weight row once for them.
-    fn ffn_block(&self, lyr: &Layer, at: FfnAt, b: FfnBufs<'_>) -> Result<(), String> {
+    fn ffn_block(
+        &self,
+        lyr: &Layer,
+        at: FfnAt,
+        b: FfnBufs<'_>,
+        t: &mut Q35Timers,
+    ) -> Result<(), String> {
         let d = self.d_model;
         let ffn_dim = self.config.d_ffn as usize;
         let eps = self.config.rms_norm_eps;
@@ -1481,6 +1515,16 @@ impl Qwen35Core {
         if self.no_ffn() {
             return Ok(());
         }
+        // Sub-stage clock, off unless the timers are on (no `Instant::now` when off).
+        let mut t_stage = self.timers_on.then(std::time::Instant::now);
+        macro_rules! lap {
+            ($field:ident) => {
+                if let Some(s) = t_stage.as_mut() {
+                    t.$field += s.elapsed().as_micros();
+                    *s = std::time::Instant::now();
+                }
+            };
+        }
         if at.layer == 0 {
             dump_layer0(at.pos, "attn_post_norm-0", &b.normed[..d]);
         }
@@ -1495,6 +1539,7 @@ impl Qwen35Core {
                 &mut b.rot[..],
             );
         }
+        lap!(ffn_qin_us);
         if n == 1 {
             self.mm_q8_two(
                 &lyr.ffn_gate,
@@ -1519,6 +1564,7 @@ impl Qwen35Core {
                 &mut b.up[..n * ffn_dim],
             )?;
         }
+        lap!(ffn_gu_us);
         for i in 0..n {
             let gate: &mut [f32] = &mut b.gate[i * ffn_dim..(i + 1) * ffn_dim];
             crate::ops::silu(gate);
@@ -1527,6 +1573,7 @@ impl Qwen35Core {
                 *g *= *u;
             }
         }
+        lap!(ffn_act_us);
         if at.layer == 0 {
             dump_layer0(at.pos, "ffn_down_in-0", &b.gate[..ffn_dim]);
         }
@@ -1539,6 +1586,7 @@ impl Qwen35Core {
                 &mut b.rot[..],
             );
         }
+        lap!(ffn_qmid_us);
         self.mm_batched(
             &lyr.ffn_down,
             &b.q8_ffn[..n * q8_ffn],
@@ -1546,6 +1594,7 @@ impl Qwen35Core {
             n,
             &mut b.down[..n * d],
         )?;
+        lap!(ffn_down_us);
         if at.layer == 0 {
             dump_layer0(at.pos, "post_ffn-0", &b.down[..d]);
         }
@@ -1665,6 +1714,7 @@ impl Qwen35Core {
                     up: &mut sc.chunk_up[..ffn_dim],
                     down: &mut sc.chunk_down[..d],
                 },
+                &mut sc.timers,
             )?;
             if self.timers_on {
                 sc.timers.ffn_us += t_stage.elapsed().as_micros();
@@ -1934,6 +1984,7 @@ impl Qwen35Core {
                     up: &mut sc.chunk_up,
                     down: &mut sc.chunk_down,
                 },
+                &mut sc.timers,
             )?;
 
             if self.timers_on {

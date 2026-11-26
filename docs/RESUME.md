@@ -91,14 +91,16 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    pays on prefill (per prompt token: `gdn gates` 19.4 -> 3.0 ms on the 27B, 5.2 -> 0.9 on the 9B;
    prefill -6.1% per token on the 27B), and both prefill paths now time the call — before that the
    row only caught the leftover token when the prompt was not a multiple of `PREFILL_CHUNK`.
-1. **The 27B's ffn is 258-269 ms against a 228.5 ms single-pass stream, and neither dispatches nor
-   park/wake explain the gap.** Fusing gate+up (192 -> 128 dispatches) is bit-identical and worth
-   ~12 ms (median of 13 alternating pairs, 11 of them favouring it), not 29. Giving idle workers a longer bounded spin before they park is *worse* (medians
-   258 / 265 / 263 ms for windows of 0 / 200 / 2000 us), and forcing them to park costs ~3 ms, so a
-   wake is 0.02-0.04 ms per dispatch: the 0.45 ms figure is dead and both knobs were reverted. Next
-   is sub-timers *inside* the bucket — silu/gating over 17408 values per layer, the two per-layer
-   activation quantizations, and 19.5 MB tensors read one dispatch at a time out of a 5.4 GB mmap
-   instead of one contiguous 3.74 GB pass. Measure before changing.
+1. **The 27B's ffn is 268-293 ms, and its sub-timers now account for every millisecond.** Against
+   the 228.5 ms single-pass stream the split is +24 ms in the two weight passes (14.6-14.8 GB/s,
+   where the read-only figure is 16.28 and the same tensor in `kernel-bench` runs 79 Gw/s against
+   68 here — so a kernel-shaped floor is ~15% above the byte floor) and **+15.1 ms in the
+   rotate+quantize** (1.44 M values at 96 Mvalues/s, serial, 77% of it the 17408-wide gated row).
+   silu is 1.1 ms and norms/residuals 0.8 ms. Fusing gate+up (192 -> 128 dispatches) is
+   bit-identical and worth ~12 ms; a longer bounded spin before workers park is *worse*, and forcing
+   them to park costs ~3 ms, so a wake is 0.02-0.04 ms and the 0.45 ms figure is dead.
+   **Next: SIMD the rotate+quantize** (bit-identical block math, ~3.4% of the token), not another
+   weight-pass or pool change.
    The Q1_0 ffn lever is *priced and blocked*, not open: no writer or Q1_0 quantizer ships, and the
    throwaway converter that measured it is in history at `1c9f5ef`, not in the tree — do not re-add
    one unless the answer changes. A 9B with ffn in 1-bit loses the 32.8% of weights that are exact
