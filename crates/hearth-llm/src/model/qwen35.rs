@@ -596,6 +596,49 @@ unsafe fn matvec_rows(_worker: usize, begin: usize, end: usize, ctx: usize) {
     }
 }
 
+/// Two weight matrices of the same shape against one activation, so `ffn_gate`
+/// and `ffn_up` cost one dispatch per layer instead of two.
+struct FfnGateUpCtx {
+    w1: *const u8,
+    w2: *const u8,
+    a: *const u8,
+    out1: *mut f32,
+    out2: *mut f32,
+    row_bytes: usize,
+    n_cols: usize,
+    dot: crate::pool::DotFn,
+}
+
+/// # Safety
+/// `ctx` points to a live [`FfnGateUpCtx`], both weight bases cover `n_rows *
+/// row_bytes`, and rows `begin..end` of both outputs are writable and disjoint
+/// from every other window the pool hands out.
+unsafe fn ffn_gate_up_rows(_worker: usize, begin: usize, end: usize, ctx: usize) {
+    let c = &*(ctx as *const FfnGateUpCtx);
+    for r in begin..end {
+        let off = r * c.row_bytes;
+        *c.out1.add(r) = (c.dot)(c.w1.add(off), c.a, c.n_cols);
+        *c.out2.add(r) = (c.dot)(c.w2.add(off), c.a, c.n_cols);
+    }
+}
+
+/// The Q8 activation dot kernel for a weight dtype, shared by the single, fused
+/// and batched passes so a new format only has to be added here once.
+fn q8_dot(dtype: GgmlDType) -> Result<crate::pool::DotFn, String> {
+    Ok(match dtype {
+        GgmlDType::PTQ1_0 => hearth_quant::dot_ptq1_0_q8_0_ptr,
+        GgmlDType::PQ2_0 | GgmlDType::Q2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
+        GgmlDType::Q1_0 | GgmlDType::Q10G128 => hearth_quant::dot_q1_0g128_q8_0_ptr,
+        GgmlDType::Q8_0 => hearth_quant::dot_q8_0_q8_0_ptr,
+        other => {
+            return Err(format!(
+                "qwen35: unsupported weight dtype {} (needs a q8 dot kernel)",
+                other.name()
+            ))
+        }
+    })
+}
+
 pub struct Qwen35Core {
     config: ModelConfig,
     pool: ThreadPool,
@@ -1197,18 +1240,7 @@ impl Qwen35Core {
                 out.len()
             ));
         }
-        let dot = match entry.dtype {
-            GgmlDType::PTQ1_0 => hearth_quant::dot_ptq1_0_q8_0_ptr,
-            GgmlDType::PQ2_0 | GgmlDType::Q2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
-            GgmlDType::Q1_0 | GgmlDType::Q10G128 => hearth_quant::dot_q1_0g128_q8_0_ptr,
-            GgmlDType::Q8_0 => hearth_quant::dot_q8_0_q8_0_ptr,
-            other => {
-                return Err(format!(
-                    "qwen35: unsupported weight dtype {} (needs a q8 dot kernel)",
-                    other.name()
-                ))
-            }
-        };
+        let dot = q8_dot(entry.dtype)?;
         let w_base = entry.data().as_ptr() as usize;
         let a_ptr = q8.as_ptr() as usize;
         let out_ptr = out.as_mut_ptr() as usize;
@@ -1222,6 +1254,61 @@ impl Qwen35Core {
             n_cols,
             dot_fn: dot,
         });
+        Ok(())
+    }
+
+    /// `ffn_gate` and `ffn_up` in one pool pass: same activation, same row
+    /// shape, so the pass carries both dots and the layer pays one dispatch
+    /// instead of two (192 -> 128 dispatches per token on the 27B).
+    ///
+    /// Each row still calls the same kernel with the same pointers as two
+    /// `mm_q8` passes would, so the outputs are bit-identical; only the
+    /// partition and the barrier count change.
+    fn mm_q8_two(
+        &self,
+        w1: &W,
+        w2: &W,
+        q8: &[u8],
+        out1: &mut [f32],
+        out2: &mut [f32],
+    ) -> Result<(), String> {
+        let e1 = &w1.0;
+        let e2 = &w2.0;
+        let n_cols = e1.n_cols();
+        let n_rows = e1.n_rows();
+        if e2.n_cols() != n_cols || e2.n_rows() != n_rows || e1.dtype != e2.dtype {
+            return Err(format!(
+                "qwen35: fused pass needs matching weights ({}x{} {} vs {}x{} {})",
+                n_rows,
+                n_cols,
+                e1.dtype.name(),
+                e2.n_rows(),
+                e2.n_cols(),
+                e2.dtype.name()
+            ));
+        }
+        if out1.len() != n_rows || out2.len() != n_rows {
+            return Err(format!(
+                "qwen35: fused pass out width mismatch (w rows {n_rows} vs out {} and {})",
+                out1.len(),
+                out2.len()
+            ));
+        }
+        let ctx = FfnGateUpCtx {
+            w1: e1.data().as_ptr(),
+            w2: e2.data().as_ptr(),
+            a: q8.as_ptr(),
+            out1: out1.as_mut_ptr(),
+            out2: out2.as_mut_ptr(),
+            row_bytes: e1.dtype.byte_size(n_cols),
+            n_cols,
+            dot: q8_dot(e1.dtype)?,
+        };
+        self.pool.par_for(
+            n_rows,
+            ffn_gate_up_rows,
+            &ctx as *const FfnGateUpCtx as usize,
+        );
         Ok(())
     }
 
@@ -1408,20 +1495,30 @@ impl Qwen35Core {
                 &mut b.rot[..],
             );
         }
-        self.mm_batched(
-            &lyr.ffn_gate,
-            &b.q8_d[..n * q8_d],
-            q8_d,
-            n,
-            &mut b.gate[..n * ffn_dim],
-        )?;
-        self.mm_batched(
-            &lyr.ffn_up,
-            &b.q8_d[..n * q8_d],
-            q8_d,
-            n,
-            &mut b.up[..n * ffn_dim],
-        )?;
+        if n == 1 {
+            self.mm_q8_two(
+                &lyr.ffn_gate,
+                &lyr.ffn_up,
+                &b.q8_d[..q8_d],
+                &mut b.gate[..ffn_dim],
+                &mut b.up[..ffn_dim],
+            )?;
+        } else {
+            self.mm_batched(
+                &lyr.ffn_gate,
+                &b.q8_d[..n * q8_d],
+                q8_d,
+                n,
+                &mut b.gate[..n * ffn_dim],
+            )?;
+            self.mm_batched(
+                &lyr.ffn_up,
+                &b.q8_d[..n * q8_d],
+                q8_d,
+                n,
+                &mut b.up[..n * ffn_dim],
+            )?;
+        }
         for i in 0..n {
             let gate: &mut [f32] = &mut b.gate[i * ffn_dim..(i + 1) * ffn_dim];
             crate::ops::silu(gate);

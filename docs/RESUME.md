@@ -96,8 +96,11 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    takes 258-281, paired prefill takes 226.6 per token, and `HEARTH_Q35_NOPAIR=1` prefill
    reproduces decode at 277-287. The split is dispatches per token: 192 -> 258-287 ms, 96 -> 226.6,
    1 -> 228.5, i.e. ~0.45 ms on each dispatch against 1.19 ms of work. So fuse gate+up into one
-   pool pass per layer (192 -> 128, ~29 ms) and/or stop the pool parking across the silu/gating gap
-   before `down`; target 228.5 ms on the `ffn` row, both byte-identical. The Q1_0 layout would price
+   pool pass per layer is **done**: 192 -> 128 dispatches, bit-identical, worth ~9 ms (median of
+   nine alternating pairs; 8/9 favour it), not the ~29 ms projected — so dispatches cost ~0.1 ms
+   each and the remaining 30-53 ms is still unexplained. `ffn` sits at ~300 ms. Next: sub-timers
+   inside the ffn bucket (silu/gating, the two activation quantizations, per-tensor vs contiguous
+   reads), not another dispatch change. The Q1_0 layout would price
    the same weights at 104 ms but needs a re-quantized 27B and a quality check, so it stays the
    bigger blocked option, and its cost is measured, not assumed: no writer or Q1_0 quantizer ships
    (`examples/requant_ffn.rs` converts in place), and a 9B with ffn in 1-bit loses 32.8% zero

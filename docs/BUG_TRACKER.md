@@ -3,6 +3,44 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Fusing gate+up: bit-identical, ~1-2% of ffn, and the dispatch theory dies (2026-11-25)
+
+Decode paid three pool passes per layer for the ffn (gate, up, down), 192 dispatches per token.
+`ffn_gate` and `ffn_up` share both the activation and the row shape, so `mm_q8_two` now runs both
+dots in one `par_for` over the rows (192 -> 128) and `ffn_block` takes that branch when `n == 1`;
+prefill keeps the paired kernel it already used.
+
+**Bit-identical:** five hybrids (2.5-27B PTQ1_0, 2-2B/4B/9B PTQ1_0, 2-27B PQ2_0) produce the same
+text as a binary built from `1c9f5ef`, which is expected — each row still calls the same kernel with
+the same two pointers, so only the partition and the barrier count moved.
+
+What it was worth, 27B PTQ1_0, `ffn` row of `HEARTH_Q35_TIMERS`, arms alternating:
+
+| old -> new (ms/token) | delta |
+| --- | --- |
+| 315.2 -> 302.5 | -12.7 |
+| 354.6 -> 310.5 | -44.1 |
+| 308.5 -> 359.6 | **+51.1** |
+| 306.7 -> 284.8 | -21.9 |
+| 271.2 -> 266.5 | -4.7 |
+| 273.8 -> 270.4 | -3.4 |
+
+Eight of nine pairs favour the fused build (the outlier sits inside the ±50 ms spread this box shows
+between runs), median **9 ms**, mean **1.9%** of the ffn row and 0.5-2% of the token. The row stays
+at ~300 ms against the 228.5 ms single-pass figure: it moves toward it, it does not arrive.
+
+**That is the result worth keeping: 64 fewer dispatches per token bought ~9 ms, i.e. ~0.1 ms per
+dispatch, not the 0.45 ms the prefill comparison implied.** The previous entry read paired prefill's
+226.6 ms/token as evidence about dispatch count; this experiment holds the bytes and the dots fixed
+and moves only the dispatch count, so it settles the question against that reading. Paired prefill is
+faster per token because one row expansion feeds two dots — arithmetic reuse — not because it makes
+96 fewer dispatches. The pool also never sleeps here: workers spin on a generation counter, so a
+dispatch is an atomic store plus a barrier.
+
+The 30-53 ms between decode and the single-pass floor is therefore still unexplained, and the next
+step is sub-timers inside the ffn bucket (silu/gating, the two activation quantizations, per-tensor
+reads against one contiguous 3.74 GB pass) rather than another dispatch change.
+
 ### What is left in the 27B's ffn: ~40 ms of decode dispatch pattern, then the format (2026-11-25)
 
 ffn is 61% of the 27B's decode (258-281 ms of 430) and 71% of the weight traffic: 64 layers x 3
@@ -33,11 +71,12 @@ Per-format rates measured at the ffn tensor's own shape (17408 x 5120 = 19.5 MB)
 
 **The next move is the decode fix, not a format swap:**
 
-- **Fuse gate+up into one pool pass per layer.** They share the same activation, so one pass can
-  carry both matrices: 192 -> 128 dispatches/token, projected ~29 ms of the 41 at 0.45 ms each.
-- **Or stop the workers parking across the serial silu/gating gap before `down`** — the same
-  ~0.4 ms per dispatch showed up when the alpha/beta matvec was parallelized, where prefill gained
-  23.2 ms/token while the gates row itself accounted for 16.9.
+- ~~**Fuse gate+up into one pool pass per layer.**~~ Done: 192 -> 128 dispatches/token is
+  bit-identical and worth ~9 ms, not the ~29 ms projected here — see the newer entry above, which
+  also kills the 0.45 ms-per-dispatch reading.
+- **Or stop the workers parking across the serial silu/gating gap before `down`.** The pool spins on
+  a generation counter rather than parking, so treat the ~0.4 ms per dispatch this line assumed as
+  unconfirmed until it is measured the way the fusion now has been.
 
 Either way the target is the 228.5 ms single-pass figure, read off the `ffn` row of
 `HEARTH_Q35_TIMERS`, and both are byte-identical changes.
