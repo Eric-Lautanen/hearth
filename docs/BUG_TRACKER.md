@@ -3,6 +3,63 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### The release path is verified end to end, and the build stopped warning (2026-11-26)
+
+The operator asked for the installers to be ready and a release once the room is green. The
+Windows path is now checked against a real machine rather than against the script that builds
+it, and the release build is warning-free under the toolchain CI actually uses.
+
+**The Windows artifacts, built from the 0.3.0 tree with `cargo +1.100.0 build --release`**
+(the toolchain CI builds with; the local default is 1.99.1, which is why the checks below are
+run with the explicit `+1.100.0`): `scripts/package-win.ps1 -Version 0.3.0 -Zip` stages both
+executables, `models/README.txt`, the README and both licenses, and writes
+`hearth-v0.3.0-windows-x86_64.zip` (3,112,337 bytes). WiX 7 builds
+`hearth-v0.3.0-windows-x86_64.msi` (3,743,744 bytes) from it.
+
+**`scripts/msi-query.ps1`: 14 of 14 checks pass.** `ProductVersion=0.3.0`, per-user scope
+(`ALLUSERS=2`, `MSIINSTALLPERUSER=1`), both installer choices defaulting to 1, the cabinet
+embedded and no `.cab` beside the MSI, one upgrade identity (the committed `UpgradeCode`),
+the removal arm's `VersionMax=0.3.0` matching `ProductVersion` so a reinstall replaces rather
+than stacks, the payload under `PerUserProgramFilesFolder\Hearth`, both executables and the
+models note shipping, and the launch action typed 18. `wix msi decompile` shows the three
+`On="uninstall"` `RemoveFolder` rows that the Windows Installer API cannot read back.
+
+**The live cycle, on a machine that already had Hearth 0.2.0 installed with two downloaded
+models** (`Bonsai-8B-Q1_0`, `Ternary-Bonsai-4B-Q2_0`, 2.2 GB). This is the case the packaging
+notes describe, so it is the one worth running:
+
+| step | result |
+| --- | --- |
+| silent install of 0.3.0 over 0.2.0 | exit 0; **one** Add/Remove Programs row, now 0.3.0 |
+| the models | both still on disk at their exact byte sizes |
+| the payload | both executables replaced by the new ones; Start-menu folder, both shortcuts and the Desktop shortcut in place |
+| the installed `hearth-ui.exe` | `/`, `/api/models`, `/api/downloads`, `/api/status`, `/favicon.svg` all 200; `hearth-ui` and `hearth-chat-cli` both `MainWindowHandle` 0, so no console window |
+| reinstalling the **same** MSI | exit 0; still exactly one row, not two |
+| uninstall | exit 0; zero rows, no payload files, no Start-menu folder, no Desktop shortcut, **both models still on disk** |
+
+The machine was reinstalled afterwards, so it ends where it started: Hearth installed, at 0.3.0,
+with its models. The macOS bundle path was checked locally too - `scripts/package-macos.sh`
+under Git Bash builds `Hearth.app` with both binaries in `Contents/MacOS`, the icon, README and
+licenses in `Contents/Resources`, the empty `models/` folder, and `CFBundleVersion` and
+`CFBundleShortVersionString` both stamped from the argument; the plist parses as XML. Signing
+and notarization need an Apple runner and stay CI-only.
+
+**Three warnings the release build was printing, fixed at the cause.** cargo 1.100 turns
+`cargo::unused_dependencies` on by default, and `cargo build --release` flagged `pollster` in
+`hearth-compute`, `half` and `hearth-core` in `hearth-gguf`. All three were real findings:
+`pollster::block_on` is only reached from the GPU tests, `half` only from
+`examples/inspect_q1_0.rs`, and `hearth-core` not at all. So two moved to `[dev-dependencies]`
+and one was removed, rather than a lint being turned off. The release build now prints no
+warnings at all.
+
+**The release body's arm64 note was wrong.** It claimed every SIMD kernel dispatches to
+avx2/avx512 on x86-64 and to the scalar fallback elsewhere. That stopped being true when the
+elementwise ops (`rms_norm`, `silu`, `softmax`) and the 4-bit/5-bit dot products moved to
+portable SIMD, which runs on NEON on arm64. The note now says which kernels are portable and
+which are x86-only (the 1-bit/2-bit dots, the Hadamard rotation and the Q8 activation
+quantize), which is what `crates/hearth-quant/src` and `crates/hearth-llm/src/ops.rs` actually
+contain.
+
 ### The Hadamard fold and the Q8 quantize are AVX2 now, and byte-identical (2026-11-26)
 
 The RESUME's first "do this" item: `rotate_quantize_into` was 15.1 ms/token on the 27B (3% of
