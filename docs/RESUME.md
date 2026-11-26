@@ -148,6 +148,13 @@ session — so compare the model you changed, and use alternating pairs, never t
 ## Verification habits for a shared checkout
 
 - `cargo fmt --all` reformats the other agent's files — use `cargo fmt -p <crate>`.
+- **Gate with the toolchain CI uses, not the default.** Stable is 1.100.0; the box's default is
+  1.99.1 and it does not report every lint 1.100 does (it missed `needless_range_loop` in
+  `model/mod.rs` for weeks of red builds). `rustup toolchain install 1.100.0 --profile minimal
+  --component clippy,rustfmt`, then `cargo +1.100.0 clippy --workspace --all-targets -- -D warnings`,
+  `cargo +1.100.0 fmt --all --check`, and the same cross-target clippy with `--target` for
+  `x86_64-unknown-linux-gnu` and the three aarch64 targets (clippy type-checks, so it needs no
+  foreign linker).
 - `target/release/hearth-chat-cli.exe` is often locked by a running UI: `netstat -ano` for the port,
   kill that PID; the bash wrapper's PID is not the exe's.
 - **A constant copied from memory is not a vector** — derive it and have an independent

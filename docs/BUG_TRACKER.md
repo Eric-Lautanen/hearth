@@ -3,6 +3,33 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### CI is green again: the toolchain became 1.100.0 and two jobs named things that had moved (2026-11-26)
+
+Every push since 2026-11-05 failed, and the local gate did not say so, because none of the three
+causes was about the code being built:
+
+| job | symptom | cause |
+| --- | --- | --- |
+| `check` (all 3 OSes), `arm-cross-check` (all 3) | clippy error at `hearth-llm/src/model/mod.rs:500` | clippy 1.100 flags `for i in 0..d { sc.hidden[i] *= scale }`; 1.99.1 does not |
+| `kernel-baseline` | `FileNotFoundError: ''` | the `hearth_quant-*.s` glob matched nothing, so the checker was handed an empty path |
+| `arm-qemu-test` | apt exit 100 | `qemu-user-static` is now a *virtual* package on Ubuntu 26.04 |
+
+Fixes, in the same order: the scale loop is an iterator over `sc.hidden[..d]` (same elements, same
+order, same panic on a short slice); the assembly listing is requested as `--emit=asm=PATH` and the
+step fails loudly if rustc writes nothing there; the emulator install tries `qemu-user`,
+`qemu-user-static`, `qemu-user-binfmt` and then runs whichever `qemu-aarch64` binary landed.
+
+**Why the local gate missed it, and what to do about it.** Stable is 1.100.0 now, so install it as a
+*second* toolchain (`rustup toolchain install 1.100.0 --component clippy,rustfmt`) and gate with
+`cargo +1.100.0`, rather than trusting the default 1.99.1. Cross-target clippy also runs locally now
+with `rustup target add --toolchain 1.100.0 x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+aarch64-apple-darwin aarch64-pc-windows-msvc`; clippy only type-checks, so no Linux or Apple toolchain
+is needed. The `arm-qemu-test` job is the only step that cannot be reproduced on the Windows box, and
+it had been dying before the tests ran for weeks — it now passes, which means the aarch64 scalar paths
+(the only ones that exist there) really do execute rather than merely compile.
+
+Run: <https://github.com/Eric-Lautanen/hearth/actions/runs/45859223624> — 8/8 jobs green.
+
 ### The 2.5 27B `Q2_0` pack decodes: type 42 also means stock llama.cpp's 64-element groups (2026-11-26)
 
 The pack is readable now. The layout was not a mystery once the reference was read: type 42 names
