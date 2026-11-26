@@ -37,9 +37,11 @@ time, a warm-up run then two measured runs each — the mean is shown, all
 measured 2026-11-26. Every model runs at its shipped worker count (dense models
 one worker per physical core, the `qwen35` hybrids by their own rule). Single
 runs on this box vary ±5-10%, and the widest cell in this sweep was 18% (the 2B
-`PTQ1_0` read 27.8 and 22.8 in the same session), so treat the table as a
-snapshot: only alternating same-session pairs carry information, and the spread
-is what `scripts/count-sweep.py` measures for you.
+`PTQ1_0` read 27.8 and 22.8 in the same session). Later sessions have read the
+same unchanged paths 6-18% under these cells, so treat every absolute number as
+a snapshot of the session that measured it: only alternating same-session pairs
+carry information, and `HEARTH_QUANT_SCALAR=1` lets a before/after pair run from
+one binary. The spread is what `scripts/count-sweep.py` measures for you.
 
 | Size | Format               | d_model | Layers | tok/s   |
 | ---- | -------------------- | ------- | ------ | ------- |
