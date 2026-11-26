@@ -1,23 +1,24 @@
 # Hearth — next session
 
-> **Session 2026-11-26, second half, in one paragraph.** The rotate+quantize path — the Hadamard
-> fold plus the Q8 activation quantize, this file's own first "do this" item — is now AVX2, and
-> the bit-identity is asserted by nine unit tests that compare the vector path against the scalar
-> reference **byte for byte** (whole and partial blocks, all-zero blocks, exact ±0.5 ties, the
-> max/127 boundary, a scale that underflows, a denormal scale, a NaN, an infinity, signed zeros,
-> and the transform itself on `to_bits()`). On the 27B `PQ2_0` the two rows that measure it are
-> **4.5x faster**: `ffn q in` 104.7 → 23.3 ms and `ffn q mid` 351.1 → 77.6 ms over 30 decode
-> tokens, i.e. **11.8 ms/token** off a ~480 ms token — the 15.1 ms/token this file predicted.
-> Every generated text was byte-identical between the arms on all seven models measured; the dense
-> models gain 0.7–6.7% end to end (their activation quantize is only 1.3% of a token, so there is
-> not much there to win) and the 27B gains 1.9%. The kernel moved to
-> `hearth-quant/src/hadamard.rs`, next to the quantize it feeds. New switch
-> **`HEARTH_QUANT_SCALAR=1`** turns every vector path off, so a before/after pair can be measured
-> from **one** binary — that is how the numbers were taken, and it is why no file surgery was
-> needed on a tree four agents were writing to. buffy landed the other half: prefill batches four
-> tokens, the `Q2_0_G64` pack finally pairs, the hero chips are grouped by family with fresh
-> screenshots. The whole-suite gate is green on the pushed tree (370 tests, clippy `-D warnings`,
-> fmt, aarch64 cross-check).
+> **Session 2026-11-26, second half and release, in one paragraph.** Two things landed.
+> First, the rotate+quantize path — the Hadamard fold plus the Q8 activation quantize, this
+> file's own first "do this" item — is AVX2, and the bit-identity is asserted by nine unit
+> tests that compare the vector path against the scalar reference **byte for byte** (whole and
+> partial blocks, all-zero blocks, exact ±0.5 ties, the max/127 boundary, a scale that
+> underflows, a denormal scale, a NaN, an infinity, signed zeros, and the transform itself on
+> `to_bits()`). On the 27B `PQ2_0` the two rows that measure it are **4.5x faster**:
+> `ffn q in` 104.7 → 23.3 ms and `ffn q mid` 351.1 → 77.6 ms over 30 decode tokens, i.e.
+> **11.8 ms/token** off a ~480 ms token. Every generated text was byte-identical between the
+> arms on all seven models measured; the dense models gain 0.7–6.7% end to end and the 27B
+> 1.9%. Second, the release: the workspace is at **0.3.0** (ten manifests, `Cargo.lock`, both
+> `Info.plist` keys, a `CHANGELOG` section), the Windows installer was verified end to end on
+> a real machine (upgrade from 0.2.0 with two downloaded models, same-version reinstall,
+> uninstall that keeps the models, the installed binary answering all five endpoints), the
+> five-runner release path was exercised with a dry run, and the tag is the last step. The
+> release build is now warning-free under the toolchain CI uses. The one scar
+> this session left is the most useful lesson in it: **the `kernel-baseline` CI job was red
+> for half a day and nobody saw it**, because the failing job was not the one anybody was
+> watching — see "Do not re-open".
 > Detail: `docs/BUG_TRACKER.md`, newest entry first.
 >
 > Earlier the same day: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md`,
@@ -39,13 +40,13 @@ Paired A/B medians from **one** binary — `HEARTH_QUANT_SCALAR=1` picks the arm
 | Ternary-Bonsai-2.5-27B-PQ2_0 | 1.87 tok/s | 1.91 tok/s | +1.9% |
 
 **The README's dense table is stale on this box.** The *before* arm — the pre-change code path,
-byte for byte — reads 42.89 tok/s on the 1.7B Q1_0 where the table says 48.1, and 18.85 against
-24.4 on the 4B Q1_0. That is 6–18% of machine state (other agents, thermals), not of this
-change: the paired A/B is immune to it, because both arms are the same binary minutes apart.
-**Re-baseline all 15 packs before quoting an absolute number.** The previous baseline paragraph
-(`48.1 / 27.1 / 24.4 / 11.7 / 12.4 / 6.2` for the dense six, `25.3 / 25.1 / 12.0 / 11.2 / 6.7 /
-6.3` for the hybrid 2B/4B/9B, `2.17 / 1.98` for the 27B pair, `2.16 / 1.94 / 2.15` for the 2.5
-trio) is still the reference for *shape*, not for absolute tok/s.
+byte for byte — reads 42.89 tok/s on the 1.7B Q1_0 where the table says 48.1, and 18.85
+against 24.4 on the 4B Q1_0. That is 6–18% of machine state (other agents, thermals), not of
+this change: the paired A/B is immune to it, because both arms are the same binary minutes
+apart. **Re-baseline all 15 packs before quoting an absolute number.** The previous baseline
+paragraph (`48.1 / 27.1 / 24.4 / 11.7 / 12.4 / 6.2` for the dense six, `25.3 / 25.1 / 12.0 /
+11.2 / 6.7 / 6.3` for the hybrid 2B/4B/9B, `2.17 / 1.98` for the 27B pair, `2.16 / 1.94 / 2.15`
+for the 2.5 trio) is still the reference for *shape*, not for absolute tok/s.
 
 ## Do these first
 
@@ -79,9 +80,28 @@ trio) is still the reference for *shape*, not for absolute tok/s.
 8. **The 27B tile finding, so nobody re-chases it.** `PREFILL_CHUNK = 4` is **neutral** on the
    27B PTQ1_0 because a 1 MB weight tile does not stay resident at d = 5120 — the second pair
    re-reads from DRAM anyway. Chunk 4 pays off where the tile *is* resident.
+9. **The release page after `v0.3.0`**: the tag's assets are on the releases page with
+   `SHA256SUMS` beside them. If the human wants signed Windows/macOS builds, the missing piece
+   is the signing secrets in `packaging/SIGNING.md` — without them the workflow publishes
+   unsigned and the OS says so.
 
 ## Do not re-open (each of these is measured, with the number)
 
+- **The `kernel-baseline` guard is not advisory — it catches a real 5.7x.** Every push for half
+  a day was red in that one job while clippy, fmt, the tests, the cross-target checks and the
+  arm emulators were all green: the AVX2 quantize kernel declared `avx2` but converted each
+  block scale with `half::from_f32`, and `avx2` does not imply `f16c`, so the conversion was an
+  out-of-line call at the weak `x86-64-v2` baseline the guard builds at. **At `x86-64-v3` the
+  omission is invisible** — the release build looked perfect locally. The fix is in
+  `dd788bc`: a `f32_to_f16_bits` helper (`#[inline]`, `target_feature f16c`, one `vcvtps2ph`,
+  round-to-nearest-even so it matches `half` bit for bit), the kernel declaring `f16c` as a
+  **second attribute** (`enable = "avx2, f16c"` parses as one feature named `" f16c"` and is
+  rejected), and the dispatch requiring `is_x86_feature_detected!("f16c")` because AMD
+  Excavator has AVX2 without F16C. **Run the guard locally before pushing a kernel:**
+  `RUSTFLAGS="-C target-cpu=x86-64-v2" cargo rustc -p hearth-quant --release --lib
+  --target-dir target/baseline-asm -- --emit=asm=target/baseline-lib.s` and the same for
+  `--tests`, then `python scripts/check-kernel-baseline.py` on each listing. Both must print
+  `baseline-invariant`.
 - **The rotate+quantize path.** It is AVX2 now and byte-identical to the scalar reference
   (nine tests). `ffn q in` 104.7 → 23.3 ms and `ffn q mid` 351.1 → 77.6 ms over 30 decode
   tokens on the 27B PQ2_0 = 11.8 ms/token. The remaining time there is the transform itself
@@ -89,7 +109,9 @@ trio) is still the reference for *shape*, not for absolute tok/s.
 - **The rounding rules in the Q8 quantize.** They are not free choices: the value is rounded
   **half away from zero** (what `f32::round` does, *not* `roundps`'s half-to-even), the clamp
   happens **before** the rounding, a NaN block falls back to the scalar path, and an all-zero
-  block stores the fp16 scale **1.0**. Change any of them and the activation bytes change.
+  block stores the fp16 scale **1.0**. The *scale* is written with the hardware `vcvtps2ph`
+  (nearest-even, which is what `half` does) — that is what keeps it byte-identical. Change any
+  of this and the activation bytes change.
 - **The 27B's ffn decomposition.** Sub-timers sum to the row exactly. +24 ms is the two weight
   passes at 14.6-14.8 GB/s (a kernel-shaped floor ~15% above the byte floor, because the read
   benchmark does not run 17.1 Gweights of MACs), +15.1 ms was the rotate+quantize (now 4.5x
@@ -111,6 +133,11 @@ trio) is still the reference for *shape*, not for absolute tok/s.
   `1c9f5ef`, not in the tree — do not re-add one unless the answer changes.
 - **The first token.** It is storage I/O on the first read of the weights; `HEARTH_PIN_WEIGHTS=1`
   died silently on the 27B on this 16 GB box.
+- **The Windows packaging contract.** It is verified, not assumed: upgrade in place, one
+  Add/Remove Programs row (a same-version reinstall still leaves exactly one), the models
+  surviving an uninstall, no console window, and the payload under the per-user program files
+  folder. `packaging/windows/README.md` lists the checks and `scripts/msi-query.ps1` is the
+  gate (14 checks, exits non-zero).
 
 ## Open items (most valuable first)
 
@@ -119,10 +146,10 @@ trio) is still the reference for *shape*, not for absolute tok/s.
    What remains is not the strided read (~5 GB/s aggregate), so suspect the dispatch cadence
    (one `par_for` per GDN layer, ~48/token) and an L2-resident working set. Count bytes per
    layer against dispatches before changing anything.
-2. **aarch64 has no SIMD backend**; every kernel is the scalar fallback. The Hadamard and the
-   Q8 quantize now have AVX2 paths that aarch64 does not take (the sign pass uses `wide`, so it
-   does get NEON). NEON first suits the `Q2V_U8` LUT dot (`vqtbl`). Needs a real ARM runner
-   before any number means anything.
+2. **aarch64 has no SIMD backend**; the 1-bit/2-bit dots, the Hadamard rotation and the Q8
+   activation quantize are x86-only and fall back to the scalar reference there. The elementwise
+   ops and the 4/5-bit dots are portable SIMD and do run on NEON. NEON first suits the
+   `Q2V_U8` LUT dot (`vqtbl`). Needs a real ARM runner before any number means anything.
 3. **Worker counts follow the path** — dense = `physical`; hybrid `Q2_0`/`PQ2_0` = `physical +
    physical/4`; hybrid `PTQ1_0` = ¾ logical. `HEARTH_THREADS` overrides. Judge a count on its
    **spread** (`scripts/count-sweep.py`), not its mean.
@@ -136,6 +163,10 @@ trio) is still the reference for *shape*, not for absolute tok/s.
    `kernel_name()` and a `selected_kernel` arm once it has two implementations. Q5_0/Q5_1 remain
    0.35 Gweights/s single-thread (per-element `% 2` unpack before the SIMD madd) — rewrite only
    if such a model lands.
+7. **The app shows no version.** The version lives in the packaging (the MSI `ProductVersion`,
+   the macOS `Info.plist`), not in the binaries, and there is no `--version` flag — the CLI
+   treats the argument as a model path. A UI "about" line would need `CARGO_PKG_VERSION` wired
+   into the served page; it was left out of 0.3.0 on purpose (a rebuild to change a string).
 
 ## Goal 2 (UI / docs / downloader)
 
@@ -147,6 +178,10 @@ trio) is still the reference for *shape*, not for absolute tok/s.
    add packs without a rebuild; the override path already exists (`HEARTH_MODEL_CATALOG_JSON`).
 4. **The downloader's DNS fallback is unit-tested only** — check it against a real dual-stack
    host and a host whose first address is unreachable.
+5. **The release notes body is static.** `.github/workflows/release.yml` carries one arm64
+   paragraph and one install table; anything that changes between releases has to be edited
+   there, and the arm64 paragraph was wrong until this session (it claimed every kernel falls
+   back to scalar off x86-64).
 
 ## Standings and hazards
 
@@ -158,7 +193,7 @@ trio) is still the reference for *shape*, not for absolute tok/s.
   spread of 14.1-43.3 tok/s, and the same model read +1.7% in a quiet window with a spread of
   41.3-44.4. Two pairs cannot resolve a 1-3% effect — use 4, and quote the sub-timer rows when
   the effect is smaller than the noise.
-- **`[generate] avg_cpu_overhead=Nus/token` is mislabelled** — it prints the whole step including
+- **[generate] avg_cpu_overhead=Nus/token is mislabelled** — it prints the whole step including
   the forward, so it is not overhead and nothing is wasting that time.
 - **The model list is a multi-root scan.** `hearth_core::paths` is the only answer to "where are the
   models"; do not re-add a walk-up elsewhere.
@@ -182,6 +217,12 @@ trio) is still the reference for *shape*, not for absolute tok/s.
 - **A live UI server holds the exe.** `target/release/hearth-ui.exe` and its `hearth-chat-cli.exe`
   child must be killed before anything can relink `target/release` (`netstat -ano` for the port;
   the bash wrapper's PID is not the exe's).
+- **The shipped artifact must come from the shipped tree.** The MSI built before the `f16c` fix
+  was thrown away and rebuilt; the proof that the installed engine is the right build is a
+  SHA-256 match against `target/release`, not the file size.
+- **CI can be red in one job while everything local is green** — the `kernel-baseline` guard
+  builds at `x86-64-v2` on purpose, so it sees what a `x86-64-v3` release build hides. Watch the
+  *whole* job list on the pushed SHA, not the job you remember.
 
 ## Verification habits for a shared checkout
 
@@ -196,11 +237,11 @@ trio) is still the reference for *shape*, not for absolute tok/s.
   infinity, a partial tail block). That is stronger than five texts matching, and it is cheap.
 - **Gate with the toolchain CI uses, not the default.** Stable is 1.100.0; the box's default is
   1.99.1 and it does not report every lint 1.100 does (it missed `needless_range_loop` in
-  `model/mod.rs` for weeks of red builds). `rustup toolchain install 1.100.0 --profile minimal
-  --component clippy,rustfmt`, then `cargo +1.100.0 clippy --workspace --all-targets -- -D warnings`,
-  `cargo +1.100.0 fmt --all --check`, and the same cross-target clippy with `--target` for
-  `x86_64-unknown-linux-gnu` and the three aarch64 targets (clippy type-checks, so it needs no
-  foreign linker).
+  `model/mod.rs` for weeks of red builds, and it missed cargo's `unused_dependencies` entirely).
+  `rustup toolchain install 1.100.0 --profile minimal --component clippy,rustfmt`, then
+  `cargo +1.100.0 clippy --workspace --all-targets -- -D warnings`, `cargo +1.100.0 fmt --all
+  --check`, and the same cross-target clippy with `--target` for `x86_64-unknown-linux-gnu` and
+  the three aarch64 targets (clippy type-checks, so it needs no foreign linker).
 - **`cargo fmt --all` reformats the other agent's files** — use `cargo fmt -p <crate>`, and if a
   shared file is not yours, fix your hunks by hand and let the owner reformat theirs.
 - **`target/release/hearth-chat-cli.exe` is often locked by a running UI**: `netstat -ano` for the
@@ -213,3 +254,6 @@ trio) is still the reference for *shape*, not for absolute tok/s.
 - **Timer rows need an exact field match.** `[q35timing]` rows are `$1="[q35timing]"`, `$2=name`
   (so `gdn gates` is `$2="gdn"`), and the ffn sub-rows put the value in `$3`; match `$2=="ffn"` or a
   regex on ` us `, never `/ffn /`, or the sub-rows arrive as extra matches.
+- **In a shared checkout, check the room before touching a file that is already dirty.** Two
+  agents can hold the same claim within seconds of each other; the one with the working patch in
+  the tree lands it and the other takes the next task.

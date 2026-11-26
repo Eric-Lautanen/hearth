@@ -47,7 +47,16 @@ it, and the release build is warning-free under the toolchain CI actually uses.
 run with the explicit `+1.100.0`): `scripts/package-win.ps1 -Version 0.3.0 -Zip` stages both
 executables, `models/README.txt`, the README and both licenses, and writes
 `hearth-v0.3.0-windows-x86_64.zip` (3,112,337 bytes). WiX 7 builds
-`hearth-v0.3.0-windows-x86_64.msi` (3,743,744 bytes) from it.
+`hearth-v0.3.0-windows-x86_64.msi` (3,747,840 bytes) from it.
+
+**The artifacts that ship are the ones from the fixed tree.** The first MSI in this entry was
+built before the `f16c` fix above and was thrown away rather than shipped: the release
+binaries were rebuilt from `dd788bc` and the whole chain re-run against them. The proof that
+the installed engine is that build and not a stale copy is the hash - the installed
+`hearth-chat-cli.exe` and `target/release/hearth-chat-cli.exe` are the same file
+(SHA-256 `D3D11975C78A1A6244E15C102531EC90766D631540A8C76C822FF0E0E0B1FA26`). `hearth-ui.exe`
+is unchanged by the fix, byte for byte, because the UI server does not link the quantize
+kernel.
 
 **`scripts/msi-query.ps1`: 14 of 14 checks pass.** `ProductVersion=0.3.0`, per-user scope
 (`ALLUSERS=2`, `MSIINSTALLPERUSER=1`), both installer choices defaulting to 1, the cabinet
@@ -92,6 +101,17 @@ portable SIMD, which runs on NEON on arm64. The note now says which kernels are 
 which are x86-only (the 1-bit/2-bit dots, the Hadamard rotation and the Q8 activation
 quantize), which is what `crates/hearth-quant/src` and `crates/hearth-llm/src/ops.rs` actually
 contain.
+
+**The five-runner path was exercised, not assumed.** `workflow_dispatch` with
+`version=v0.0.0-dry-run` builds exactly what a tag would publish and stops before publishing:
+run 45873402074 came back 5 of 5 green (windows-x86_64, linux-x86_64, linux-arm64,
+macos-x86_64, macos-arm64) with the publish job skipped. The artifacts were pulled and
+inspected rather than trusted: the **CI-built** MSI passes `scripts/msi-query.ps1` with 14 of
+14 checks, the Linux tarball carries both executables, `models/README.txt`, the README, both
+licenses, `hearth.desktop` and `hearth.svg`, and the macOS zip carries `Hearth.app` with both
+binaries in `Contents/MacOS` and the icon, README and licenses in `Contents/Resources`. A dry
+run's artifacts are named `v0.0.0-*` because `STAMP` is the dispatch input; a tag push stamps
+the tag's version instead.
 
 ### The Hadamard fold and the Q8 quantize are AVX2 now, and byte-identical (2026-11-26)
 
