@@ -366,6 +366,17 @@ struct Q35Timers {
     norm_us: u128,
     /// GDN recurrence or full attention for a layer (`gdn_layer`/`attn_layer`).
     mix_us: u128,
+    /// The `gdn_scan_heads` pool dispatch alone — a **subset** of `mix_us`, not a
+    /// sixth stage. It is reported separately because it is the only work inside
+    /// the stage that is not a weight matmul: it walks the recurrent state (151 MB
+    /// per token on the 27B) with serial `dot +=` chains, so the stage's GB/s
+    /// cannot be compared with a kernel's without knowing how much of it this is.
+    scan_us: u128,
+    /// The `ssm_alpha`/`ssm_beta` f32 matvecs (`gdn_alpha_beta`) — also a subset of
+    /// `mix_us`. They are the stage's only dense f32 weights (1.92 MiB per GDN
+    /// layer) and they run serially, so they are the second candidate for why the
+    /// stage trails a weight kernel.
+    gates_us: u128,
     /// Sandwich norm + FFN branch + both residuals for one layer.
     ffn_us: u128,
     /// `output_norm` plus the language-model head.
@@ -381,10 +392,12 @@ impl Q35Timers {
             "[q35timing] {}: {} tokens, {:.3} ms/token",
             label, tokens, per_token
         );
-        let rows: [(&str, u128); 6] = [
+        let rows: [(&str, u128); 8] = [
             ("embed", self.embed_us),
             ("attn_norm", self.norm_us),
             ("gdn/attn", self.mix_us),
+            ("gdn scan", self.scan_us),
+            ("gdn gates", self.gates_us),
             ("ffn", self.ffn_us),
             ("head", self.head_us),
             ("TOTAL", self.total_us),
@@ -397,6 +410,7 @@ impl Q35Timers {
                 us as f64 * 100.0 / total as f64
             );
         }
+        eprintln!("[q35timing]   (gdn scan and gdn gates are subsets of gdn/attn, not stages)");
     }
 }
 
@@ -1836,7 +1850,11 @@ impl Qwen35Core {
         if layer == 0 {
             dump_layer0(pos, "linear_attn_qkv_mixed-0", &sc.qkv);
         }
+        let t_gates = self.timers_on.then(std::time::Instant::now);
         self.gdn_alpha_beta(lyr, &sc.normed, &mut sc.abuf, &mut sc.bbuf)?;
+        if let Some(t) = t_gates {
+            sc.timers.gates_us += t.elapsed().as_micros();
+        }
         self.gdn_scan(layer, pos, lyr, sc, caches)?;
         if layer == 0 {
             dump_layer0(pos, "final_output-0", &sc.normed_out);
@@ -1853,10 +1871,18 @@ impl Qwen35Core {
         Ok(())
     }
 
-    /// `ssm_alpha` / `ssm_beta`: dense f32 weights (`dt_rank` rows of `d_model`),
-    /// so they stay serial matvecs on both prefill paths — ~32k MACs each is
-    /// below the cost of a pool dispatch, and below the noise of the weight pass
-    /// they sit next to.
+    /// `ssm_alpha` / `ssm_beta`: dense f32 weights, `dt_rank` rows of `d_model`
+    /// (48 x 5120 on the 27B, 960 KiB each), so they stay serial matvecs on both
+    /// prefill paths.
+    ///
+    /// They are not free, whatever their size next to a folded projection
+    /// suggests: two of these per GDN layer push 96.5 MB of f32 through one
+    /// thread every token, measured at 21 ms of the 164 ms `gdn/attn` stage —
+    /// 4.6 GB/s, a third of what the quantized projections beside them read. An
+    /// earlier version of this comment called them 32k MACs, "below the noise of
+    /// the weight pass"; the `gdn gates` row of `HEARTH_Q35_TIMERS` says 21 ms.
+    /// Parallelizing over the 48 rows would be bit-identical and is the obvious
+    /// next lever in this stage.
     fn gdn_alpha_beta(
         &self,
         lyr: &Layer,
@@ -1998,8 +2024,12 @@ impl Qwen35Core {
             scale_q,
         };
         let func: ParForFn = gdn_scan_heads;
+        let t_scan = self.timers_on.then(std::time::Instant::now);
         self.pool
             .par_for(n_v, func, &ctx as *const GdnHeadCtx as usize);
+        if let Some(t) = t_scan {
+            sc.timers.scan_us += t.elapsed().as_micros();
+        }
 
         if q35dbg {
             let mean_abs = |v: &[f32]| v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;

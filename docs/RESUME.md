@@ -79,6 +79,14 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
 
 ## Open inference items (most valuable first)
 
+0. **Parallelize `matvec_dense` over rows — the one measured waste left in the 27B's gdn/attn.**
+   `ssm_alpha`/`ssm_beta` are f32 (1.92 MiB per GDN layer) and are dotted on one thread: 96.5 MB
+   per token at 4.6 GB/s, 21 ms, 13% of the stage. Rows are independent dots in ascending `c`, so
+   a pool over the 48 rows is bit-identical. Worth ~18 ms/token (4%) — the scan, by contrast, was
+   measured at 8.5 ms and is not worth touching. Context: the stage's projections already run at
+   77-85% of the ceiling for *their* matmul size (6.7-11.2 MiB reads 13.8-15.3 GB/s in
+   `kernel-bench`, against 16.2 at 140 MiB), so do not go looking for a stage-sized gap there.
+
 1. **The scan is still the biggest stage after the FFN** — 161-169 of 436-451 ms/token
    prefill, and 210-224 ms of ~590 decode, against 258 for the FFN. Layout and head split
    are done: `GdnState` is `[j][i]` per head and `gdn_scan_heads` runs the 48 heads across the

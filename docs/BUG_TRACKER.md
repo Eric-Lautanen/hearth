@@ -3,6 +3,54 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### GDN scan timed: 8.5 ms, so the stage's shortfall is the serial alpha/beta matvec (2026-11-25)
+
+The stage entry above left the scan as an estimate (~8-10 ms, derived from the state's size and
+scalar throughput). It is now measured: `HEARTH_Q35_TIMERS` reports `gdn scan` (the `par_for` over
+`gdn_scan_heads` alone) and `gdn gates` (`gdn_alpha_beta`), both marked as subsets of `gdn/attn`.
+
+| per token, 27B PTQ1_0 | run 1 | run 2 |
+| --- | --- | --- |
+| decode | 454.9 ms | 484.0 ms |
+| gdn/attn | 164.0 | 178.8 |
+| — gdn scan | **8.5** | **11.3** |
+| — gdn gates | **21.0** | **20.4** |
+| ffn | 271.1 | 285.2 |
+| head | 19.1 | 19.2 |
+
+The estimate was right to within a millisecond, and the hypothesis built on it was wrong: the scan
+is 5% of the stage, not its shortfall. It moves 302 MB of state in 8.5 ms — an effective 36 GB/s,
+which is not a DRAM figure at all (each head's 64 KB stays in L2 across the read/update/read, so
+the traffic is L2-resident and the loop is limited by its scalar `dot +=` chains, ~0.4 element per
+cycle per worker). There is nothing to win there without changing summation order.
+
+**The shortfall is `matvec_dense`.** `ssm_alpha`/`ssm_beta` are stored f32, 48 rows of 5120 per
+layer (960 KiB each, 1.92 MiB per GDN layer), and `gdn_alpha_beta` dots them on one thread with no
+pool dispatch: **96.5 MB per token at 4.6 GB/s, 21 ms** — 13% of the stage and 4.6% of decode, for
+0.6% of the weights. The comment above it claimed "~32k MACs each ... below the cost of a pool
+dispatch and below the noise of the weight pass"; the MAC count was off by 7.5x (246k each) and the
+timer contradicts the rest. Corrected in place.
+
+**What is left is working-set size, not overhead.** The stage's projections are 6.7-11.2 MiB each,
+and `kernel-bench` measures the size effect the headline ceiling hides:
+
+| buffer | GB/s at 12 workers |
+| --- | --- |
+| 6.6 MiB (6144 rows) | 13.76 |
+| 10.9 MiB (10240 rows) | 15.29 |
+| 18.6 MiB (17408 rows) | 17.16 |
+| 140 MiB (131072 rows) | 16.18 |
+
+The stage's matmul weights (1.584 GB after the f32 pair) move at 11.78 GB/s, against a size-matched
+ceiling of 13.8-15.3 — 77-85%. In the same run the ffn reads 13.81 GB/s (3.743 GB, 18.6 MiB
+matmuls) and the head 14.56, so every stage sits at ~85% of the ceiling for *its* matmul size. The
+27B is not leaving a stage-sized gap on the table; it is paying a per-dispatch and cold-start tax
+that a 140 MiB buffer does not pay.
+
+**Next lever, bit-identical:** parallelize `matvec_dense` over its 48 rows (each row is an
+independent dot in ascending `c`, so the result cannot move). That is ~18 ms/token, 4%, and the only
+measurable waste this entry found.
+
 ### PTQ1_0 decode: sixteen lanes instead of eight, and the table form that lost (decode 1.27-1.38x, 2026-11-25)
 
 The stage analysis above left one lever: cycles per weight in `dot_ptq1_0_q8_0`, where one thread
