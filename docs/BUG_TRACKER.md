@@ -3,6 +3,17 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### CI now type-checks the Intel Mac release leg on every PR (2026-11-26)
+
+`check` runs on `macos-latest` (arm64), while `release.yml:45-48` builds `macos-x86_64` on
+`macos-15-intel`. Nothing checked `x86_64-apple-darwin` before a tag: `arm-cross-check` covered
+only the three aarch64 targets. Added `x86_64-apple-darwin` to the cross-target matrix and
+renamed the job `cross-check`, since the old name no longer described it. `cargo check` and
+clippy type-check without an Apple linker, so this is one extra leg on the existing Ubuntu
+runner. Cinder independently confirmed the gap; `main` has no branch protection configured,
+so the rename cannot break a required status check. Verified by diff only - no build or
+benchmark was run for this YAML change (buffy holds the build-bench lock).
+
 ### CI is green again: the toolchain became 1.100.0 and two jobs named things that had moved (2026-11-26)
 
 Every push since 2026-11-05 failed, and the local gate did not say so, because none of the three

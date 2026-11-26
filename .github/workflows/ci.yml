@@ -75,19 +75,21 @@ jobs:
           # dispatched, so nothing ever re-measured it.
           check target/baseline-tests.s target/baseline-asm-tests --tests
 
-  # aarch64 has no runner in this matrix, and does not need one to catch the kind
-  # of break that stops a release: a reference to an x86-only module from a branch
-  # the optimizer can prove dead is still a name the compiler has to resolve, so
-  # `hearth-tls` did not build for aarch64 at all until its AES-NI and PCLMUL
-  # calls were gated on the architecture. `cargo check` does not link, so this
-  # runs on the x86 runners already here and still covers every target, clippy
-  # included. The three targets are the platforms a release has to reach: ARM
-  # Linux (Graviton, Raspberry Pi), Apple silicon, Windows on ARM.
-  arm-cross-check:
+  # No native runner is needed to catch the kind of break that stops a release:
+  # a reference to an x86-only module from a branch the optimizer can prove dead
+  # is still a name the compiler has to resolve, so `hearth-tls` did not build for
+  # aarch64 at all until its AES-NI and PCLMUL calls were gated on the
+  # architecture. `cargo check` does not link, so this runs on an x86_64 Ubuntu
+  # runner with no Apple or Windows toolchain. It covers the release targets that
+  # `check` does not already build natively: all three aarch64 ones, plus
+  # x86_64-apple-darwin - `macos-latest` is arm64, so the Intel Mac release leg in
+  # release.yml would otherwise have no PR-time type check at all.
+  cross-check:
     strategy:
       fail-fast: false
       matrix:
         target:
+          - x86_64-apple-darwin
           - aarch64-unknown-linux-gnu
           - aarch64-apple-darwin
           - aarch64-pc-windows-msvc
