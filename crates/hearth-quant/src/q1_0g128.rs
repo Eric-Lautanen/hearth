@@ -8,10 +8,10 @@ use core::arch::x86_64::*;
 /// Used by the 512-bit VNNI kernel (LUT expansion path).
 ///
 /// Compiled only for tests, with that kernel: nothing dispatched reads it, so a shipped
-/// build should not carry the table. `#[cfg(test)]` says that where a `#[allow(dead_code)]`
-/// said "unused, and I would rather not hear about it". The x86_64 half of the gate follows
-/// the kernel itself: the AVX-512 VNNI body is the only reader, and it does not exist
-/// elsewhere.
+/// build should not carry the table. `#[cfg(test)]` says that where a dead-code
+/// suppression said "unused, and I would rather not hear about it". The x86_64
+/// half of the gate follows the kernel itself: the AVX-512 VNNI body is the only
+/// reader, and it does not exist elsewhere.
 #[cfg(all(test, target_arch = "x86_64"))]
 const Q1V_SM: [[u8; 8]; 256] = {
     let mut table = [[0u8; 8]; 256];
