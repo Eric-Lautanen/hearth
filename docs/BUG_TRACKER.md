@@ -42,9 +42,33 @@ Per-format rates measured at the ffn tensor's own shape (17408 x 5120 = 19.5 MB)
 Either way the target is the 228.5 ms single-pass figure, read off the `ffn` row of
 `HEARTH_Q35_TIMERS`, and both are byte-identical changes.
 
-The format lever is still the larger one — Q1_0 prices the same 17.1 Gweights at 2.41 GB / 165 Gw/s
-= 104 ms — but it needs a 27B re-quantized from source plus a quality check, because Q1_0 is 1-bit
-{-1,+1} and drops the 5-level ternary. It is the bigger blocked option, not the next move.
+**The format lever: larger, and now priced.** Q1_0 puts the same 17.1 Gweights at 2.41 GB / 165 Gw/s
+= 104 ms. Its cost was measured on the 9B rather than assumed, and it is not an availability
+inconvenience — it is a cliff.
+
+*Can the repo produce it?* No, not as shipped: `hearth-gguf` parses only (no writer) and
+`hearth_quant::quantize_f32` covers Q8_0 and F32, so there is no Q1_0 quantizer outside
+`hearth-compute`'s `#[cfg(test)]` helper. `crates/hearth-llm/examples/requant_ffn.rs` now does it
+without a writer: copy the file, rewrite each ffn payload at its existing offset with 18-byte Q1_0
+blocks, patch that tensor's dtype id 143 -> 43, leaving every other offset valid (the region tail
+keeps stale bytes no reader looks at).
+
+*What the drop costs* (9B hybrid, ffn only, 96 tensors, 11.0 -> 7.1 MB each):
+
+- **32.8% of ffn weights are exact zeros**, and 1-bit has no zero level.
+- **Aggregate relative L2 error 0.5748** (0.5749-0.5751 per tensor). That is the floor for a
+  sign-only drop, not a scale choice: with mean-abs scale `m` and a third of weights at zero,
+  `relL2 = sqrt((m^2/3 + 2(s-m)^2/3) / (2s^2/3)) = 0.577` at `m = 2s/3`, which is both the
+  L2-optimal scale and the one the converter uses.
+- **Output at temp 0, 24 tokens:** the original answers ("Analyze the phenomenon of Rayleigh
+  scattering…", "To find the product of 17 and 23…"); the converted model emits a single token (EOS)
+  on two of three prompts and `1` followed by whitespace on the third.
+- **The speed is real:** `ffn` 77.5 -> 35.9 ms and decode 137.8 -> 99.1 ms/token (1.39x) on the 9B.
+
+So the option stays blocked for a stronger reason than tooling: a post-hoc 1-bit ffn destroys a
+model whose ffn carries real zeros, and the shipped Q1_0 models are 1-bit-native rather than
+converted. Acting on it needs a 27B made 1-bit from source with the zeros trained or annealed away,
+which is a model project, not a kernel or a script.
 
 Dead ends, both measured or bounded:
 

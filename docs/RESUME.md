@@ -99,7 +99,10 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    pool pass per layer (192 -> 128, ~29 ms) and/or stop the pool parking across the silu/gating gap
    before `down`; target 228.5 ms on the `ffn` row, both byte-identical. The Q1_0 layout would price
    the same weights at 104 ms but needs a re-quantized 27B and a quality check, so it stays the
-   bigger blocked option. Numbers and dead ends: BUG_TRACKER's "What is left in the 27B's ffn".
+   bigger blocked option, and its cost is measured, not assumed: no writer or Q1_0 quantizer ships
+   (`examples/requant_ffn.rs` converts in place), and a 9B with ffn in 1-bit loses 32.8% zero
+   weights for relL2 0.575, then answers with EOS. It needs a 27B made 1-bit from source, not a
+   conversion. Numbers and dead ends: BUG_TRACKER's "What is left in the 27B's ffn".
 2. **The scan is still the biggest stage after the FFN** — 161-169 of 436-451 ms/token
    prefill, and 210-224 ms of ~590 decode, against 258 for the FFN. Layout and head split
    are done: `GdnState` is `[j][i]` per head and `gdn_scan_heads` runs the 48 heads across the
