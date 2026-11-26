@@ -16,8 +16,10 @@
 > uninstall that keeps the models, the installed binary answering all five endpoints), the
 > five-runner release path was exercised with a dry run, and `v0.3.0` is published
 > (six assets plus `SHA256SUMS`; 6 of 6 hashes match and the *shipped* MSI passes the 14-check
-> table gate). The operator then asked for the chat attachments to be in that release too, so
-> `v0.3.0` is re-tagged at the tree that carries them and republished under the same version.
+> table gate). It was published once, then re-tagged and republished at the tree that carries
+> the chat attachments, because the operator asked for the new updates to be in the same
+> version — the republished assets are different files (the MSI hash moved), and the published
+> installer was installed and tested here, including `POST /api/attach`.
 > The release build is now warning-free under the toolchain CI uses. The one scar
 > this session left is the most useful lesson in it: **the `kernel-baseline` CI job was red
 > for half a day and nobody saw it**, because the failing job was not the one anybody was

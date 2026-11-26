@@ -123,6 +123,21 @@ the removal arm covering its own version. The operator then asked for the chat a
 `+` button, paste-as-file, every file type) to be in the release as well, so `v0.3.0` is
 re-tagged at the tree that carries them and republished under the same version number.
 
+**The re-release, done the same way.** The tag was deleted locally and on the remote and
+re-created at `3607e43` (attachments, the two review fixes, the `allow`-comment cleanup, the
+CHANGELOG and the refreshed screenshots), and the workflow republished over the same asset
+names. The check that matters is that the assets are *different*: the MSI hash moved from
+`f12939978124a2fd10014cbf8d05202a9f13060a0e727e7740cdb42253623ba6` to
+`df8be14188a8651301a38dfeb118cb5ba972fc655806a2275951c3829887ff6b`, and `hearth-ui.exe` inside
+it grew from 800,256 to 828,928 bytes — the attachment code is in the UI server, not the
+engine, which is why `hearth-chat-cli.exe` is the same size in both publishes. The republished
+assets were downloaded again: 6 of 6 hashes match the new `SHA256SUMS`, and the shipped MSI
+passes the 14-check table gate again. It was then installed on this machine over the previous
+0.3.0: exit 0, one Add/Remove Programs row, the models kept, all five endpoints 200 from the
+installed binary, and `POST /api/attach` answering
+`{"bytes":37,"chars":37,"id":1,"kind":"text","name":"notes.txt","ok":true,"truncated":false}`
+for a 37-byte text file. So the artifact a user downloads is the artifact that was tested.
+
 ### The Hadamard fold and the Q8 quantize are AVX2 now, and byte-identical (2026-11-26)
 
 The RESUME's first "do this" item: `rotate_quantize_into` was 15.1 ms/token on the 27B (3% of
