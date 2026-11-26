@@ -199,6 +199,7 @@ Only set what you want to change — the rest follows the model:
 | `HEARTH_PIN_WEIGHTS` | off | Same as `--pin-weights` |
 | `HEARTH_MODEL_CATALOG_JSON` / `HEARTH_DL_ALLOW_HTTP` / `HEARTH_NO_AUTO_SHUTDOWN` | built-in / off / off | Catalog override, http mirrors, keep UI up |
 | `HEARTH_UI_TOKEN` | off (open) | Require a token on every `/api/*` call (header or `?token=`); the UI prompts once |
+| `HEARTH_QUANT_SCALAR` | off | Set to anything but `0` to force scalar quantization/Hadamard paths; used to A/B one binary against its byte-identical scalar reference |
 
 ## Architecture
 
