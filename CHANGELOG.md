@@ -5,6 +5,53 @@ one installer or archive per platform (Windows zip + MSI, Linux tarball, macOS
 `.app`) and publishes them with `SHA256SUMS`. `0.x` means the CLI flags and the
 HTTP API can still move between minor versions.
 
+## [0.3.0] - 2026-11-26
+
+Prefill throughput, a portability pass, and a web UI cleanup. Every new vector
+path keeps a byte-identical scalar reference, and all artifacts carry the same
+version number.
+
+### Added
+
+- **AVX2 Q8 activation quantize and Hadamard rotation** in `hearth-quant`, each
+  with a `to_bits()` equality test against its scalar reference. The forward
+  rotation is sign-then-WHT, the inverse is WHT-then-sign, and normalization is
+  a single `1/sqrt(n)` at the end. `HEARTH_QUANT_SCALAR=1` turns every vector
+  path off in one binary, so A/B runs need no rebuild.
+- **Paired-token `Q2_0_G64` prefill kernel**: one weight-row LUT expansion
+  shared by two activation rows, each token keeping its own accumulation order,
+  so the result is bit-identical to two single dots.
+- **Intel macOS is type-checked on every PR**: `macos-latest` is arm64, so
+  `x86_64-apple-darwin` joins the Ubuntu cross-check matrix alongside the
+  aarch64 targets.
+
+### Changed
+
+- Qwen3.5 prefill batches four tokens instead of two. The pool already walks
+  weights in 1 MB tiles with the token loop inside the tile, so the extra rows
+  reuse a resident tile instead of going back to DRAM.
+- The model picker is ordered and grouped by family, controls have labels and
+  ARIA names, and the hero chips have a grouped layout.
+- Version bumped from 0.2.0 to 0.3.0 across all ten workspace crates,
+  `Cargo.lock` and both macOS `Info.plist` version keys.
+
+### Fixed
+
+- Stale benchmark prose that called `[generate] avg_cpu_overhead` overhead when
+  it includes the forward pass. The README now also warns that absolute tok/s
+  cells drift 6-18% between sessions.
+- aarch64-only warnings from bindings used only by the x86 tests.
+- Stale comments in `qwen35.rs` and `pool.rs` that still described width-2
+  prefill and a missing paired kernel.
+
+### Performance
+
+Alternating same-session pairs on the Ryzen 7 8840HS box: the paired Q2_0
+kernel took the 2.5-27B Q2_0 prefill from 496.67 to 338 ms/token; four-token
+prefill cut the 2-1.7B PTQ1_0 case by 15.6% and was neutral on the 27B at
+d 5120. Absolute numbers drift between sessions, so `docs/BUG_TRACKER.md`
+holds the paired measurements and the reverted attempts.
+
 ## [0.2.0] - 2026-10-17
 
 The release machinery, the Windows installer, and a hardening pass over the
@@ -79,4 +126,5 @@ breakdown into `hearth-core`, `hearth-gguf`, `hearth-quant`, `hearth-tokenizer`,
 `hearth-sampler`, `hearth-llm`, `hearth-compute`, `hearth-diffusion` and
 `hearth-ui`.
 
+[0.3.0]: https://github.com/Eric-Lautanen/hearth/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Eric-Lautanen/hearth/compare/v0.1.0...v0.2.0
