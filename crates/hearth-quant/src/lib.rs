@@ -91,6 +91,33 @@ pub(crate) unsafe fn f16_bits_to_f32(bits: u16) -> f32 {
     _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(i32::from(bits))))
 }
 
+/// One f32 value → the bits of its f16 round-trip, for kernels that declare `f16c`
+/// themselves.
+///
+/// The mirror of [`f16_bits_to_f32`], and for the same reason: `half`'s `from_f32`
+/// probes the CPU at runtime, so inside a `#[target_feature]` body that does not declare
+/// `f16c` the conversion cannot inline and stays an out-of-line call to
+/// `f32_to_f16_x86_f16c`. At a weak baseline that is a real per-call loss, and it is what
+/// [`scripts/check-kernel-baseline.py`] reports as a missing `f16c`; at `x86-64-v3` it
+/// lowers to the same single instruction and hides.
+///
+/// Rounding is to nearest, ties to even, which is what `half` does too, so a kernel can
+/// swap one for the other and keep a byte-equality test against the scalar path.
+///
+/// # Safety
+/// The calling function must declare `#[target_feature(enable = "f16c")]`; this executes
+/// `vcvtps2ph`, which is a hard requirement wherever it is reached.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "f16c")]
+pub(crate) unsafe fn f32_to_f16_bits(value: f32) -> u16 {
+    use core::arch::x86_64::{
+        _mm_cvtps_ph, _mm_cvtsi128_si32, _mm_set_ss, _MM_FROUND_TO_NEAREST_INT,
+    };
+    let half = _mm_cvtps_ph(_mm_set_ss(value), _MM_FROUND_TO_NEAREST_INT);
+    _mm_cvtsi128_si32(half) as u16
+}
+
 // The AVX-512 width policy and the CPUID fields it reads are x86_64-only by
 // construction: they exist to choose between x86 kernels, and another
 // architecture has no width to choose. Gated here rather than left to fall out

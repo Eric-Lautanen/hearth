@@ -24,9 +24,15 @@ pub fn quantize_into(src: &[f32], dst: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
     {
         let full = src.len() / 32;
-        if !crate::scalar_only() && crate::avx2_available() {
-            // SAFETY: the vector path is entered only when the CPU reports
-            // AVX2, and it reads and writes exactly the blocks it is given.
+        // `f16c` as well as AVX2: the kernel converts each block scale with the
+        // hardware instruction, and AVX2 does not imply F16C (AMD Excavator has
+        // the first and not the second).
+        if !crate::scalar_only()
+            && crate::avx2_available()
+            && std::arch::is_x86_feature_detected!("f16c")
+        {
+            // SAFETY: the vector path is entered only when the CPU reports both
+            // AVX2 and F16C, and it reads and writes exactly the blocks it is given.
             unsafe { avx2::quantize_blocks_avx2(src, dst, full) };
             // The tail is a partial block. The scalar path is the reference
             // for it, and the vector path would read past the end of `src`.
@@ -113,8 +119,6 @@ fn quantize_block_scalar(src: &[f32], dst: &mut [u8]) {
 mod avx2 {
     use core::arch::x86_64::*;
 
-    use half::f16;
-
     use super::quantize_block_scalar;
 
     /// The horizontal maximum of eight lanes.
@@ -161,8 +165,10 @@ mod avx2 {
     /// Quantize `blocks` whole 32-element blocks of `src` into `dst`.
     ///
     /// # Safety
-    /// The CPU must support AVX2 (see [`crate::avx2_available`]).
+    /// The CPU must support AVX2 and F16C (see [`crate::avx2_available`]; the
+    /// caller checks both).
     #[target_feature(enable = "avx2")]
+    #[target_feature(enable = "f16c")]
     pub(super) unsafe fn quantize_blocks_avx2(src: &[f32], dst: &mut [u8], blocks: usize) {
         let sign_bit = _mm256_castsi256_ps(_mm256_set1_epi32(i32::MIN));
         let big = _mm256_set1_ps(f32::MAX);
@@ -244,10 +250,12 @@ mod avx2 {
             _mm_storeu_si128(dp as *mut __m128i, p01);
             _mm_storeu_si128(dp.add(16) as *mut __m128i, p23);
 
-            let scale_bytes = f16::from_f32(scale).to_le_bytes();
+            // Through the hardware conversion: `half`'s would be an out-of-line
+            // call here, because `from_f32` probes the CPU at runtime.
+            let [scale_lo, scale_hi] = crate::f32_to_f16_bits(scale).to_le_bytes();
             let ds = dst.as_mut_ptr().add(b * 34);
-            *ds = scale_bytes[0];
-            *ds.add(1) = scale_bytes[1];
+            *ds = scale_lo;
+            *ds.add(1) = scale_hi;
         }
     }
 }

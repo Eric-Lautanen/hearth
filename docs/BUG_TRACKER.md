@@ -3,6 +3,39 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### The quantize kernel declared `avx2` but converted scales with `f16c` (2026-11-26)
+
+Every push for half a day failed one job, `kernel-baseline`, and nothing else in those runs
+was red — clippy, fmt, the tests, the cross-target checks and the arm emulators all passed.
+The job's own words:
+
+    target/baseline-lib.s: 1 out-of-line intrinsic call(s) -- a kernel is missing fma/f16c:
+      in quantize_blocks_avx2  ->  half::binary16::arch::x86::f32_to_f16_x86_f16c
+
+`quantize_blocks_avx2` declared `#[target_feature(enable = "avx2")]` and wrote each block's
+scale with `f16::from_f32(scale).to_le_bytes()`. `avx2` does not imply `f16c`, so `half`
+runtime-dispatched the conversion and the call never inlined: at the `x86-64-v2` baseline the
+listing holds a real `call`, and the per-call cost is the same mechanism as the 5.7x loss the
+guard documents at the top of `scripts/check-kernel-baseline.py`. At `x86-64-v3` the probe's
+f16c arm lowers to one instruction and the omission is invisible, which is why only the weak
+baseline caught it — and it is exactly the class of regression that guard exists for, in the
+kernel the AVX2 work had just optimized.
+
+**The fix, in `hearth-quant`.** A new `f32_to_f16_bits` next to the existing
+`f16_bits_to_f32`: `#[inline]`, `#[target_feature(enable = "f16c")]`, one `vcvtps2ph`, rounding
+to nearest-even so it matches `half` bit for bit. The kernel now declares both features (one
+attribute each — `enable = "avx2, f16c"` is parsed as a single feature named `" f16c"` and
+rejected) and writes the scale through the helper, and the dispatch requires
+`is_x86_feature_detected!("f16c")` as well as AVX2, because AMD Excavator has AVX2 without
+F16C and AVX2 alone is not a licence to execute `vcvtps2ph`.
+
+**Proof, run the way CI runs it:** `cargo rustc -p hearth-quant --release` with
+`RUSTFLAGS=-C target-cpu=x86-64-v2 --emit=asm` for both `--lib` and `--tests`, then
+`scripts/check-kernel-baseline.py` on each listing — both report "baseline-invariant". The
+`hearth-quant` tests still pass 56/56, including the byte-equality of the vector quantize
+against the scalar reference, so the hardware rounding change did not move a byte. `fmt` and
+`clippy --workspace --all-targets -D warnings` are clean on the same tree.
+
 ### The release path is verified end to end, and the build stopped warning (2026-11-26)
 
 The operator asked for the installers to be ready and a release once the room is green. The
