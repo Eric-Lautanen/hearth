@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Hearth Chat</title>
+<meta name="description" content="Local chat for quantized Bonsai models, served by Hearth on 127.0.0.1.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
   :root {
@@ -15,7 +16,7 @@
     --border2: #2a3140;
     --text: #e8ecf3;
     --muted: #9aa3b5;
-    --faint: #5f6779;
+    --faint: #7b8497;
     --accent: #ff6a3d;
     --accent2: #ff3d71;
     --accent-soft: rgba(255, 106, 61, 0.14);
@@ -559,7 +560,7 @@
   <div class="brand"><div class="flame" style="color:#fff"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c1 4-2.5 5.5-2.5 9a2.5 2.5 0 0 0 5 .5C15.5 9 14 7.5 14 7.5c2.5 1.5 4.5 4.2 4.5 7.7A6.5 6.5 0 0 1 12 21.7a6.5 6.5 0 0 1-6.5-6.5C5.5 9.5 10 6 12 2Z"/></svg></div><span>Hearth</span></div>
   <div class="model-zone">
     <div class="select-wrap">
-      <select id="modelSelect" disabled>
+      <select id="modelSelect" aria-label="Model" disabled>
         <option>Loading models…</option>
       </select>
     </div>
@@ -582,7 +583,7 @@
 
 <div class="composer-zone">
   <div class="composer">
-    <textarea id="input" rows="1" placeholder="Message Hearth…"></textarea>
+    <textarea id="input" rows="1" placeholder="Message Hearth…" aria-label="Message Hearth"></textarea>
     <button class="send-btn" id="sendBtn" title="Send (Enter)" disabled>
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
     </button>
@@ -603,48 +604,48 @@
   </div>
   <div class="drawer-body">
     <div class="field">
-      <label>System prompt</label>
+      <label for="systemPrompt">System prompt</label>
       <textarea id="systemPrompt" class="mini" rows="3" style="resize:vertical">You are a helpful assistant.</textarea>
     </div>
     <div class="field">
-      <label>Temperature <b id="tempVal">0.70</b></label>
+      <label for="temp">Temperature <b id="tempVal">0.70</b></label>
       <input type="range" id="temp" min="0" max="2" step="0.05" value="0.7">
     </div>
     <div class="field">
-      <label>Top-K <b id="topkVal">40</b></label>
+      <label for="topk">Top-K <b id="topkVal">40</b></label>
       <input type="range" id="topk" min="1" max="100" step="1" value="40">
     </div>
     <div class="field">
-      <label>Top-P <b id="toppVal">0.90</b></label>
+      <label for="topp">Top-P <b id="toppVal">0.90</b></label>
       <input type="range" id="topp" min="0" max="1" step="0.01" value="0.9">
     </div>
     <div class="field">
-      <label>Min-P <b id="minpVal">0.00</b></label>
+      <label for="minp">Min-P <b id="minpVal">0.00</b></label>
       <input type="range" id="minp" min="0" max="1" step="0.01" value="0">
     </div>
     <div class="field">
-      <label>Typical-P <b id="typpVal">0.00</b></label>
+      <label for="typp">Typical-P <b id="typpVal">0.00</b></label>
       <input type="range" id="typp" min="0" max="1" step="0.01" value="0">
     </div>
     <div class="field">
-      <label>Repeat penalty <b id="reppenVal">1.10</b></label>
+      <label for="reppen">Repeat penalty <b id="reppenVal">1.10</b></label>
       <input type="range" id="reppen" min="1" max="2" step="0.01" value="1.1">
     </div>
     <div class="field">
-      <label>Seed <b id="seedVal">0 (random)</b></label>
+      <label for="seed">Seed <b id="seedVal">0 (random)</b></label>
       <input type="number" id="seed" class="mini" min="0" step="1" value="0">
     </div>
     <div class="field">
-      <label>Max reply tokens <b id="maxtokVal">512</b></label>
+      <label for="maxtok">Max reply tokens <b id="maxtokVal">512</b></label>
       <input type="range" id="maxtok" min="16" max="4096" step="16" value="512">
     </div>
     <div class="field">
-      <label>Context window <b id="ctxVal">8192</b></label>
+      <label for="ctx">Context window <b id="ctxVal">8192</b></label>
       <input type="range" id="ctx" min="256" max="32768" step="256" value="8192">
     </div>
     <div class="check-row">
       <span>Show &lt;think&gt; reasoning</span>
-      <label class="toggle"><input type="checkbox" id="showThink"><span class="track"></span></label>
+      <label class="toggle"><input type="checkbox" id="showThink" aria-label="Show think reasoning"><span class="track"></span></label>
     </div>
     <div class="drawer-note" style="margin-top:-8px">
       When on, the model reasons first and its &lt;think&gt; stream appears in a
@@ -652,7 +653,7 @@
       directly; if a model still reasons, only its answer is shown.
     </div>
     <div class="field">
-      <label>Device</label>
+      <label for="device">Device</label>
       <select id="device" class="mini">
         <option value="cpu" selected>CPU only (fastest here)</option>
         <option value="gpu">GPU — all layers</option>
@@ -661,12 +662,12 @@
       </select>
     </div>
     <div class="field hidden" id="gpuLayersField">
-      <label>GPU layers <b id="gpuLayersVal">8</b></label>
+      <label for="gpuLayers">GPU layers <b id="gpuLayersVal">8</b></label>
       <input type="range" id="gpuLayers" min="1" max="64" step="1" value="8">
     </div>
     <div class="check-row">
       <span>Pin weights in RAM</span>
-      <label class="toggle"><input type="checkbox" id="pinWeights"><span class="track"></span></label>
+      <label class="toggle"><input type="checkbox" id="pinWeights" aria-label="Pin weights in RAM"><span class="track"></span></label>
     </div>
     <div class="reset-row">
       <button class="link-btn" id="resetDefaults" title="Reload the loaded model's recommended sampling settings">↺ Reset to model defaults</button>
@@ -689,9 +690,9 @@
     </div>
     <div id="dlList"></div>
     <div class="field">
-      <label>Custom link (.gguf URL)</label>
+      <label for="dlUrl">Custom link (.gguf URL)</label>
       <input id="dlUrl" class="mini" placeholder="https://huggingface.co/…/resolve/main/….gguf" style="margin-bottom:8px">
-      <input id="dlFile" class="mini" placeholder="Filename, e.g. My-Model-Q4_0.gguf" style="margin-bottom:8px">
+      <input id="dlFile" class="mini" placeholder="Filename, e.g. My-Model-Q4_0.gguf" aria-label="Filename for the custom link" style="margin-bottom:8px">
       <button class="dl-btn" id="dlAdd">Add &amp; download</button>
     </div>
     <div class="drawer-note">One file downloads at a time; the rest queue. Files land in the project <span style="font-family:var(--mono)">models/</span> folder and appear in the model dropdown automatically. Partial files resume.</div>
@@ -969,7 +970,37 @@ function heroEl() {
 }
 
 function prettyName(file) {
-  return file.replace(/\.gguf$/i, "").replace(/[-_]/g, " ");
+  // Only the hyphen separates words; the quant token keeps its underscore so
+  // "Q1_0" does not read as "Q1 0".
+  return file.replace(/\.gguf$/i, "").replace(/-/g, " ");
+}
+
+// The CLI lists .gguf files in byte order, which puts "Ternary-Bonsai-2-27B"
+// between "2-2B" and "2-4B" ('7' < 'B') and scatters the 27B through the 2B
+// models. Sort the picker the way the download catalog is written: family
+// first, then size, then 1-bit before 2-bit.
+function modelFamily(name) {
+  if (/^bonsai-/i.test(name)) return 0;
+  if (/^ternary-bonsai-2\.5-/i.test(name)) return 3;
+  if (/^ternary-bonsai-2-/i.test(name)) return 2;
+  if (/^ternary-bonsai-/i.test(name)) return 1;
+  return 4; // a file the catalog does not know: after the known families
+}
+function modelSize(name) {
+  const m = name.match(/(\d+(?:\.\d+)?)\s*b/gi);
+  return m ? parseFloat(m[m.length - 1]) : 0;
+}
+function quantRank(name) {
+  if (/(?:ptq1_0|q1_0)\.gguf$/i.test(name)) return 0;
+  if (/(?:pq2_0|q2_0)\.gguf$/i.test(name)) return 1;
+  return 2;
+}
+function sortModels(list) {
+  return list.slice().sort((a, b) =>
+    modelFamily(a.name) - modelFamily(b.name) ||
+    modelSize(a.name) - modelSize(b.name) ||
+    quantRank(a.name) - quantRank(b.name) ||
+    (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
 // Build the collapsible reasoning drawer element for a completed message.
@@ -1067,7 +1098,7 @@ async function refreshModels() {
     const r = await fetch("/api/models");
     const j = await r.json();
     if (!j.ok) throw new Error(j.error || "failed");
-    S.models = j.models || [];
+    S.models = sortModels(j.models || []);
     S.modelsDir = j.dir || "";
     S.modelsDirs = Array.isArray(j.dirs) && j.dirs.length ? j.dirs : (j.dir ? [j.dir] : []);
     renderModelOptions();
@@ -1220,6 +1251,7 @@ function renderDl() {
     row.innerHTML =
       '<div class="dl-top">' +
         '<input type="checkbox" class="dl-check" data-id="' + esc(it.id) + '"' +
+          ' aria-label="Download ' + esc(it.label) + '"' +
           (isDone ? " disabled" : S.dl.checked[it.id] ? " checked" : "") + ">" +
         '<div class="dl-name" title="' + esc(it.filename) + '">' + esc(it.label) + "</div>" +
         '<div class="dl-size">' + (it.size_bytes > 0 ? fmtBytes(it.size_bytes) : "") + "</div>" +
