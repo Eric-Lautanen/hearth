@@ -1066,6 +1066,13 @@ fn handle_generate(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
         prompt.push_str(&message);
         message = prompt;
     }
+    // Every id can be stale or already spent, and the request then has nothing
+    // to say: refuse it here rather than sending the engine an empty prompt.
+    if message.trim().is_empty() {
+        ctx.generating.store(false, Ordering::Relaxed);
+        error_response(stream, "message is empty");
+        return;
+    }
 
     // Reset stream state for this generation.
     {
@@ -1178,24 +1185,7 @@ fn handle_attach(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
     };
     let bytes = req.body.len();
 
-    // Text means UTF-8 and no NUL. A NUL is the one reliable marker for a
-    // binary payload that happens to decode as UTF-8 (a lot of them do not,
-    // but some do), and feeding it to a model is worse than saying "binary".
-    let (text, truncated) = match std::str::from_utf8(&req.body) {
-        Ok(s) if !req.body.contains(&0) => {
-            let mut kept = String::new();
-            let mut cut = false;
-            for (i, ch) in s.char_indices() {
-                if i >= ATTACH_TEXT_CHARS {
-                    cut = true;
-                    break;
-                }
-                kept.push(ch);
-            }
-            (Some(kept), cut)
-        }
-        _ => (None, false),
-    };
+    let (text, truncated) = text_preview(&req.body);
     let kind = if text.is_some() { "text" } else { "binary" };
     let chars = text.as_ref().map(|t| t.chars().count()).unwrap_or(0);
 
@@ -1227,6 +1217,34 @@ fn handle_attach(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
     v.set("chars", Json::num(chars as f64));
     v.set("truncated", Json::Bool(truncated));
     json_response(stream, &v);
+}
+
+/// Decide whether these bytes are text the model can read, and cut them to
+/// [`ATTACH_TEXT_CHARS`] characters if so.
+///
+/// Text means UTF-8 and no NUL. A NUL is the one reliable marker for a binary
+/// payload that happens to decode as UTF-8 (many do not, but some do), and
+/// feeding one to a model is worse than saying "binary".
+///
+/// The cut counts characters, not bytes: a file of CJK or emoji would
+/// otherwise lose three quarters of the context it was given, and the count
+/// reported back to the client has to match what the prompt actually holds.
+fn text_preview(bytes: &[u8]) -> (Option<String>, bool) {
+    match std::str::from_utf8(bytes) {
+        Ok(s) if !bytes.contains(&0) => {
+            let mut kept = String::new();
+            let mut cut = false;
+            for (n, ch) in s.chars().enumerate() {
+                if n >= ATTACH_TEXT_CHARS {
+                    cut = true;
+                    break;
+                }
+                kept.push(ch);
+            }
+            (Some(kept), cut)
+        }
+        _ => (None, false),
+    }
 }
 
 /// Remove the attachments a generate request names, so each upload is used
@@ -1817,6 +1835,28 @@ mod tests {
         assert!(block.contains("kind=\"binary\""), "{block}");
         assert!(block.contains("bytes=\"82104\""), "{block}");
         assert!(block.contains("contents not inlined"), "{block}");
+    }
+
+    /// The cut is in characters, not bytes, so a multi-byte file keeps the
+    /// context it was promised. `\u{2713}` is three bytes in UTF-8, so a byte
+    /// cap would have kept a third of these.
+    #[test]
+    fn the_preview_cut_counts_characters() {
+        let wide = "\u{2713}".repeat(ATTACH_TEXT_CHARS + 5);
+        let (text, truncated) = text_preview(wide.as_bytes());
+        let text = text.expect("valid UTF-8 is text");
+        assert!(truncated);
+        assert_eq!(text.chars().count(), ATTACH_TEXT_CHARS);
+    }
+
+    #[test]
+    fn binary_payloads_are_not_text() {
+        // Invalid UTF-8, and valid UTF-8 with a NUL: both are binary.
+        assert_eq!(text_preview(&[0xff, 0xfe, 0x00, 0x01]).0, None);
+        assert_eq!(text_preview(b"a\0b").0, None);
+        let (text, truncated) = text_preview(b"hello");
+        assert_eq!(text.as_deref(), Some("hello"));
+        assert!(!truncated);
     }
 
     #[test]
