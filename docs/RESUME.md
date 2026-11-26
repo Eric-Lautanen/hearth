@@ -91,26 +91,16 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    pays on prefill (per prompt token: `gdn gates` 19.4 -> 3.0 ms on the 27B, 5.2 -> 0.9 on the 9B;
    prefill -6.1% per token on the 27B), and both prefill paths now time the call — before that the
    row only caught the leftover token when the prompt was not a multiple of `PREFILL_CHUNK`.
-0. **ffn (61% of the 27B's decode) is at its format's floor; the lever is the format, not the
-   kernel.** 17.1 Gweights/token cost 3.74 GB in PTQ1_0 and take 244 ms at the measured 70.2 Gw/s
-   (12 workers, DRAM-streaming shape) against 258-281 ms measured. Q2_0 prices the same weights at
-   243 ms (more bytes, same LUT-class rate) and a 5-level bitplane variant would land near 8-10
-   Gw/s, so neither is worth building. The one real win is a 27B ffn in the Q1_0 layout:
-   2.41 GB at 165 Gw/s = 104 ms, token 430 -> ~275 ms — no kernel work, but it needs an artifact
-   re-quantized from source plus a quality check, since Q1_0 drops the 5-level ternary.
-   Everything behind that number is in BUG_TRACKER's "What is left in the 27B's ffn" entry.
-
-## Open inference items (most valuable first)
-
-0. **Parallelize `matvec_dense` over rows — the one measured waste left in the 27B's gdn/attn.**
-   `ssm_alpha`/`ssm_beta` are f32 (1.92 MiB per GDN layer) and are dotted on one thread: 96.5 MB
-   per token at 4.6 GB/s, 21 ms, 13% of the stage. Rows are independent dots in ascending `c`, so
-   a pool over the 48 rows is bit-identical. Worth ~18 ms/token (4%) — the scan, by contrast, was
-   measured at 8.5 ms and is not worth touching. Context: the stage's projections already run at
-   77-85% of the ceiling for *their* matmul size (6.7-11.2 MiB reads 13.8-15.3 GB/s in
-   `kernel-bench`, against 16.2 at 140 MiB), so do not go looking for a stage-sized gap there.
-
-1. **The scan is still the biggest stage after the FFN** — 161-169 of 436-451 ms/token
+1. **The 27B's ffn has ~30-50 ms of decode-side dispatch overhead, and that is the next fix.**
+   17.1 Gweights/token = 3.74 GB streams as one pass in 228.5 ms (16.28 GB/s, 74.4 Gw/s), decode
+   takes 258-281, paired prefill takes 226.6 per token, and `HEARTH_Q35_NOPAIR=1` prefill
+   reproduces decode at 277-287. The split is dispatches per token: 192 -> 258-287 ms, 96 -> 226.6,
+   1 -> 228.5, i.e. ~0.45 ms on each dispatch against 1.19 ms of work. So fuse gate+up into one
+   pool pass per layer (192 -> 128, ~29 ms) and/or stop the pool parking across the silu/gating gap
+   before `down`; target 228.5 ms on the `ffn` row, both byte-identical. The Q1_0 layout would price
+   the same weights at 104 ms but needs a re-quantized 27B and a quality check, so it stays the
+   bigger blocked option. Numbers and dead ends: BUG_TRACKER's "What is left in the 27B's ffn".
+2. **The scan is still the biggest stage after the FFN** — 161-169 of 436-451 ms/token
    prefill, and 210-224 ms of ~590 decode, against 258 for the FFN. Layout and head split
    are done: `GdnState` is `[j][i]` per head and `gdn_scan_heads` runs the 48 heads across the
    pool, worth 1.57x on the prefill stage and 1.14-1.31x end to end. What remains is not the
@@ -118,26 +108,26 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    aggregate, so suspect the dispatch cadence (one `par_for` per GDN layer, ~48/token on top
    of ~450 matmul dispatches) and an L2-resident working set. Count bytes per layer against
    dispatches before changing anything.
-2. **aarch64 has no SIMD backend**; every kernel is the scalar fallback. NEON first suits
+3. **aarch64 has no SIMD backend**; every kernel is the scalar fallback. NEON first suits
    the `Q2V_U8` LUT dot (`vqtbl`) and the f32 glue in `ops.rs`. Needs a real ARM runner
    before any number means anything.
-3. **Worker counts follow the path** — dense = `physical`; hybrid `Q2_0`/`PQ2_0` =
+4. **Worker counts follow the path** — dense = `physical`; hybrid `Q2_0`/`PQ2_0` =
    `physical + physical/4`; hybrid `PTQ1_0` = ¾ logical. `HEARTH_THREADS` overrides. Judge a
    count on its **spread** (`scripts/count-sweep.py`), not its mean.
-4. **Speculative decoding: measure acceptance `a` first.** The 27B's decode is ~650 ms/token
+5. **Speculative decoding: measure acceptance `a` first.** The 27B's decode is ~650 ms/token
    and the 2B's ~50 ms, but 3 of every 4 `qwen35` layers are recurrent, so a rejected draft
    must rewind conv+SSM state, not just a KV cache.
-5. **Paired prefill is done; do not re-derive the split.** `forward_pair` pairs every
+6. **Paired prefill is done; do not re-derive the split.** `forward_pair` pairs every
    projection (mix, `ssm_out`, `attn_output`, FFN) and runs `gdn_scan`/`attn_scan` per token
    in order, which is why the output is bit-identical. `HEARTH_Q35_NOPAIR=1` reverts.
    `gdn_out_q8` holds the grouped-order Hadamard permutation for `ssm_out`, and the whole
    per-token FFN exists once in `ffn_block` (called with `rows = 1` from `forward`, `rows =
    PREFILL_CHUNK` from `forward_pair`), so do not reintroduce a second copy of it.
-6. **Kernel rules that made past fixes findable**: a `#[target_feature]` body names every
+7. **Kernel rules that made past fixes findable**: a `#[target_feature]` body names every
    feature it uses and its dispatch gate names the same set; `.cargo/config.toml` pins
    `x86-64-v3` and must not drop below what any dispatched body uses. A new quant format
    needs `kernel_name()` and a `selected_kernel` arm once it has two implementations.
-7. **GPU scaffolding: still not started** (opt-in via `--device`/env, graceful without a
+8. **GPU scaffolding: still not started** (opt-in via `--device`/env, graceful without a
    ROCm device, must not break the CPU path or Windows/macOS builds).
 
 ## Goal 2 (UI / docs / downloader)
