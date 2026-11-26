@@ -114,10 +114,16 @@ inconvenience — it is a cliff.
 
 *Can the repo produce it?* No, not as shipped: `hearth-gguf` parses only (no writer) and
 `hearth_quant::quantize_f32` covers Q8_0 and F32, so there is no Q1_0 quantizer outside
-`hearth-compute`'s `#[cfg(test)]` helper. `crates/hearth-llm/examples/requant_ffn.rs` now does it
-without a writer: copy the file, rewrite each ffn payload at its existing offset with 18-byte Q1_0
-blocks, patch that tensor's dtype id 143 -> 43, leaving every other offset valid (the region tail
-keeps stale bytes no reader looks at).
+`hearth-compute`'s `#[cfg(test)]` helper. Measuring this needed a throwaway converter, and it is
+**not in the tree** — the number is what was wanted, and 300 lines of GGUF header walking would rot
+against a parser that already exists:
+
+> Recipe (git has the working version at `1c9f5ef`, `examples/requant_ffn.rs`): copy the GGUF, walk
+> the header to each `ffn_*` tensor, dequantize its PTQ1_0 rows with `hearth_quant::dequantize`, then
+> requantize each 128-element block to an f16 **mean-abs** scale plus 16 sign bytes, write the 18
+> bytes/128 payload at that tensor's existing offset, and patch the tensor's dtype id 143 -> 43. Every
+> other offset stays valid because regions keep their extent and byte length comes from dtype+shape;
+> the region tail keeps stale bytes no reader looks at.
 
 *What the drop costs* (9B hybrid, ffn only, 96 tensors, 11.0 -> 7.1 MB each):
 

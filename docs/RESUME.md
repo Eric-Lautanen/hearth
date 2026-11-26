@@ -99,6 +99,10 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    is sub-timers *inside* the bucket — silu/gating over 17408 values per layer, the two per-layer
    activation quantizations, and 19.5 MB tensors read one dispatch at a time out of a 5.4 GB mmap
    instead of one contiguous 3.74 GB pass. Measure before changing.
+   The Q1_0 ffn lever is *priced and blocked*, not open: no writer or Q1_0 quantizer ships, and the
+   throwaway converter that measured it is in history at `1c9f5ef`, not in the tree — do not re-add
+   one unless the answer changes. A 9B with ffn in 1-bit loses the 32.8% of weights that are exact
+   zeros for relL2 0.575 and then answers with EOS, so it needs a 27B made 1-bit from source.
 2. **The scan is still the biggest stage after the FFN** — 161-169 of 436-451 ms/token
    prefill, and 210-224 ms of ~590 decode, against 258 for the FFN. Layout and head split
    are done: `GdnState` is `[j][i]` per head and `gdn_scan_heads` runs the 48 heads across the
