@@ -22,6 +22,30 @@ pub enum GgufError {
     UnexpectedEof(usize),
     #[error("Unknown dtype id {0} for tensor {1}")]
     UnknownDtype(u32, String),
+    #[error(
+        "tensor layout mismatch on {name}: the file gives it {actual} bytes but {dtype} {shape} needs \
+         {expected}, so the file stores {actual_per_block} bytes per {block}-element block where \
+         {dtype} assumes {expected_per_block}. Decoding it would misalign every block after the \
+         first, so this file is refused rather than run."
+    )]
+    TensorLayoutMismatch {
+        name: String,
+        dtype: &'static str,
+        shape: String,
+        expected: usize,
+        actual: u64,
+        block: usize,
+        expected_per_block: usize,
+        actual_per_block: f64,
+    },
+    #[error("tensor {name} is truncated: {actual} bytes remain after offset {offset} but {dtype} needs {expected}")]
+    TensorTruncated {
+        name: String,
+        dtype: &'static str,
+        offset: u64,
+        expected: usize,
+        actual: u64,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -125,6 +149,71 @@ fn read_meta_value(data: &[u8], pos: &mut usize, type_id: u32) -> Result<MetaVal
     })
 }
 
+/// Every tensor occupies the gap between its own offset and the next tensor's, padded to
+/// `alignment`. If a file lays its blocks out at a different width than its dtype claims — a
+/// `Q2_0` pack written at 36 bytes per 128-element block, say — the first block of each tensor
+/// still decodes and every block after it is read from the wrong place, so the model runs at full
+/// speed and emits well-shaped garbage. The arithmetic is cheap, so check it before decoding.
+fn verify_tensor_layout(
+    tensors: &[TensorInfo],
+    file_len: u64,
+    data_offset: u64,
+    alignment: u64,
+) -> Result<(), GgufError> {
+    let mut order: Vec<usize> = (0..tensors.len()).collect();
+    order.sort_by_key(|&i| tensors[i].offset);
+
+    for pair in order.windows(2) {
+        let (cur, next) = (&tensors[pair[0]], &tensors[pair[1]]);
+        check_tensor_stride(cur, next.offset - cur.offset, alignment)?;
+    }
+
+    if let Some(&last) = order.last() {
+        let info = &tensors[last];
+        let start = data_offset + info.offset;
+        let available = file_len.saturating_sub(start);
+        let expected = info.byte_size() as u64;
+        if expected > 0 && available < expected {
+            return Err(GgufError::TensorTruncated {
+                name: info.name.clone(),
+                dtype: info.dtype.name(),
+                offset: start,
+                expected: expected as usize,
+                actual: available,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn check_tensor_stride(info: &TensorInfo, gap: u64, alignment: u64) -> Result<(), GgufError> {
+    let elems = info.element_count() as usize;
+    let expected = info.byte_size();
+    if elems == 0 || expected == 0 {
+        return Ok(());
+    }
+
+    // Writers pad each tensor up to the file's alignment, so the gap is the tensor's own size or
+    // up to one alignment step more than it — never less.
+    let slack = gap as i64 - expected as i64;
+    if (0..alignment as i64).contains(&slack) {
+        return Ok(());
+    }
+
+    let block = info.dtype.block_size();
+    Err(GgufError::TensorLayoutMismatch {
+        name: info.name.clone(),
+        dtype: info.dtype.name(),
+        shape: format!("{:?}", info.shape),
+        expected,
+        actual: gap,
+        block,
+        expected_per_block: info.dtype.block_bytes(),
+        actual_per_block: gap as f64 * block as f64 / elems as f64,
+    })
+}
+
 pub struct GgufFile {
     mmap: Arc<Mmap>,
     pub version: u32,
@@ -206,6 +295,8 @@ impl GgufFile {
         } else {
             pos as u64
         };
+
+        verify_tensor_layout(&tensors, data.len() as u64, data_offset, alignment)?;
 
         Ok(GgufFile {
             mmap,

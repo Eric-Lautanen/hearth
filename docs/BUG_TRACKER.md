@@ -3,6 +3,32 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### A tensor stride no longer has to be trusted: mismatched packs are refused at load (2026-11-26)
+
+`GgufFile::open` now checks every tensor's real footprint against what its dtype claims, so the
+`Q2_0` case above fails to load instead of decoding at speed. For each tensor, in offset order, the
+gap to the next tensor's offset is the tensor's own length plus at most one alignment step of
+padding; anything else is a layout the decoder would misread, and the error names the tensor, its
+dtype and shape, both sizes, and both bytes-per-block figures:
+
+```
+Failed to load model: GGUF: tensor layout mismatch on output.weight: the file gives it 357580800
+bytes but Q2_0 [5120, 248320] needs 337715200, so the file stores 36 bytes per 128-element block
+where Q2_0 assumes 34. Decoding it would misalign every block after the first, so this file is
+refused rather than run.
+```
+
+The last tensor in offset order is bounded against the file length as well, which is a
+truncation check rather than a stride one. Tensors are sorted by offset before comparing, because
+GGUF does not require the tensor list to be in file order, and zero-element tensors are skipped.
+
+Checked: the guard fires on the 2.5 27B `Q2_0` pack through both the CLI and `dump_gguf`, and all
+sixteen other packs in `models/` still load — six dense (`Q1_0` ×3, `Q2_0` ×3) and ten hybrid
+(`PTQ1_0` ×5, `PQ2_0` ×5) — including the ones whose tightest tensors are exactly
+`byte_size % 32 != 0`, so the padding allowance is doing its job. `cargo test --workspace` is green
+(357 tests). Greedy output is untouched: the check runs once at load and never touches the decode
+path.
+
 ### The 2.5 27B `Q2_0` pack downloads clean and decodes at 2.1 tok/s of garbage (2026-11-26)
 
 Both 2.5 packs that were missing are now on disk and byte-exact against the catalog
@@ -57,11 +83,9 @@ this bug, and changing the rotation would have broken the two packs that work. D
 are unaffected because their packs really are 34 bytes per 128 — the dtype id alone does not
 distinguish the two encodings, which is the hazard.
 
-**What to do.** Either implement the 36-byte layout or, first, refuse it: a load-time check that each
-tensor's stride (the next tensor's offset minus its own, per 128 elements) matches what
-`dtype.byte_size(shape)` implies would have named this instead of emitting `!`. Until then the pack is
-dangerous in a way the stale-README problem was not: it loads, runs at speed, and reports a plausible
-token count.
+**Resolved** by the entry above: the pack is now refused at load, before any tensor is decoded. What
+remains is the other half — implementing the 36-byte layout, if this pack is worth supporting at all
+(wider blocks mean more bytes read per token, so it would not be faster than `PQ2_0`).
 
 
 ### Full re-baseline: all 15 packs (2026-11-26)

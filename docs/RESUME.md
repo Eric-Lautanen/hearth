@@ -44,16 +44,15 @@ session — so compare the model you changed, and use alternating pairs, never t
    downstream is width-agnostic (scans stay per token, scratch is sized from the constant), so it is
    a one-line change plus identity and timing runs. If the 1 MB tile is not actually resident, the
    number will be flat or worse — measure.
-3. **Refuse (or implement) the 2.5 `Q2_0` pack: it is a 36-byte-per-128 layout Hearth reads as 34.**
-   Measured, not hypothesised: the tokenizer is identical to the working packs (same SHA over
-   248,320 tokens and 247,587 merges, and `!` is id 0 in all), the hidden state is already 11,718x
-   too large straight out of the embedding dequant (`emb_raw` 132.0 against 0.0113), and the tensor
-   table steps 36 bytes per 128 elements where `hearth-quant/src/q2_0.rs` hard-codes
-   `BLOCK_BYTES = 34`. Only block 0 lines up, which is why the first bytes match and the output does
-   not. An earlier guess in the tracker blamed the Hadamard metadata; that was wrong — do not
-   "fix" the rotation, it would break the packs that work. The cheap remedy is a load-time stride
-   check (next tensor offset minus this one, per 128 elements, against `dtype.byte_size(shape)`),
-   which turns silent garbage into a named error.
+3. **The 2.5 `Q2_0` pack is now refused at load; supporting it means implementing the 36-byte layout.**
+   `GgufFile::open` verifies that each tensor's real footprint (the gap to the next offset, allowing
+   one alignment step of padding) matches `dtype.byte_size(shape)`, so this pack fails with a named
+   error — `tensor layout mismatch on output.weight: … the file stores 36 bytes per 128-element block
+   where Q2_0 assumes 34` — instead of decoding at 2.15 tok/s of `!`. All sixteen other packs load
+   unchanged, and the check is load-only, so greedy output is untouched. If the pack is ever wanted,
+   the work is a second `Q2_0` layout at 36 bytes per 128 elements; it would not be faster than
+   `PQ2_0`, since wider blocks mean more bytes read per token. Do not "fix" the Hadamard rotation —
+   an earlier guess in the tracker blamed it and that was wrong.
 4. **Tool calling is the next template gap, and it is unchecked.** The 2.5 template's `tools` branch
    (`|tojson`, `tool_call.function`, `{% for k, v in …|items %}`, the `<tool_call>` XML format)
    parses, but no fixture exercises it: `TemplateContext` has no `tools` field. Before wiring tools

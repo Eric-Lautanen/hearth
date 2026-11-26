@@ -68,8 +68,9 @@ at that rate but its output is wrong** (a run of `!` for every prompt). Its tens
 are laid out at 36 bytes per 128 elements where Hearth's `Q2_0` reads 34, so every
 block after the first is misaligned — the tokenizer and the first block are
 identical to the working `PQ2_0` pack's, which is what made it look like a weights
-problem. Tracked in `docs/BUG_TRACKER.md`; treat the row as the speed of a pack
-Hearth cannot decode, not as a usable model. The 27B runs at ~2 tok/s, so raise `--max-tokens`
+problem. Hearth now refuses the pack at load rather than decoding it, so the rate is
+a record of what it used to do, not something you can reproduce. Tracked in
+`docs/BUG_TRACKER.md`. The 27B runs at ~2 tok/s, so raise `--max-tokens`
 deliberately — the UI streams progress and reasoning live instead of buffering a
 reply. Raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md).
 
