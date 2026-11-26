@@ -87,7 +87,10 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    byte-identical), the PTQ1_0 decode is 16 lanes wide, and the scan measures 8.5-9.7 ms with
    nothing to win without changing summation. What remains in the stage is size-limited matmul
    throughput: 6.7-11.2 MiB projections read 77-85% of the ceiling for their own size, so a stage
-   number below `kernel-bench`'s 140 MiB headline is expected rather than a leak.
+   number below `kernel-bench`'s 140 MiB headline is expected rather than a leak. The split also
+   pays on prefill (per prompt token: `gdn gates` 19.4 -> 3.0 ms on the 27B, 5.2 -> 0.9 on the 9B;
+   prefill -6.1% per token on the 27B), and both prefill paths now time the call — before that the
+   row only caught the leftover token when the prompt was not a multiple of `PREFILL_CHUNK`.
 
 ## Open inference items (most valuable first)
 

@@ -1740,12 +1740,16 @@ impl Qwen35Core {
                     if layer == 0 {
                         dump_layer0(pos + i, "linear_attn_qkv_mixed-0", &sc.qkv);
                     }
+                    let t_gates = self.timers_on.then(std::time::Instant::now);
                     self.gdn_alpha_beta(
                         lyr,
                         &sc.chunk_normed[i * d..(i + 1) * d],
                         &mut sc.abuf,
                         &mut sc.bbuf,
                     )?;
+                    if let Some(t) = t_gates {
+                        sc.timers.gates_us += t.elapsed().as_micros();
+                    }
                     self.gdn_scan(layer, pos + i, lyr, sc, caches)?;
                     sc.chunk_mix[i * v_dim..(i + 1) * v_dim].copy_from_slice(&sc.normed_out);
                 }
@@ -1916,17 +1920,21 @@ impl Qwen35Core {
     }
 
     /// `ssm_alpha` / `ssm_beta`: dense f32 weights, `dt_rank` rows of `d_model`
-    /// (48 x 5120 on the 27B, 960 KiB each), so they stay serial matvecs on both
-    /// prefill paths.
+    /// (48 x 5120 on the 27B, 960 KiB each).
     ///
     /// They are not free, whatever their size next to a folded projection
-    /// suggests: two of these per GDN layer push 96.5 MB of f32 through one
-    /// thread every token, measured at 21 ms of the 164 ms `gdn/attn` stage —
-    /// 4.6 GB/s, a third of what the quantized projections beside them read. An
-    /// earlier version of this comment called them 32k MACs, "below the noise of
-    /// the weight pass"; the `gdn gates` row of `HEARTH_Q35_TIMERS` says 21 ms.
-    /// Parallelizing over the 48 rows would be bit-identical and is the obvious
-    /// next lever in this stage.
+    /// suggests: two of these per GDN layer push 96.5 MB of f32 per token, which
+    /// on one thread was 21 ms of the 164 ms `gdn/attn` stage — 4.6 GB/s, a third
+    /// of what the quantized projections beside them read. An earlier version of
+    /// this comment called them 32k MACs, "below the noise of the weight pass";
+    /// the `gdn gates` row of `HEARTH_Q35_TIMERS` says 21 ms. `matvec_dense` now
+    /// splits the rows across the pool, which brought that row to 3-4 ms and the
+    /// stage to 139 ms.
+    ///
+    /// Both prefill paths come through here too — once per token of the chunk for
+    /// the paired path — so the `gdn gates` timer wraps this call in each place it
+    /// is made. Before that, prefill only reported the odd leftover token that fell
+    /// through to `gdn_layer`, which made the row look like 0.1% of the stage.
     fn gdn_alpha_beta(
         &self,
         lyr: &Layer,

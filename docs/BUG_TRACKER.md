@@ -3,6 +3,36 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Prefill pays the same matvec: `gdn gates` 5-7x faster per prompt token (2026-11-25)
+
+`matvec_dense` runs once per prompt token as well as per decode token, and the row split was
+committed on decode numbers alone, so prefill was measured separately. That turned up an
+instrumentation gap before it turned up a speedup: the prefill chunk loop called `gdn_alpha_beta`
+untimed, so the `gdn gates` row only ever counted the odd leftover token that falls through to
+`gdn_layer` (5269 us for a 47-token prompt — exactly the 5305 us one decode token costs). Both paths
+time the call now.
+
+47-token prompt, two rounds each, before = `c9083d7`:
+
+| | prefill ms/token | gdn gates | gates/token | gdn/attn | ffn (control) |
+| --- | --- | --- | --- | --- | --- |
+| 2-9B before | 122.03 / 115.95 | 246.5 / 240.6 ms | 5.24 / 5.12 | 2168.7 / 2016.0 | 3188.1 / 3071.5 |
+| 2-9B after | 110.52 / 115.98 | **39.2 / 51.5 ms** | **0.83 / 1.10** | 1783.3 / 1882.6 | 3048.0 / 3206.8 |
+| 27B before | 377.56 / 378.57 | 911.0 / 915.5 ms | 19.38 / 19.48 | 6635.4 / 6667.8 | 10651.8 / 10668.0 |
+| 27B after | 365.96 / 355.38 | **147.6 / 123.1 ms** | **3.14 / 2.62** | 5922.9 / 5710.0 | 10815.2 / 10543.0 |
+
+- The matvec is 5-6x faster per prompt token: 9B 5.2 -> 0.9 ms, 27B 19.4 -> 3.0 ms.
+- The stage follows: 27B `gdn/attn` drops 12-16%, 9B 7-18%.
+- Prefill per token: 27B **-6.1%** in the round whose control moved least (`ffn` within 1.2%),
+  -4.5% in the other; 9B -4 to -5% after normalising for its `ffn` drift. `ffn` is the control and
+  tracks the machine, not the change.
+- Prefill converts a bit more than the gates row accounts for: on the 27B the row saves 16.9 ms/token
+  against 23.2 ms/token of prefill. The remainder is the pool no longer going cold between a serial
+  matvec and the batched projection that follows it — a smaller effect, and not separately measured.
+
+So the row split is worth roughly the same per token on both sides of the prompt boundary, and the
+prefill gain is 4-6% of a path where `ffn` is already 57% and the projections are size-limited.
+
 ### `matvec_dense` split over the pool: `gdn gates` 20 ms -> 3-4 ms (2026-11-25)
 
 The sub-stage timers found the one genuinely slow thing in the 27B's `gdn/attn`: `ssm_alpha`/
