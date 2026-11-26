@@ -6,10 +6,12 @@ description = "GGUF file parser"
 
 [dependencies]
 memmap2 = { workspace = true }
-half = { workspace = true }
-hearth-core = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 # `examples/inspect_embed.rs` dequantizes a row to cross-check the GPU path.
 hearth-quant = { workspace = true }
+# `examples/inspect_q1_0.rs` reads an f16 scale out of a block header. The
+# library itself never touches f16, so `half` is a dev-dependency: as a normal
+# dependency it is what `cargo::unused_dependencies` flags in a plain build.
+half = { workspace = true }

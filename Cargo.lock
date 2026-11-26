@@ -378,7 +378,6 @@ name = "hearth-gguf"
 version = "0.3.0"
 dependencies = [
  "half",
- "hearth-core",
  "hearth-quant",
  "memmap2",
  "thiserror",

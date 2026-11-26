@@ -334,10 +334,13 @@ jobs:
             progress, and it lands in the `models/` folder next to the app.
             Reinstalling or upgrading keeps it.
 
-            **arm64 note.** Every SIMD kernel in the engine currently dispatches
-            to avx2/avx512 on x86-64 and to the scalar fallback elsewhere, so the
-            arm64 builds are correct but not yet tuned. The x86-64 builds are the
-            fast ones.
+            **arm64 note.** The vectorized kernels split in two. The elementwise
+            ones (rms_norm, silu, softmax) and the 4-bit/5-bit dot products are
+            written in portable SIMD, so they run on NEON on arm64. The rest -
+            the 1-bit/2-bit dot products, the Hadamard rotation and the Q8
+            activation quantize - are x86-64 kernels (AVX2/AVX-512) and fall back
+            to the scalar reference on arm64. The arm64 builds are correct but not
+            yet tuned; the x86-64 builds are the fast ones.
 
             **Signed builds.** When the repository has its signing secrets set,
             the Windows executables and the MSI are Authenticode-signed and the

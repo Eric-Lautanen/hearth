@@ -7,6 +7,11 @@ description = "GPU compute backend via wgpu/WGSL for hearth-llm"
 [dependencies]
 hearth-gguf = { workspace = true }
 wgpu = "29"
-pollster = "0.4"
 bytemuck = { workspace = true }
 half = { workspace = true }
+
+[dev-dependencies]
+# `pollster::block_on` is how the GPU tests wait for a device; the library
+# itself never blocks on one, so this is a dev-dependency rather than a
+# dependency the library does not use.
+pollster = "0.4"

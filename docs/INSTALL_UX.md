@@ -27,10 +27,11 @@ downloader fills it) and the README. No admin rights needed anywhere.
 
 ### Windows — zip **and MSI**, both shipping
 
-- `hearth-v0.2.0-windows-x86_64.zip`: `hearth-ui.exe`, `hearth-chat-cli.exe`,
+- `hearth-vX.Y.Z-windows-x86_64.zip` (the current release: `v0.3.0`):
+  `hearth-ui.exe`, `hearth-chat-cli.exe`,
   `models/README.txt`, `README.md`, both licenses. Unzip anywhere and
   double-click `hearth-ui.exe`.
-- `hearth-v0.2.0-windows-x86_64.msi` (`packaging/windows/hearth.wxs`): the same
+- `hearth-vX.Y.Z-windows-x86_64.msi` (`packaging/windows/hearth.wxs`): the same
   payload, per-user (`%LOCALAPPDATA%\Programs\Hearth`) with no UAC prompt, a
   Start-menu folder, an optional Desktop shortcut, an Add/Remove Programs entry,
   and a launch-on-finish checkbox. Built and verified end to end on Windows 11 —
