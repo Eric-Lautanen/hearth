@@ -46,47 +46,28 @@ use crate::pool::{BatchedDotRowsParams, ParForFn, ThreadPool};
 // Hadamard transform
 // ---------------------------------------------------------------------------
 
-/// Normalized Sylvester Walsh-Hadamard: H[i][j] = s * (-1)^popcount(i & j),
-/// s = 1/sqrt(n). In-place butterfly, O(n log n).
 /// Prompt tokens per batched prefill pass.
 ///
-/// Two is the width the paired dot kernels implement (`dot_*_q8_0x2_ptr`): one
-/// weight-row expansion serves both activations, and every format the hybrids
-/// ship has one (PTQ1_0, PQ2_0/Q2_0, Q1_0_G128), each falling back to two single
-/// calls on targets without the SIMD arm. A wider chunk would need an x4 kernel,
-/// and that variant measured 3.2x slower than the x2 path when it was tried; the
-/// scratch buffers are sized from this constant, so raising it is a real change
-/// to the prefill, not a tuning knob.
+/// Four rows, two pairs. The paired dot kernels (`dot_*_q8_0x2_ptr`) take two
+/// rows at a time, so a pass over four activations still expands each weight row
+/// twice — but `pool::batched_rows_chunk` walks the weights in 1 MB tiles with
+/// the token loop *inside* the tile, so the second pair re-reads the tile the
+/// first pair just filled instead of going back to DRAM. Every format the
+/// hybrids ship has a paired kernel (PTQ1_0, PQ2_0/Q2_0, Q1_0_G128, Q2_0G64),
+/// each falling back to two single calls on targets without the SIMD arm.
+///
+/// The scratch buffers are sized from this constant and everything downstream is
+/// width-agnostic (the scans stay per token, `ffn_block` takes `rows`), which is
+/// why this is a constant and not a knob: raising it changes prefill only.
 ///
 /// Every projection whose input is a per-token activation uses it — the mix block
 /// (qkv, z gate, q/k/v), `ssm_out`, the attention output and the FFN — while the
 /// ordered state (conv/scan, KV append) stays one token at a time.
-const PREFILL_CHUNK: usize = 2;
+const PREFILL_CHUNK: usize = 4;
 
 /// Q8_0 row width: 32-element blocks of a 2-byte scale plus 32 signed bytes.
 fn q8_size(dim: usize) -> usize {
     dim.div_ceil(32) * 34
-}
-
-fn walsh_hadamard_in_place(x: &mut [f32]) {
-    let n = x.len();
-    debug_assert!(n.is_power_of_two());
-    let s = 1.0 / (n as f32).sqrt();
-    let mut h = 1usize;
-    while h < n {
-        for i in 0..n {
-            if i & h == 0 {
-                let a = x[i];
-                let b = x[i | h];
-                x[i] = a + b;
-                x[i | h] = a - b;
-            }
-        }
-        h <<= 1;
-    }
-    for v in x.iter_mut() {
-        *v *= s;
-    }
 }
 
 /// In-place transform of `x`: multiply by the per-element sign vector (when
@@ -94,16 +75,13 @@ fn walsh_hadamard_in_place(x: &mut [f32]) {
 /// Forward fold transform `R = D·H`: sign pass first, then the normalized WHT
 /// per block. This is what quantized weight rows were folded by, so activations
 /// feeding those weights are rotated the same way.
+///
+/// The kernel is `hearth_quant::hadamard`: the normalized Sylvester
+/// Walsh-Hadamard `H[i][j] = s * (-1)^popcount(i & j)`, `s = 1/sqrt(n)`, in an
+/// in-place butterfly of O(n log n), plus the sign pass. It has an AVX2 path
+/// that is bit-identical to the scalar one it replaced.
 fn hadamard_rotate(x: &mut [f32], signs: Option<&[f32]>, block_size: usize) {
-    if let Some(sgn) = signs {
-        debug_assert_eq!(sgn.len(), x.len());
-        for (v, s) in x.iter_mut().zip(sgn.iter()) {
-            *v *= s;
-        }
-    }
-    for chunk in x.chunks_exact_mut(block_size) {
-        walsh_hadamard_in_place(chunk);
-    }
+    hearth_quant::hadamard::rotate_in_place(x, signs, block_size);
 }
 
 /// Debug aid: with `HEARTH_DUMP_TENSORS=<dir-or-prefix>` set, layer-0 activations
@@ -126,15 +104,7 @@ fn dump_layer0(pos: usize, name: &str, buf: &[f32]) {
 /// must apply `R⁻¹` — the opposite order from `hadamard_rotate`. Verified
 /// bit-exact (cos = 1.000000) against the reference fork's `attn_norm-0` dump.
 fn hadamard_unrotate(x: &mut [f32], signs: Option<&[f32]>, block_size: usize) {
-    for chunk in x.chunks_exact_mut(block_size) {
-        walsh_hadamard_in_place(chunk);
-    }
-    if let Some(sgn) = signs {
-        debug_assert_eq!(sgn.len(), x.len());
-        for (v, s) in x.iter_mut().zip(sgn.iter()) {
-            *v *= s;
-        }
-    }
+    hearth_quant::hadamard::unrotate_in_place(x, signs, block_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -1400,9 +1370,10 @@ impl Qwen35Core {
                 hearth_quant::dot_q2_0_q8_0_ptr,
                 Some(hearth_quant::dot_q2_0_q8_0x2_ptr),
             ),
-            // No paired-token kernel for the 64-element layout yet: prefill walks the two
-            // activation rows one at a time, which is correct and re-reads the weights.
-            GgmlDType::Q2_0G64 => (hearth_quant::dot_q2_0_g64_q8_0_ptr, None),
+            GgmlDType::Q2_0G64 => (
+                hearth_quant::dot_q2_0_g64_q8_0_ptr,
+                Some(hearth_quant::dot_q2_0_g64_q8_0x2_ptr),
+            ),
             GgmlDType::Q1_0 | GgmlDType::Q10G128 => (
                 hearth_quant::dot_q1_0g128_q8_0_ptr,
                 Some(hearth_quant::dot_q1_0g128_q8_0x2_ptr),
@@ -1473,8 +1444,8 @@ impl Qwen35Core {
     /// single-token buffers, `forward_pair` with `PREFILL_CHUNK` rows on the chunk
     /// buffers, and nothing inside branches on which one called it. Each row is
     /// normed and quantized on its own; the weight passes are shared whenever more
-    /// than one row arrives, because `mm_batched` hands the pool two rows at a time
-    /// (`PREFILL_CHUNK = 2`) and the pool expands each weight row once for them.
+    /// than one row arrives, because `mm_batched` hands the pool the whole chunk
+    /// and the pool pairs the rows inside an L2-sized weight tile.
     fn ffn_block(
         &self,
         lyr: &Layer,

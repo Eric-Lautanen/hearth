@@ -1,3 +1,4 @@
+pub mod hadamard;
 pub mod pq2_0;
 pub mod ptq1_0;
 pub mod q1_0g128;
@@ -41,6 +42,32 @@ pub(crate) fn avx512_full_width() -> bool {
     );
     STATE.store(if ok { 1 } else { 0 }, Ordering::Relaxed);
     ok
+}
+
+/// Whether this CPU has AVX2.
+///
+/// The kernels that need it are dispatched per call. `is_x86_feature_detected!`
+/// caches the feature bits in a static, so this is a relaxed atomic load and
+/// a bit test on the hot path - cheap enough to call per row.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn avx2_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx2")
+}
+
+/// Whether `HEARTH_QUANT_SCALAR=1` turns the vector paths off.
+///
+/// The switch exists so a before/after pair can be measured from **one**
+/// binary: the scalar path is the reference implementation the vector paths
+/// are proven byte-equal to (see the `q8_0` and `hadamard` unit tests), so
+/// `HEARTH_QUANT_SCALAR=1` is the "before" arm and the default is the "after"
+/// arm. That keeps an A/B from needing two builds, and keeps the comparison
+/// inside one binary instead of across two checkouts.
+///
+/// Read once: `std::env::var_os` takes a process-wide lock on Windows, and
+/// this is consulted on every quantized row.
+pub(crate) fn scalar_only() -> bool {
+    static SCALAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SCALAR.get_or_init(|| std::env::var_os("HEARTH_QUANT_SCALAR").is_some_and(|v| v != "0"))
 }
 
 /// One f16 scale → f32, for kernels that declare `f16c` themselves.
@@ -314,6 +341,20 @@ pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) ->
 /// w_ptr valid for n/64*18 bytes, a_ptr valid for n/32*34 bytes.
 pub unsafe fn dot_q2_0_g64_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     q2_0_g64::dot_q2_0_g64_q8_0_ptr(w_ptr, a_ptr, n)
+}
+
+/// Paired-token Q2_0G64 dot: one weight row against two Q8_0 activation rows,
+/// sharing the LUT expansion. Output is bit-identical to two calls to
+/// [`dot_q2_0_g64_q8_0_ptr`].
+/// # Safety
+/// w_ptr valid for n/64*18 bytes, a0_ptr and a1_ptr each valid for n/32*34 bytes.
+pub unsafe fn dot_q2_0_g64_q8_0x2_ptr(
+    w_ptr: *const u8,
+    a0_ptr: *const u8,
+    a1_ptr: *const u8,
+    n: usize,
+) -> (f32, f32) {
+    q2_0_g64::dot_q2_0_g64_q8_0x2_ptr(w_ptr, a0_ptr, a1_ptr, n)
 }
 
 /// Paired-token Q2_0 dot: one weight row against two Q8_0 activation rows,
