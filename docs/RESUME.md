@@ -91,6 +91,14 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    pays on prefill (per prompt token: `gdn gates` 19.4 -> 3.0 ms on the 27B, 5.2 -> 0.9 on the 9B;
    prefill -6.1% per token on the 27B), and both prefill paths now time the call — before that the
    row only caught the leftover token when the prompt was not a multiple of `PREFILL_CHUNK`.
+0. **ffn (61% of the 27B's decode) is at its format's floor; the lever is the format, not the
+   kernel.** 17.1 Gweights/token cost 3.74 GB in PTQ1_0 and take 244 ms at the measured 70.2 Gw/s
+   (12 workers, DRAM-streaming shape) against 258-281 ms measured. Q2_0 prices the same weights at
+   243 ms (more bytes, same LUT-class rate) and a 5-level bitplane variant would land near 8-10
+   Gw/s, so neither is worth building. The one real win is a 27B ffn in the Q1_0 layout:
+   2.41 GB at 165 Gw/s = 104 ms, token 430 -> ~275 ms — no kernel work, but it needs an artifact
+   re-quantized from source plus a quality check, since Q1_0 drops the 5-level ternary.
+   Everything behind that number is in BUG_TRACKER's "What is left in the 27B's ffn" entry.
 
 ## Open inference items (most valuable first)
 

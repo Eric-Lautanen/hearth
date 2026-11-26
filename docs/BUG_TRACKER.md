@@ -3,6 +3,49 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### What is left in the 27B's ffn: nothing in PTQ1_0, 155 ms in the format (2026-11-25)
+
+ffn is 61% of the 27B's decode (258-281 ms of 430) and 71% of the weight traffic. Priced against
+the stage's own byte count and each format's rate at the same tensor shape, all of that time is
+the format's floor.
+
+27B shape: 64 layers x 3 tensors (gate/up/down) x 17408 x 5120 = **17.1 Gweights**, which is
+**3.74 GB** in PTQ1_0. Rates measured with `kernel-bench` at the ffn tensor's own shape
+(17408 x 5120 = 19.5 MB) and at a 78 MB shape that streams from DRAM the way a 3.74 GB pass does:
+
+| format | B/weight | 1 thread | 12 threads, 19.5 MB | 12 threads, 78 MB |
+| --- | --- | --- | --- | --- |
+| PTQ1_0 (shipped) | 0.219 | 1.98-2.08 GB/s, 9.05-9.51 Gw/s | 17.28 GB/s, 79.0 Gw/s | 15.35 GB/s, **70.2 Gw/s** |
+| Q1_0_G128 | 0.141 | 3.18-3.25 GB/s, 22.6-23.1 Gw/s | 26.33 GB/s, 187 Gw/s | 23.14 GB/s, **165 Gw/s** |
+| Q2_0 | 0.266 | 2.41-2.45 GB/s, 9.08-9.24 Gw/s | 20.50 GB/s, 77.2 Gw/s | 18.74 GB/s, **70.5 Gw/s** |
+
+Time for those 17.1 Gweights at each format's sustained 12-thread rate:
+
+- **PTQ1_0: 3.74 GB / 15.35 GB/s = 244 ms** (per weight: 17.1/70.2 = 244 ms). Measured 258-281 ms
+  is 105-115% of that, so the stage is at the wall; the excess is the silu/gating work in the same
+  bucket plus machine state, not a missed optimisation.
+- **Q2_0: 4.55 GB / 18.74 = 243 ms.** Same time with more bytes — the swap is not a win.
+- **Q1_0: 2.41 GB / 23.14 = 104 ms.** That is the 155 ms, and it needs no kernel work.
+
+Two things that are *not* the answer, both measured or bounded here:
+
+- **Widening the decode further.** The table-driven formats (PTQ1_0, Q2_0) decode at 9.0-9.5
+  Gweights/s per thread and 70-79 Gw/s at 12; the bit-expansion format reaches 22.8 and 165. The
+  PTQ1_0 i16 widening landed exactly on Q2_0's rate, so both LUT formats sit on one ceiling and it
+  is structural: a per-byte table lookup produces 4-5 weights, one `vpshufb`/`cmp` pair produces 32.
+- **A 5-level bitplane PTQ1_0.** Sign plus 2-bit magnitude is three planes, so ~3x the expansion
+  work, landing near 8-10 Gw/s — no better than the LUT — for 0.375 B/weight, 71% more bytes.
+
+Threads are also finished: 12 workers buy 7.2-7.4x single-thread on 8 physical cores for all three
+formats, and the 19.5 MB shape reads *faster* than the 78 MB one precisely because it partly fits
+the 16 MB L3 — which a 3.74 GB per-token stream never does.
+
+So ffn has nothing left inside PTQ1_0. The highest-value option is the one the byte counts point at:
+put the 27B's ffn tensors in the Q1_0 layout the repo already has kernels and dense models for,
+which prices ffn at ~104 ms and the token at ~275 ms (2.3 -> 3.6 tok/s). It needs an artifact
+re-quantized from source and a quality check, because Q1_0 is 1-bit {-1,+1} and drops the 5-level
+ternary that PTQ1_0 carries.
+
 ### Prefill pays the same matvec: `gdn gates` 5-7x faster per prompt token (2026-11-25)
 
 `matvec_dense` runs once per prompt token as well as per decode token, and the row split was
