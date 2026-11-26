@@ -3,6 +3,58 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Every pack audited for inference: 16 clean, one greeting quirk, two dead 2-27B artefacts (2026-11-26)
+
+**Trigger.** The operator's screenshot: `Bonsai-1.7B-Q1_0` answering both "Hello :)" and "How are
+you?" with "I'm sorry, I can't help with that. Please let me know how I can assist you." So: audit
+every pack in `models/` for inference, not just for speed.
+
+**Method.** One model at a time, nothing else running — 18 packs x 2 prompts, 36 runs:
+
+    target/release/hearth-chat-cli.exe models/<pack>.gguf --temp 0 --max-tokens 24 --prompt "<text>"
+
+with no `--prompt-raw`, so each pack's own `tokenizer.chat_template` renders the prompt, which is
+exactly what the UI sends. Prompts: `Hello`, and `What is 2+2? Answer in one short sentence.`
+
+| pack | `Hello` | `2+2` |
+| --- | --- | --- |
+| Bonsai-1.7B-Q1_0 | **refusal** | `2+2=4 </think> The answer is 4.` |
+| Bonsai-4B-Q1_0 | coherent greeting | `2 + 2 = 4.` |
+| Bonsai-8B-Q1_0 | coherent greeting | `2 + 2 equals 4.` |
+| 1.7B/4B/8B `Q2_0` | coherent greeting | `2 + 2 = 4.` |
+| 2-2B, 2-4B, 2-9B `PTQ1_0`/`PQ2_0` | coherent greeting | `2+2 equals 4.` |
+| 2-27B `PTQ1_0` | **0 tokens, EOS** | `The answer` (2 tokens) |
+| 2-27B `PQ2_0` | **0 tokens, EOS** | `The answer` (2 tokens) |
+| 2.5-27B `PTQ1_0`/`PQ2_0`/`Q2_0` | coherent greeting | `2 + 2 = 4.` |
+
+**The 1.7B `Q1_0` refusal is the model, not the engine.** `render_prompt` renders a byte-identical
+prompt for `Bonsai-1.7B-Q1_0` and its `Q2_0` sibling, and the sibling answers "Hello! I'm Bonsai, a
+1-bit AI assistant developed by PrismML...". The same `Q1_0` pack is healthy on real questions —
+identity ("I'm Bonsai, a 1-bit model developed by PrismML..."), a joke, "The capital of France is
+Paris..." — all at ~25 tok/s. It is temperature-sensitive, not prompt-blind: `--temp 0` gives the
+refusal, `--temp 0.5` gives a variant of it, `--temp 0.7` gives "Okay, the user is asking for a
+helpful assistant...". And the string is not ours: `grep -i "can't help|cannot help|I'm sorry"` over
+the tree returns nothing, so no code path can be emitting it. A 1.7B 1-bit pack on a bare greeting
+is simply weak; there is no inference bug to fix here.
+
+**The 2-27B pair is dead in chat framing and nothing else.** Templated `Hello` samples EOS as its
+first token; raw ChatML (`<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n`) produces 24
+blank lines; `User: Hello\nAssistant:` samples EOS; `--temp 0.5` gets one token, `Hello`. Yet plain
+continuation is perfect: `The capital of France is` → "Paris. The capital of Germany is Berlin. The".
+That continuation runs the same dense layers, the same GDN/SSM recurrence and the same kernels, so
+the forward pass is not what breaks — the pack only collapses once special tokens make it a chat.
+
+Both 2-27B quants behave identically, and their metadata is identical to the 2.5-27B pack that works
+in every key but three: `general.name` (`Hf` vs `Ternary-Bonsai-2.5-27B`), `general.basename`
+(`folded`), and the dtype of `ssm_alpha`/`ssm_beta` (BF16 vs F32). BF16 is not the culprit:
+`hearth-quant::dequantize` widens it correctly (`u16` bits `<< 16`), and the coherent plain-text
+continuation exercises those same GDN layers. The 2.5 refresh of the same geometry answers all three
+of its quants correctly.
+
+**Follow-up, not yet done:** `crates/hearth-ui/src/downloads.rs` still lists both 2-27B entries
+alongside the 2.5 trio, so the downloader will happily fetch 12 GiB of packs that cannot hold a
+conversation. Either drop those two entries or label them experimental.
+
 ### The quantize kernel declared `avx2` but converted scales with `f16c` (2026-11-26)
 
 Every push for half a day failed one job, `kernel-baseline`, and nothing else in those runs
