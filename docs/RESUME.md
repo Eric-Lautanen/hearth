@@ -70,7 +70,10 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    arithmetic, DRAM is ~25% used, and dispatch is under 10 ms of 417. A wider datapath is the only
    remaining lever on this kernel, and this Zen 4 has no full-width AVX-512 to give it.
    A kernel claim should name the GB/s, the format and the thread count, plus the whole-model
-   tok/s it was meant to move. Before
+   tok/s it was meant to move. Do not go looking for PTQ1_0's 8-lane defect in the other formats:
+   Q2_0's LUT already emits `i16` and Q1_0_G128's VNNI expands bits 32 lanes at a time, measured
+   at 9.3-10.0 and 22.6-24.3 Gweights/s per thread with 7.6-8.1x scaling, and building Q2_0's
+   weight vector in registers instead of a stack buffer changed nothing (2.57 vs 2.55 GB/s). Before
    trusting a stage number, check the kernel's curve: PTQ1_0 tops out at 11.2 GB/s (12 threads),
    Q1_0_G128 at 25.3 (12), Q8_0 at 48.7 (12), and above eight threads the cells move by up to 40%
    between runs. The one open finding it recorded is Q5_0/Q5_1 at 0.35 Gweights/s single-thread,

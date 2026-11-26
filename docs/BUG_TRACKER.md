@@ -3,6 +3,41 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### The 8-lane decode defect is PTQ1_0's alone: Q1_0_G128 and Q2_0 measured (2026-11-25)
+
+PTQ1_0 gained 39% by decoding 16 lanes at a time instead of 8-byte halves with an `i8` pack and a
+re-widen in the dot. The other two formats were checked for the same shape before assuming it
+generalises. Neither has it, and neither has anything to widen.
+
+| 140 MiB buffer, 12 workers | 1 thread | 12 threads | scaling |
+| --- | --- | --- | --- |
+| Q2_0 / PQ2_0 (`avx2_lut`) | 2.47-2.67 GB/s, 9.3-10.0 Gweights/s | 18.7-20.4 GB/s, 70-77 Gweights/s | 7.6-8.1x |
+| Q1_0_G128 (`vnni256`) | 3.18-3.41 GB/s, 22.6-24.3 Gweights/s | 25.2-26.1 GB/s, 179-185 Gweights/s | 7.9-8.1x |
+| PTQ1_0, for scale | 2.07 GB/s, 9.46 Gweights/s | 16.3 GB/s, 74 Gweights/s | 7.9x |
+
+**Why there is nothing to widen.** Q2_0's LUT arm already emits `i16` (`Q2V_I16`, four 8-byte copies
+per 16 elements) and dots it with 16-lane `vpmaddwd` — no `i8` buffer, no `packs`, no
+`cvtepi8_epi16` round trip. Q1_0_G128 dispatches its VNNI kernel: one 32-bit word → `vpshufb` →
+`vpand`/`vpcmpeqb` sign mask → `vpdpbusd`, 32 lanes per step. The PTQ1_0 defect was a property of
+its base-3 packing, which spreads one byte's five trits 16 elements apart, so the only way to
+produce them was 8-byte unpack halves; bit-packed and 2-bit formats have no such stride.
+
+**The closest analogue was tested anyway.** Q2_0's LUT stages each 16-element group through a
+`[i16; 16]` stack buffer (four 8-byte stores, then a 256-bit load), which is the one place a
+store-to-load-forwarding stall could hide. Building the vector in registers instead
+(`punpcklqdq` of four 8-byte table loads) read **2.57 against 2.55 GB/s** — LLVM already keeps that
+buffer in registers, so the hypothesis was wrong and the variant was reverted rather than kept.
+
+**Scaling and end to end.** All three formats scale to the 8 physical cores at 7.6-8.1x with 12
+workers, so none of them is losing to pool contention either. The dense sweep is unchanged (the
+tree is byte-identical to the previous commit): 48.88 / 24.13 / 20.85 / 11.54 / 12.96 / 6.45 tok/s
+this session against the 47.98 / 26.60 / 22.80 / 11.99 / 13.08 / 6.64 baseline — inside the
+documented spread, with one batch in the middle of the session reading 15% low across every model
+until the machine settled.
+
+The useful number here is the cross-check: PTQ1_0's 16.3 GB/s ceiling is a property of its packing,
+not of this CPU's AVX2 — Q1_0_G128 pushes 26 GB/s through the same pool.
+
 ### GDN scan timed: 8.5 ms, so the stage's shortfall is the serial alpha/beta matvec (2026-11-25)
 
 The stage entry above left the scan as an estimate (~8-10 ms, derived from the state's size and
