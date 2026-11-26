@@ -53,16 +53,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          RUSTFLAGS="-C target-cpu=x86-64-v2" cargo rustc -p hearth-quant --release --lib \
-            --target-dir target/baseline-asm -- --emit=asm
-          python3 scripts/check-kernel-baseline.py "$(ls target/baseline-asm/release/deps/hearth_quant-*.s)"
+          # `--emit=asm=PATH` rather than a glob over the target directory: the artefact's name
+          # is rustc's business, and when it stopped matching the glob this step failed with an
+          # empty path (`FileNotFoundError: ''`) instead of reporting on a kernel. The listing
+          # is the input to the check, so the workflow states where it goes.
+          check() {
+            local out="$1" dir="$2"
+            shift 2
+            RUSTFLAGS="-C target-cpu=x86-64-v2" cargo rustc -p hearth-quant --release "$@" \
+              --target-dir "$dir" -- --emit=asm="$out"
+            test -s "$out" || {
+              echo "::error::rustc wrote no assembly listing to $out"
+              return 1
+            }
+            python3 scripts/check-kernel-baseline.py "$out"
+          }
+          check target/baseline-lib.s target/baseline-asm --lib
           # The test build as well: a kernel only the tests reach is a kernel the library
           # build never sees, and the Q1_0_G128 VNNI kernel hid there -- `#[cfg(test)]`,
           # measuring +180% against the kernel it was meant to replace, so it was never
           # dispatched, so nothing ever re-measured it.
-          RUSTFLAGS="-C target-cpu=x86-64-v2" cargo rustc -p hearth-quant --release --tests \
-            --target-dir target/baseline-asm-tests -- --emit=asm
-          python3 scripts/check-kernel-baseline.py "$(ls target/baseline-asm-tests/release/deps/hearth_quant-*.s)"
+          check target/baseline-tests.s target/baseline-asm-tests --tests
 
   # aarch64 has no runner in this matrix, and does not need one to catch the kind
   # of break that stops a release: a reference to an x86-only module from a branch
@@ -114,12 +125,29 @@ jobs:
       - name: Cross linker and user-mode emulation
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          # `qemu-user-static` stopped being a real package on ubuntu-latest (26.04): apt now
+          # reports it as virtual, provided by `qemu-user-binfmt`. The emulator itself is the
+          # same binary under either name, so try the packages that ship it and then find it
+          # where that package put it, instead of naming one path that only one release has.
+          installed=no
+          for pkg in qemu-user qemu-user-static qemu-user-binfmt; do
+            if sudo apt-get install -y "$pkg"; then
+              echo "installed $pkg"
+              installed=yes
+              break
+            fi
+          done
+          test "$installed" = yes || { echo "::error::no aarch64 emulator package would install"; exit 1; }
+          qemu=$({ command -v qemu-aarch64-static || command -v qemu-aarch64 || \
+                   find /usr -maxdepth 4 -name 'qemu-aarch64*' -type f; } 2>/dev/null | head -1)
+          test -n "$qemu" || { echo "::error::installed qemu but found no aarch64 emulator"; exit 1; }
+          echo "aarch64 emulator: $qemu"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=$qemu -L /usr/aarch64-linux-gnu" >> "$GITHUB_ENV"
 
       - name: cargo test under qemu
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
         run: |
           cargo test --target aarch64-unknown-linux-gnu \
             -p hearth-core -p hearth-gguf -p hearth-quant \

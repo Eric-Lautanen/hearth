@@ -497,8 +497,8 @@ impl LlamaModel {
             }
             if self.config.embed_scale {
                 let scale = (d as f32).sqrt();
-                for i in 0..d {
-                    sc.hidden[i] *= scale;
+                for v in sc.hidden[..d].iter_mut() {
+                    *v *= scale;
                 }
             }
         }
