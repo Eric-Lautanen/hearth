@@ -189,7 +189,38 @@ struct AppCtx {
     /// access for local callers (the default); `Some` requires the token on
     /// every /api/* call, via header or `?token=`.
     api_token: Option<String>,
+    /// Files attached to the next message, keyed by the id `POST /api/attach`
+    /// returned. One-shot: `handle_generate` removes the ones it inlines, and
+    /// the map is bounded so a client that uploads and never sends cannot
+    /// grow it forever.
+    files: Mutex<HashMap<i64, AttachedFile>>,
+    next_file: AtomicI64,
 }
+
+/// One uploaded file, held in memory between `/api/attach` and the message
+/// that references it.
+struct AttachedFile {
+    name: String,
+    bytes: usize,
+    /// `Some` when the bytes are UTF-8 text with no NUL, already cut to
+    /// [`ATTACH_TEXT_CHARS`]; `None` for anything the model should not be fed
+    /// as text (images, archives, executables, a file too large to inline).
+    text: Option<String>,
+    truncated: bool,
+}
+
+/// Largest upload accepted, in bytes. It matches the request-body cap in
+/// `read_request`, so a file that fits arrives whole.
+const ATTACH_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much of a text file is inlined into the prompt. A model with an 8k
+/// context cannot read a 4 MB log anyway; the rest is reported as truncated
+/// rather than silently dropped.
+const ATTACH_TEXT_CHARS: usize = 40_000;
+
+/// Attachment entries kept between uploads and the message that uses them.
+/// Beyond this the oldest are dropped, so an idle tab cannot pin memory.
+const ATTACH_MAX_PENDING: usize = 32;
 
 impl AppCtx {
     fn new_id(&self) -> i64 {
@@ -632,6 +663,12 @@ struct Request {
     origin: Option<String>,
     /// `X-Hearth-Token` header, if present.
     token: Option<String>,
+    /// `X-Hearth-Filename` header, percent-encoded UTF-8, sent with
+    /// `POST /api/attach` so a file keeps its name.
+    filename: Option<String>,
+    /// The declared `Content-Length`, before the body cap is applied, so an
+    /// oversized upload can be refused instead of silently truncated.
+    declared_len: usize,
 }
 
 /// Hosts this server answers to. The socket is bound to loopback, and the
@@ -687,6 +724,7 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     let mut host = String::new();
     let mut origin: Option<String> = None;
     let mut token: Option<String> = None;
+    let mut filename: Option<String> = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).ok()? == 0 {
@@ -705,13 +743,28 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
                 origin = Some(value.trim().to_string());
             } else if name.eq_ignore_ascii_case("x-hearth-token") {
                 token = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case("x-hearth-filename") {
+                filename = Some(value.trim().to_string());
             }
         }
     }
 
+    let declared_len = content_length;
     let mut body = vec![0u8; content_length.min(4 * 1024 * 1024)];
     if !body.is_empty() && reader.read_exact(&mut body).is_err() {
         return None;
+    }
+    // Read the rest of an oversized body off the socket anyway: leaving it
+    // there would desynchronise the next request on this keep-alive
+    // connection, and the handler refuses the upload on `declared_len`.
+    let mut leftover = content_length.saturating_sub(body.len());
+    while leftover > 0 {
+        let want = leftover.min(65536);
+        let mut sink = vec![0u8; want];
+        if reader.read_exact(&mut sink).is_err() {
+            return None;
+        }
+        leftover -= want;
     }
 
     // Split the query string off the path (the API is POST-body driven, but
@@ -729,6 +782,8 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
         host,
         origin,
         token,
+        filename,
+        declared_len,
     })
 }
 
@@ -991,11 +1046,25 @@ fn handle_generate(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
     }
 
     let body = json_body(req);
-    let message = get_str(&body, "message");
-    if message.trim().is_empty() {
+    let mut message = get_str(&body, "message");
+    if message.trim().is_empty() && body.get("attachments").is_none() {
         ctx.generating.store(false, Ordering::Relaxed);
         error_response(stream, "message is empty");
         return;
+    }
+
+    // Attached files go in front of what was typed: the engine's chat template
+    // takes one prompt string, so the block *is* the attachment as far as the
+    // model is concerned. Taking them here also makes them one-shot - a second
+    // send does not repeat a file the user removed from the composer.
+    let files = take_attachments(ctx, &body);
+    if !files.is_empty() {
+        let mut prompt = String::new();
+        for file in &files {
+            prompt.push_str(&attachment_block(file));
+        }
+        prompt.push_str(&message);
+        message = prompt;
     }
 
     // Reset stream state for this generation.
@@ -1074,6 +1143,179 @@ fn handle_generate(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
     v.set("ok", Json::Bool(true));
     v.set("gen_id", Json::Num(id as f64));
     json_response(stream, &v);
+}
+
+/// How many attachments one message may carry. Beyond this the oldest are
+/// dropped on upload, so this is a backstop rather than the normal path.
+const ATTACH_PER_MESSAGE: usize = 8;
+
+/// Store one uploaded file and answer with its id.
+///
+/// The body is the file's raw bytes (no multipart, no base64), and the name
+/// rides in `X-Hearth-Filename` percent-encoded so any OS path can survive an
+/// HTTP header. Every type is accepted; what differs is whether the model can
+/// read it, which is decided here rather than by the client.
+fn handle_attach(ctx: &Arc<AppCtx>, req: &Request, stream: &mut TcpStream) {
+    if req.declared_len > ATTACH_MAX_BYTES {
+        error_response(
+            stream,
+            &format!(
+                "file is {} bytes; the limit is {} bytes",
+                req.declared_len, ATTACH_MAX_BYTES
+            ),
+        );
+        return;
+    }
+    if req.body.is_empty() {
+        error_response(stream, "file is empty");
+        return;
+    }
+
+    let decoded = req.filename.as_deref().map(pct_decode).unwrap_or_default();
+    let name = match decoded.trim() {
+        "" => "attachment".to_string(),
+        other => other.to_string(),
+    };
+    let bytes = req.body.len();
+
+    // Text means UTF-8 and no NUL. A NUL is the one reliable marker for a
+    // binary payload that happens to decode as UTF-8 (a lot of them do not,
+    // but some do), and feeding it to a model is worse than saying "binary".
+    let (text, truncated) = match std::str::from_utf8(&req.body) {
+        Ok(s) if !req.body.contains(&0) => {
+            let mut kept = String::new();
+            let mut cut = false;
+            for (i, ch) in s.char_indices() {
+                if i >= ATTACH_TEXT_CHARS {
+                    cut = true;
+                    break;
+                }
+                kept.push(ch);
+            }
+            (Some(kept), cut)
+        }
+        _ => (None, false),
+    };
+    let kind = if text.is_some() { "text" } else { "binary" };
+    let chars = text.as_ref().map(|t| t.chars().count()).unwrap_or(0);
+
+    let id = ctx.next_file.fetch_add(1, Ordering::Relaxed) + 1;
+    {
+        let mut store = ctx.files.lock().unwrap();
+        if store.len() >= ATTACH_MAX_PENDING {
+            if let Some(oldest) = store.keys().min().copied() {
+                store.remove(&oldest);
+            }
+        }
+        store.insert(
+            id,
+            AttachedFile {
+                name: name.clone(),
+                bytes,
+                text,
+                truncated,
+            },
+        );
+    }
+
+    let mut v = Json::obj();
+    v.set("ok", Json::Bool(true));
+    v.set("id", Json::num(id as f64));
+    v.set("name", Json::str(name));
+    v.set("bytes", Json::num(bytes as f64));
+    v.set("kind", Json::str(kind));
+    v.set("chars", Json::num(chars as f64));
+    v.set("truncated", Json::Bool(truncated));
+    json_response(stream, &v);
+}
+
+/// Remove the attachments a generate request names, so each upload is used
+/// once.
+fn take_attachments(ctx: &Arc<AppCtx>, body: &Json) -> Vec<AttachedFile> {
+    let Some(items) = body.get("attachments").and_then(|x| x.as_arr()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut store = ctx.files.lock().unwrap();
+    for item in items.iter().take(ATTACH_PER_MESSAGE) {
+        if let Some(id) = item.as_usize() {
+            if let Some(file) = store.remove(&(id as i64)) {
+                out.push(file);
+            }
+        }
+    }
+    out
+}
+
+/// One `<file>` block for the prompt.
+fn attachment_block(file: &AttachedFile) -> String {
+    let name = xml_escape(&file.name);
+    match &file.text {
+        Some(text) => format!(
+            "<file name=\"{}\" bytes=\"{}\"{}>\n{}\n</file>\n",
+            name,
+            file.bytes,
+            if file.truncated {
+                " truncated=\"true\""
+            } else {
+                ""
+            },
+            text.trim_end()
+        ),
+        None => format!(
+            "<file name=\"{}\" bytes=\"{}\" kind=\"binary\">\n(binary file: contents not inlined)\n</file>\n",
+            name, file.bytes
+        ),
+    }
+}
+
+/// `%XX` decoding for the filename header, plus `+` as a space so the value can
+/// also be sent form-style.
+fn pct_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi * 16 + lo) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Escape the four characters that would break out of the `<file>` tag.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,6 +1606,7 @@ fn handle_client(ctx: Arc<AppCtx>, stream: TcpStream) {
             }
             ("POST", "/api/unload") => handle_unload(&ctx, &mut stream),
             ("GET", "/api/status") => handle_status(&ctx, &mut stream),
+            ("POST", "/api/attach") => handle_attach(&ctx, &req, &mut stream),
             ("POST", "/api/generate") => handle_generate(&ctx, &req, &mut stream),
             ("POST", "/api/stop") => handle_stop(&ctx, &mut stream),
             ("GET", "/api/events") => {
@@ -1448,6 +1691,8 @@ fn main() {
         tabs: Mutex::new(HashMap::new()),
         ever_seen_tab: AtomicBool::new(false),
         api_token,
+        files: Mutex::new(HashMap::new()),
+        next_file: AtomicI64::new(0),
     });
     // Download progress/completion fans out to every open tab over SSE.
     {
@@ -1514,5 +1759,75 @@ fn open_browser(url: &str) {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A filename has to survive the header, and a stray `%` is data rather
+    /// than a broken escape - that is the case a naive split would mangle.
+    #[test]
+    fn filename_header_round_trips() {
+        assert_eq!(pct_decode("note%20one.txt"), "note one.txt");
+        assert_eq!(pct_decode("a+b.txt"), "a b.txt");
+        assert_eq!(pct_decode("plain.txt"), "plain.txt");
+        assert_eq!(pct_decode("%E2%9C%93.txt"), "\u{2713}.txt");
+        assert_eq!(pct_decode("100%.txt"), "100%.txt");
+        assert_eq!(pct_decode("trailing%"), "trailing%");
+    }
+
+    /// The name goes inside the tag's attribute, so it must not be able to
+    /// close the tag and write its own prompt text.
+    #[test]
+    fn file_names_cannot_break_out_of_the_tag() {
+        assert_eq!(xml_escape("a\"<b>&.txt"), "a&quot;&lt;b&gt;&amp;.txt");
+    }
+
+    #[test]
+    fn a_text_block_carries_the_contents() {
+        let file = AttachedFile {
+            name: "notes.txt".to_string(),
+            bytes: 11,
+            text: Some("hello world".to_string()),
+            truncated: false,
+        };
+        let block = attachment_block(&file);
+        assert!(
+            block.contains("<file name=\"notes.txt\" bytes=\"11\">"),
+            "{block}"
+        );
+        assert!(block.contains("hello world"), "{block}");
+        assert!(block.trim_end().ends_with("</file>"), "{block}");
+        assert!(!block.contains("truncated"), "{block}");
+    }
+
+    /// A binary file is announced, not dumped: the size is the only thing the
+    /// model can act on, so the block says so instead of inlining noise.
+    #[test]
+    fn a_binary_block_only_names_the_file() {
+        let file = AttachedFile {
+            name: "shot.png".to_string(),
+            bytes: 82104,
+            text: None,
+            truncated: false,
+        };
+        let block = attachment_block(&file);
+        assert!(block.contains("kind=\"binary\""), "{block}");
+        assert!(block.contains("bytes=\"82104\""), "{block}");
+        assert!(block.contains("contents not inlined"), "{block}");
+    }
+
+    #[test]
+    fn a_cut_file_says_it_was_cut() {
+        let file = AttachedFile {
+            name: "log.txt".to_string(),
+            bytes: 900_000,
+            text: Some("first line".to_string()),
+            truncated: true,
+        };
+        let block = attachment_block(&file);
+        assert!(block.contains("truncated=\"true\""), "{block}");
     }
 }
