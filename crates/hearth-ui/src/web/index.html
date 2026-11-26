@@ -293,6 +293,37 @@
     transition: all .15s;
   }
   .chip:hover { color: var(--text); border-color: var(--accent); background: var(--accent-soft); }
+  /* The hero chip wall, grouped by family: one heading per run of models, so
+     seventeen packs read as four families instead of one long line. A two-column
+     label/chips row keeps the headings aligned with each other and the chips
+     aligned with the labels, which a centred flex line cannot do. */
+  .chip-groups {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    max-width: 780px;
+    margin: 26px auto 0;
+    text-align: left;
+  }
+  .chip-group { display: flex; align-items: baseline; gap: 14px; }
+  .chip-group-label {
+    /* Wide enough for the longest heading ("Ternary Bonsai 2.5") on one line:
+       a wrapped heading pushes its chips down and breaks the column. */
+    flex: 0 0 150px;
+    text-align: right;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  .chip-group .chips {
+    flex: 1 1 auto;
+    justify-content: flex-start;
+    gap: 8px;
+    margin-top: 0;
+  }
 
   /* ---------- Composer ---------- */
   .composer-zone {
@@ -939,6 +970,30 @@ function searchedDirsHtml() {
     '<span class="dir">' + esc(d) + (i === dirs.length - 1 ? '.' : '') + '</span>').join("");
 }
 
+// The picker can hold seventeen files, and a flat list of seventeen chips is a
+// wall. S.models is already sorted by family, so one pass splits it into
+// consecutive runs and each run gets its heading.
+function modelChipsHtml() {
+  const groups = [];
+  for (const m of S.models) {
+    const family = familyOf(m.name);
+    let group = groups[groups.length - 1];
+    if (!group || group.family !== family) {
+      group = { family, items: [] };
+      groups.push(group);
+    }
+    group.items.push(m);
+  }
+  return '<div class="chip-groups">' + groups.map((g) =>
+    '<div class="chip-group">' +
+      '<div class="chip-group-label">' + esc(g.family.label) + '</div>' +
+      '<div class="chips">' + g.items.map((m) =>
+        '<button class="chip" data-path="' + esc(m.path) + '">' + esc(chipLabel(m.name)) +
+        ' <span style="color:var(--faint)">· ' + fmtBytes(m.size_bytes) + '</span></button>').join("") +
+      '</div>' +
+    '</div>').join("") + '</div>';
+}
+
 function heroEl() {
   const div = document.createElement("div");
   div.className = "hero";
@@ -953,11 +1008,7 @@ function heroEl() {
         '<div class="dir">HEARTH_MODELS_DIR adds more folders.</div></div>' +
         '<div><button class="chip" id="heroDl">Open model downloads</button></div>'
       : "") +
-    (S.models.length
-      ? '<div class="chips">' + S.models.map(m =>
-          '<button class="chip" data-path="' + esc(m.path) + '">' + esc(prettyName(m.name)) +
-          ' <span style="color:var(--faint)">· ' + fmtBytes(m.size_bytes) + '</span></button>').join("") + '</div>'
-      : "");
+    (S.models.length ? modelChipsHtml() : "");
   div.querySelectorAll(".chip").forEach(ch => {
     ch.addEventListener("click", () => {
       modelSelect.value = ch.dataset.path;
@@ -978,13 +1029,23 @@ function prettyName(file) {
 // The CLI lists .gguf files in byte order, which puts "Ternary-Bonsai-2-27B"
 // between "2-2B" and "2-4B" ('7' < 'B') and scatters the 27B through the 2B
 // models. Sort the picker the way the download catalog is written: family
-// first, then size, then 1-bit before 2-bit.
+// first, then size, then 1-bit before 2-bit. The same table names the groups
+// the hero chips are listed under, so rank, heading and prefix cannot drift
+// apart. The plain Ternary family excludes the "-2-" and "-2.5-" packs, which
+// are their own families; the specific patterns are tested first.
+const MODEL_FAMILIES = [
+  { rank: 0, re: /^bonsai-/i, label: "Bonsai" },
+  { rank: 1, re: /^ternary-bonsai-(?!2[.-])/i, label: "Ternary Bonsai" },
+  { rank: 2, re: /^ternary-bonsai-2-/i, label: "Ternary Bonsai 2" },
+  { rank: 3, re: /^ternary-bonsai-2\.5-/i, label: "Ternary Bonsai 2.5" },
+];
+// A file the catalog does not know sorts after the known families.
+const OTHER_FAMILY = { rank: 4, re: null, label: "Other" };
+function familyOf(name) {
+  return MODEL_FAMILIES.find((f) => f.re.test(name)) || OTHER_FAMILY;
+}
 function modelFamily(name) {
-  if (/^bonsai-/i.test(name)) return 0;
-  if (/^ternary-bonsai-2\.5-/i.test(name)) return 3;
-  if (/^ternary-bonsai-2-/i.test(name)) return 2;
-  if (/^ternary-bonsai-/i.test(name)) return 1;
-  return 4; // a file the catalog does not know: after the known families
+  return familyOf(name).rank;
 }
 function modelSize(name) {
   const m = name.match(/(\d+(?:\.\d+)?)\s*b/gi);
@@ -1001,6 +1062,14 @@ function sortModels(list) {
     modelSize(a.name) - modelSize(b.name) ||
     quantRank(a.name) - quantRank(b.name) ||
     (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+// Under a family heading the family name is already said, so a chip only
+// carries what differs: "27B PTQ1_0" rather than "Ternary Bonsai 2 27B PTQ1_0".
+function chipLabel(name) {
+  const family = familyOf(name);
+  const stem = name.replace(/\.gguf$/i, "");
+  return prettyName(family.re ? stem.replace(family.re, "") : stem);
 }
 
 // Build the collapsible reasoning drawer element for a completed message.
