@@ -51,10 +51,15 @@ What it was worth, 27B PTQ1_0, `ffn` row of `HEARTH_Q35_TIMERS`, arms alternatin
 | 306.7 -> 284.8 | -21.9 |
 | 271.2 -> 266.5 | -4.7 |
 | 273.8 -> 270.4 | -3.4 |
+| 326.9 -> 327.3 (30-token runs) | +0.4 |
+| 326.6 -> 292.6 | -34.0 |
+| 298.2 -> 273.9 | -24.3 |
+| 279.7 -> 273.8 | -5.9 |
 
-Eight of nine pairs favour the fused build (the outlier sits inside the ±50 ms spread this box shows
-between runs), median **9 ms**, mean **1.9%** of the ffn row and 0.5-2% of the token. The row stays
-at ~300 ms against the 228.5 ms single-pass figure: it moves toward it, it does not arrive.
+Eleven of thirteen pairs favour the fused build (the two non-wins sit inside the ±50 ms spread this
+box shows between runs, and the old arm fell from 326.9 to 279.7 ms across the last four), median
+**~12 ms**, mean **1.9-3%** of the ffn row and 1-3% of the token. The row stays at 273-293 ms against
+the 228.5 ms single-pass figure: it moves toward it, it does not arrive.
 
 **That is the result worth keeping: 64 fewer dispatches per token bought ~9 ms, i.e. ~0.1 ms per
 dispatch, not the 0.45 ms the prefill comparison implied.** The previous entry read paired prefill's

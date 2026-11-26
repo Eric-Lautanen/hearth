@@ -93,7 +93,7 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    row only caught the leftover token when the prompt was not a multiple of `PREFILL_CHUNK`.
 1. **The 27B's ffn is 258-269 ms against a 228.5 ms single-pass stream, and neither dispatches nor
    park/wake explain the gap.** Fusing gate+up (192 -> 128 dispatches) is bit-identical and worth
-   ~9 ms, not 29. Giving idle workers a longer bounded spin before they park is *worse* (medians
+   ~12 ms (median of 13 alternating pairs, 11 of them favouring it), not 29. Giving idle workers a longer bounded spin before they park is *worse* (medians
    258 / 265 / 263 ms for windows of 0 / 200 / 2000 us), and forcing them to park costs ~3 ms, so a
    wake is 0.02-0.04 ms per dispatch: the 0.45 ms figure is dead and both knobs were reverted. Next
    is sub-timers *inside* the bucket — silu/gating over 17408 values per layer, the two per-layer
