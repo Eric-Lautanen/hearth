@@ -24,6 +24,11 @@ version number.
 - **Intel macOS is type-checked on every PR**: `macos-latest` is arm64, so
   `x86_64-apple-darwin` joins the Ubuntu cross-check matrix alongside the
   aarch64 targets.
+- **Chat file attachments**: the composer has a `+` picker with no extension
+  filter; pasted files and long text become one-shot attachment chips.
+  `POST /api/attach` takes raw bytes up to 4 MiB, and the server inlines UTF-8
+  text up to 40k characters into the prompt while describing binary files by
+  name and size instead of feeding their bytes to the model.
 
 ### Changed
 
