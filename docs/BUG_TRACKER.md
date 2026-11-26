@@ -3,6 +3,57 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### PTQ1_0 decode: sixteen lanes instead of eight, and the table form that lost (decode 1.27-1.38x, 2026-11-25)
+
+The stage analysis above left one lever: cycles per weight in `dot_ptq1_0_q8_0`, where one thread
+read 6.75 Gweights/s against Q2_0's 9.60 on 21% *more* bytes per weight. Q2_0's advantage is its
+table decode, so that was tried first — and it lost.
+
+**The table form, measured.** `dot_ptq1_0_q8_0_lut_avx2` copied each packed byte's five trits out
+of the 256-entry table straight into the slot-major buffer, exactly as `q2_0` does. On the 27B's
+own `blk.0` tensors, single thread, `benchk` read **0.92 GB/s against 1.42** for the arithmetic
+decode — 35% slower, not faster. The reason is layout: a Q2_0 byte's four values land contiguously
+in the output, so the copy is four bytes at a time and the compiler keeps it in registers; a
+PTQ1_0 byte's five trits land 16 elements apart, so the same copy becomes five single-byte stores
+and the buffer is filled a byte at a time instead of 32 lanes at a time. Removed rather than kept
+behind a flag.
+
+**What won: the same table, evaluated 16 lanes wide.** The arithmetic decode already computes the
+256-entry lookup with multiply/mask/shift, which is the cheapest form available to AVX2 (no
+`vpshufb` reaches 256 entries and gathers are slower than the arithmetic). It was running on 8-byte
+halves: two `_mm_unpacklo/hi_epi8`, two 16-bit chains, a `packs` back to `i8`, and then the dot
+re-widened with `cvtepi8_epi16`. `dot_ptq1_0_q8_0_avx2_i16` widens once per 16 bytes with
+`_mm256_cvtepu8_epi16`, keeps the weights as `i16` so nothing is packed back down, and the dot
+loads them ready for `vpmaddwd`. Element order and the sub-block `vpmaddwd` pairing are unchanged,
+so the result is bit-identical; `all_variants_bit_identical` pins `i16` == `i8` == scalar over every
+packed byte value. The paired prefill kernel (`dot_ptq1_0_q8_0x2_avx2`) took the same change.
+
+| measurement | before | after |
+| --- | --- | --- |
+| benchk, one thread, 27B weights | 1.42 GB/s | **1.97 GB/s** (+39%) |
+| kernel-bench, 1 thread | 1.48 GB/s, 6.75 Gweights/s | **2.07 GB/s, 9.46 Gweights/s** |
+| kernel-bench, 12 workers | 11.98-12.02 GB/s | **16.26-16.62 GB/s, 74-76 Gweights/s** |
+| 27B decode | 565 / 574 ms/token (1.77 tok/s) | **459 / 417 ms/token (2.40 tok/s)** |
+| 27B ffn stage | 10.83 GB/s | 15.05 GB/s |
+| 27B gdn/attn stage | 10.22 GB/s | 13.22 GB/s |
+| 27B head stage | 11.50 GB/s | 15.77 GB/s |
+| prefill, 67-token prompt, 4B / 9B | 73.5 / 127.4 ms/token | 64.8 / 111.9 |
+
+All five PTQ1_0 hybrids, 50 tokens: 2B 20.11 -> 25.25, 4B 9.01 -> 11.74, 9B 5.12 -> 6.82,
+27B 1.57 -> 2.17, 2.5-27B 1.68 -> 2.14 tok/s. Dense sweep (kernels untouched): 48.36 / 27.47 /
+25.33 / 12.73 / 14.12 / 6.85 against the 47.98 / 26.60 / 22.80 / 11.99 / 13.08 / 6.64 baseline.
+
+**Byte-identical, end to end.** A second binary built from the previous commit in a worktree, same
+prompts, `--temp 0`: identical text and reasoning on twelve model/prompt pairs — dense Q1_0 and
+Q2_0, hybrid PQ2_0, and PTQ1_0 at 2B/4B/9B/27B/2.5-27B — at 48 and 96 tokens. The only stream
+differences were timings and a `Special tokens` line whose order comes from a hash set.
+
+**Where that leaves the ceiling**: decode now runs at 14.40 GB/s against a 16.26-16.62 ceiling, so
+still ~90% — the ceiling moved and the ratio held. PTQ1_0 is now level with Q2_0 per weight
+(9.46 against 9.60 at one thread), which closes the gap this entry started from. The next lever is
+not in this kernel's structure: it needs a wider datapath (`avx512_full_width` is false on this
+Zen 4, and the AVX-512 kernel already trails at 1.25 GB/s here) or fewer weights to move.
+
 ### 27B decode: where its 565 ms goes, stage bytes against the kernel ceiling (2026-11-25)
 
 `kernel-bench` gave a ceiling; this closes the loop by asking whether the model reaches it. Byte

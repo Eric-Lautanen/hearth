@@ -83,6 +83,7 @@ fn make_variants(dtype: GgmlDType) -> Vec<(&'static str, DotFn)> {
             v.push(("scalar", hearth_quant::ptq1_0::dot_ptq1_0_q8_0_ptr_scalar));
             if have("avx2") {
                 v.push(("avx2", hearth_quant::ptq1_0::dot_ptq1_0_q8_0_avx2));
+                v.push(("avx2_i16", hearth_quant::ptq1_0::dot_ptq1_0_q8_0_avx2_i16));
             }
             if have("avx512f") && have("avx512bw") && have("avx512vl") {
                 v.push(("avx512", hearth_quant::ptq1_0::dot_ptq1_0_q8_0_avx512));

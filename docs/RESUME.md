@@ -60,13 +60,15 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
    rendered by the reference engine, or the first real tool call goes out in a format
    nobody checked.
 
-7. **Quote `kernel-bench` numbers, not tok/s, for kernel work.** Decode already sits at ~92% of
-   the PTQ1_0 ceiling (10.63 GB/s against 11.2-12.7), and the ceiling is arithmetic, not memory:
-   Q8_0 moves 47 GB/s on the same 12 workers while PTQ1_0 does 12, both at 44-58 Gweights/s, and
-   DRAM usage is ~18% of what this box can stream. So do not spend a session on layout, thread
-   counts or pool barriers for the 27B — the only lever left is cycles per weight in
-   `dot_ptq1_0_q8_0` (6.75 Gweights/s at one thread against Q2_0's 9.60 on more bytes per
-   weight, so a table-driven ternary decode is the shape to try; 20% there is ~70 ms/token).
+7. **The PTQ1_0 decode is done; do not re-litigate it.** Widening the decode from 8-byte
+   halves to 16 lanes (`dot_ptq1_0_q8_0_avx2_i16`, weights kept as `i16`) moved one thread from
+   6.75 to 9.46 Gweights/s and the 12-worker ceiling from 12.0 to 16.3-16.6 GB/s, worth 1.27-1.38x
+   on every PTQ1_0 hybrid and 1.13x on prefill. The table-driven form Q2_0 uses was measured first
+   and is **35% slower** here (0.92 against 1.42 GB/s) because a PTQ1_0 byte's trits land 16
+   elements apart, so do not retry it. Decode now sits at ~90% of its own ceiling again (14.40
+   against 16.4 GB/s), which is the same shape the previous entry described: the ceiling is
+   arithmetic, DRAM is ~25% used, and dispatch is under 10 ms of 417. A wider datapath is the only
+   remaining lever on this kernel, and this Zen 4 has no full-width AVX-512 to give it.
    A kernel claim should name the GB/s, the format and the thread count, plus the whole-model
    tok/s it was meant to move. Before
    trusting a stage number, check the kernel's curve: PTQ1_0 tops out at 11.2 GB/s (12 threads),

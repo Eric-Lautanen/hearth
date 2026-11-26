@@ -161,7 +161,7 @@ pub unsafe fn dot_ptq1_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) 
             return dot_ptq1_0_q8_0_avx512(w_ptr, a_ptr, n);
         }
         if avx2_available() {
-            return dot_ptq1_0_q8_0_avx2(w_ptr, a_ptr, n);
+            return dot_ptq1_0_q8_0_avx2_i16(w_ptr, a_ptr, n);
         }
     }
     dot_ptq1_0_q8_0_ptr_scalar(w_ptr, a_ptr, n)
@@ -403,6 +403,132 @@ pub unsafe fn dot_ptq1_0_q8_0_avx2(w_ptr: *const u8, a_ptr: *const u8, n: usize)
     sum
 }
 
+/// Same decode as [`dot_ptq1_0_q8_0_avx2`], widened: the 24 packed `qs` bytes are
+/// expanded 16 lanes at a time into an `i16` buffer, so nothing is packed back down
+/// to `i8` and the dot loads the weights ready to multiply.
+///
+/// The element order, the per-sub-block `vpmaddwd` pairing and the lane reduction
+/// are unchanged, so the result is bit-identical to the `i8` kernel; the saving is
+/// the whole `packs`/`cvtepi8` round trip and half the decode instructions, since a
+/// 256-bit register carries 16 bytes instead of 8.
+///
+/// # Safety
+/// Same contract as the scalar version.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "f16c")]
+pub unsafe fn dot_ptq1_0_q8_0_avx2_i16(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let blocks = n / BLOCK_SIZE;
+    if blocks == 0 {
+        return 0.0;
+    }
+    let mask_ff = _mm256_set1_epi16(0xFF);
+    let three = _mm256_set1_epi16(3);
+    let one = _mm256_set1_epi16(1);
+    let mask_ff_128 = _mm_set1_epi16(0xFF);
+    let three_128 = _mm_set1_epi16(3);
+    let one_128 = _mm_set1_epi16(1);
+    let mut wvals = [0i16; BLOCK_SIZE];
+    let wp = wvals.as_mut_ptr();
+    let mut sum = 0.0f32;
+
+    for b in 0..blocks {
+        let bo = b * BLOCK_BYTES;
+        let scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(bo + 26),
+            *w_ptr.add(bo + 27),
+        ]));
+
+        // 16-byte stage in one register, 8-byte stage in another; both run the same
+        // three-step decode the i8 kernel runs, without the pack back to bytes.
+        let qa = _mm256_cvtepu8_epi16(_mm_loadu_si128(w_ptr.add(bo) as *const __m128i));
+        let qb = _mm_cvtepu8_epi16(_mm_loadl_epi64(w_ptr.add(bo + 16) as *const __m128i));
+        for (nn, &p3) in POW3.iter().enumerate() {
+            let ta = _mm256_and_si256(
+                _mm256_mullo_epi16(qa, _mm256_set1_epi16(p3 as i16)),
+                mask_ff,
+            );
+            let va = _mm256_sub_epi16(_mm256_srli_epi16(_mm256_mullo_epi16(ta, three), 8), one);
+            _mm256_storeu_si256(wp.add(nn * 16) as *mut __m256i, va);
+
+            let tb = _mm_and_si128(_mm_mullo_epi16(qb, _mm_set1_epi16(p3 as i16)), mask_ff_128);
+            let vb = _mm_sub_epi16(_mm_srli_epi16(_mm_mullo_epi16(tb, three_128), 8), one_128);
+            _mm_storeu_si128(wp.add(80 + nn * 8) as *mut __m128i, vb);
+        }
+        // qh: 2 bytes x 4 trits, interleaved as [n][byte] at elements 120..128.
+        let qh0 = *w_ptr.add(bo + QS_BYTES) as usize;
+        let qh1 = *w_ptr.add(bo + QS_BYTES + 1) as usize;
+        for (nn, (&t0, &t1)) in QH_TRIT[qh0].iter().zip(QH_TRIT[qh1].iter()).enumerate() {
+            *wp.add(120 + 2 * nn) = t0 as i16;
+            *wp.add(121 + 2 * nn) = t1 as i16;
+        }
+
+        let mut acc = _mm256_setzero_ps();
+        for s in 0..4 {
+            let a_off = (b * 4 + s) * 34;
+            let a_scale = crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a_ptr.add(a_off),
+                *a_ptr.add(a_off + 1),
+            ]));
+            let a32 = _mm256_loadu_si256(a_ptr.add(a_off + 2) as *const __m256i);
+            let al = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(a32));
+            let ah = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a32, 1));
+            let wl = _mm256_loadu_si256(wp.add(s * 32) as *const __m256i);
+            let wh = _mm256_loadu_si256(wp.add(s * 32 + 16) as *const __m256i);
+            let p = _mm256_add_epi32(_mm256_madd_epi16(wl, al), _mm256_madd_epi16(wh, ah));
+            acc = _mm256_add_ps(
+                acc,
+                _mm256_mul_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(a_scale)),
+            );
+        }
+        let mut lanes = [0.0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+        let block_acc: f32 = lanes.iter().sum();
+        sum += block_acc * scale;
+    }
+    sum
+}
+
+/// Bit-identity test: the table decode and the widened `i16` decode must agree with
+/// the `i8` arithmetic kernel on every byte pattern, not merely on a fixture.
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod decode_variants {
+    use super::*;
+
+    #[test]
+    fn all_variants_bit_identical() {
+        if !avx2_available() {
+            return;
+        }
+        // 8 blocks covering every byte value in `qs` and `qh` positions at least once.
+        let blocks = 8usize;
+        let n = blocks * BLOCK_SIZE;
+        let mut w = vec![0u8; blocks * BLOCK_BYTES];
+        for b in 0..blocks {
+            for i in 0..QS_BYTES + QH_BYTES {
+                w[b * BLOCK_BYTES + i] = (b * 61 + i * 97 + 13) as u8;
+            }
+            let s = f16::from_f32(0.125 + b as f32 * 0.03).to_le_bytes();
+            w[b * BLOCK_BYTES + 26] = s[0];
+            w[b * BLOCK_BYTES + 27] = s[1];
+        }
+        let act: Vec<f32> = (0..n)
+            .map(|i| ((i as f32) * 0.37).sin() * 4.0 - (i % 7) as f32)
+            .collect();
+        let mut a = Vec::new();
+        crate::q8_0::quantize(&act, &mut a);
+
+        let want = unsafe { dot_ptq1_0_q8_0_avx2(w.as_ptr(), a.as_ptr(), n) };
+        let wide = unsafe { dot_ptq1_0_q8_0_avx2_i16(w.as_ptr(), a.as_ptr(), n) };
+        let scalar = unsafe { dot_ptq1_0_q8_0_ptr_scalar(w.as_ptr(), a.as_ptr(), n) };
+        assert_ne!(want, 0.0, "fixture is degenerate");
+        assert_eq!(wide.to_bits(), want.to_bits(), "i16 decode diverges");
+        assert_eq!(scalar.to_bits(), want.to_bits(), "scalar diverges");
+    }
+}
+
 /// Paired-token PTQ1_0 x Q8_0 dot: one weight row against two Q8_0 activation
 /// rows, sharing the ternary decode.
 ///
@@ -434,10 +560,13 @@ pub unsafe fn dot_ptq1_0_q8_0x2_avx2(
     if blocks == 0 {
         return (0.0, 0.0);
     }
-    let mask_ff = _mm_set1_epi16(0xFF);
-    let three = _mm_set1_epi16(3);
-    let one = _mm_set1_epi16(1);
-    let mut wvals = [0i8; BLOCK_SIZE];
+    let mask_ff = _mm256_set1_epi16(0xFF);
+    let three = _mm256_set1_epi16(3);
+    let one = _mm256_set1_epi16(1);
+    let mask_ff_128 = _mm_set1_epi16(0xFF);
+    let three_128 = _mm_set1_epi16(3);
+    let one_128 = _mm_set1_epi16(1);
+    let mut wvals = [0i16; BLOCK_SIZE];
     let wp = wvals.as_mut_ptr();
     let mut sums = [0.0f32; 2];
 
@@ -448,39 +577,29 @@ pub unsafe fn dot_ptq1_0_q8_0x2_avx2(
             *w_ptr.add(bo + 27),
         ]));
 
-        // ---- decode the block once (verbatim from the single-token kernel) ----
+        // ---- decode the block once, widened the way the single-token kernel is ----
         // 16-byte stage (elements 0..80, stride 16 per trit slot) and 8-byte
         // stage (elements 80..120, stride 8).
-        let qs = _mm_loadu_si128(w_ptr.add(bo) as *const __m128i);
-        let qh_bytes = _mm_loadl_epi64(w_ptr.add(bo + 16) as *const __m128i);
-        let zv = _mm_setzero_si128();
-        let a_lo = _mm_unpacklo_epi8(qs, zv);
-        let a_hi = _mm_unpackhi_epi8(qs, zv);
-        let b_lo = _mm_unpacklo_epi8(qh_bytes, zv);
-        let b_hi = _mm_unpackhi_epi8(qh_bytes, zv);
+        let qa = _mm256_cvtepu8_epi16(_mm_loadu_si128(w_ptr.add(bo) as *const __m128i));
+        let qb = _mm_cvtepu8_epi16(_mm_loadl_epi64(w_ptr.add(bo + 16) as *const __m128i));
         for (nn, &p3) in POW3.iter().enumerate() {
-            let k = _mm_set1_epi16(p3 as i16);
-            let t_lo = _mm_and_si128(_mm_mullo_epi16(a_lo, k), mask_ff);
-            let t_hi = _mm_and_si128(_mm_mullo_epi16(a_hi, k), mask_ff);
-            let v_lo = _mm_sub_epi16(_mm_srli_epi16(_mm_mullo_epi16(t_lo, three), 8), one);
-            let v_hi = _mm_sub_epi16(_mm_srli_epi16(_mm_mullo_epi16(t_hi, three), 8), one);
-            _mm_storeu_si128(wp.add(nn * 16) as *mut __m128i, _mm_packs_epi16(v_lo, v_hi));
-
-            let u_lo = _mm_and_si128(_mm_mullo_epi16(b_lo, k), mask_ff);
-            let u_hi = _mm_and_si128(_mm_mullo_epi16(b_hi, k), mask_ff);
-            let w_lo = _mm_sub_epi16(_mm_srli_epi16(_mm_mullo_epi16(u_lo, three), 8), one);
-            let w_hi = _mm_sub_epi16(_mm_srli_epi16(_mm_mullo_epi16(u_hi, three), 8), one);
-            _mm_storel_epi64(
-                wp.add(80 + nn * 8) as *mut __m128i,
-                _mm_packs_epi16(w_lo, w_hi),
+            let ta = _mm256_and_si256(
+                _mm256_mullo_epi16(qa, _mm256_set1_epi16(p3 as i16)),
+                mask_ff,
             );
+            let va = _mm256_sub_epi16(_mm256_srli_epi16(_mm256_mullo_epi16(ta, three), 8), one);
+            _mm256_storeu_si256(wp.add(nn * 16) as *mut __m256i, va);
+
+            let tb = _mm_and_si128(_mm_mullo_epi16(qb, _mm_set1_epi16(p3 as i16)), mask_ff_128);
+            let vb = _mm_sub_epi16(_mm_srli_epi16(_mm_mullo_epi16(tb, three_128), 8), one_128);
+            _mm_storeu_si128(wp.add(80 + nn * 8) as *mut __m128i, vb);
         }
         // qh: 2 bytes x 4 trits, interleaved as [n][byte] at elements 120..128.
         let qh0 = *w_ptr.add(bo + QS_BYTES) as usize;
         let qh1 = *w_ptr.add(bo + QS_BYTES + 1) as usize;
         for (nn, (&t0, &t1)) in QH_TRIT[qh0].iter().zip(QH_TRIT[qh1].iter()).enumerate() {
-            *wp.add(120 + 2 * nn) = t0;
-            *wp.add(121 + 2 * nn) = t1;
+            *wp.add(120 + 2 * nn) = t0 as i16;
+            *wp.add(121 + 2 * nn) = t1 as i16;
         }
 
         // ---- two accumulators over the same decoded weights ----
@@ -492,12 +611,11 @@ pub unsafe fn dot_ptq1_0_q8_0x2_avx2(
                     *a_ptr.add(a_off),
                     *a_ptr.add(a_off + 1),
                 ]));
-                let w32 = _mm256_loadu_si256(wp.add(s * 32) as *const __m256i);
                 let a32 = _mm256_loadu_si256(a_ptr.add(a_off + 2) as *const __m256i);
-                let wl = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w32));
-                let wh = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w32, 1));
                 let al = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(a32));
                 let ah = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a32, 1));
+                let wl = _mm256_loadu_si256(wp.add(s * 32) as *const __m256i);
+                let wh = _mm256_loadu_si256(wp.add(s * 32 + 16) as *const __m256i);
                 let p = _mm256_add_epi32(_mm256_madd_epi16(wl, al), _mm256_madd_epi16(wh, ah));
                 acc[t] = _mm256_add_ps(
                     acc[t],
