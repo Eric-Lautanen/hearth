@@ -31,35 +31,40 @@ for rotation representation, avoiding gimbal lock...
 
 ## Performance
 
-14 models on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5), at `--temp 0
+15 packs on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5), at `--temp 0
 --max-tokens 50 --prompt "Hello" --prompt-raw`, idle machine, one model at a
-time, a warm-up run then two measured runs each — the mean is shown. Every model
-runs at its shipped worker count (dense models one worker per physical core, the
-`qwen35` hybrids by their own rule). Single runs on this box vary ±5-10%: an
-interleaved re-run of the same binaries read the Q2_0 family ~25% lower, so treat
-these as snapshots — only alternating same-session pairs carry information, and
-the spread is what `scripts/count-sweep.py` measures for you.
+time, a warm-up run then two measured runs each — the mean is shown, all
+measured 2026-11-26. Every model runs at its shipped worker count (dense models
+one worker per physical core, the `qwen35` hybrids by their own rule). Single
+runs on this box vary ±5-10%, and the widest cell in this sweep was 18% (the 2B
+`PTQ1_0` read 27.8 and 22.8 in the same session), so treat the table as a
+snapshot: only alternating same-session pairs carry information, and the spread
+is what `scripts/count-sweep.py` measures for you.
 
-| Size | Format               | d_model | Layers | tok/s |
-| ---- | -------------------- | ------- | ------ | ----- |
-| 1.7B | Q1_0 (1-bit, 128-el) | 2048    | 28     | **46.7** |
-| 1.7B | Q2_0 (2-bit ternary) | 2048    | 28     | **23.6** |
-| 4B   | Q1_0 (1-bit, 128-el) | 2560    | 36     | **23.6** |
-| 4B   | Q2_0 (2-bit ternary) | 2560    | 36     | **12.2** |
-| 8B   | Q1_0 (1-bit, 128-el) | 4096    | 36     | **13.0** |
+| Size | Format               | d_model | Layers | tok/s   |
+| ---- | -------------------- | ------- | ------ | ------- |
+| 1.7B | Q1_0 (1-bit, 128-el) | 2048    | 28     | **48.1** |
+| 1.7B | Q2_0 (2-bit ternary) | 2048    | 28     | **27.1** |
+| 4B   | Q1_0 (1-bit, 128-el) | 2560    | 36     | **24.4** |
+| 4B   | Q2_0 (2-bit ternary) | 2560    | 36     | **11.7** |
+| 8B   | Q1_0 (1-bit, 128-el) | 4096    | 36     | **12.4** |
 | 8B   | Q2_0 (2-bit ternary) | 4096    | 36     | **6.2** |
-| 2B²  | PTQ1_0 (1-bit)       | —       | —      | **15.6** |
-| 2B²  | PQ2_0 (2-bit)        | —       | —      | **18.2** |
-| 4B²  | PTQ1_0 (1-bit)       | —       | —      | **6.9** |
-| 4B²  | PQ2_0 (2-bit)        | —       | —      | **7.2** |
-| 9B²  | PTQ1_0 (1-bit)       | —       | —      | **4.1** |
-| 9B²  | PQ2_0 (2-bit)        | —       | —      | **5.0** |
-| 27B² | PTQ1_0 (1-bit)       | —       | 64     | **1.4** |
-| 27B² | PQ2_0 (2-bit)        | —       | 64     | **1.6** |
+| 2B²  | PTQ1_0 (1-bit)       | —       | —      | **25.3** |
+| 2B²  | PQ2_0 (2-bit)        | —       | —      | **25.1** |
+| 4B²  | PTQ1_0 (1-bit)       | —       | —      | **12.0** |
+| 4B²  | PQ2_0 (2-bit)        | —       | —      | **11.2** |
+| 9B²  | PTQ1_0 (1-bit)       | —       | —      | **6.7** |
+| 9B²  | PQ2_0 (2-bit)        | —       | —      | **6.3** |
+| 27B² | PTQ1_0 (1-bit)       | —       | 64     | **2.2** |
+| 27B² | PQ2_0 (2-bit)        | —       | 64     | **2.0** |
+| 27B³ | PTQ1_0 (1-bit)       | —       | 64     | **2.2** |
 
-² = Ternary Bonsai 2 (`qwen35` hybrid). The 27B pair runs at ~1.4 tok/s, so
-raise `--max-tokens` deliberately — the UI streams progress and reasoning live
-instead of buffering a reply. Raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md).
+² = Ternary Bonsai 2 (`qwen35` hybrid). ³ = Ternary Bonsai 2.5, the agentic
+refresh of the same architecture: its `PTQ1_0` matches the 2-series 27B to the
+rounding (`PQ2_0` and `Q2_0` were not on the sweep machine, so they carry no
+number here). The 27B runs at ~2 tok/s, so raise `--max-tokens` deliberately —
+the UI streams progress and reasoning live instead of buffering a reply. Raw
+data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md).
 
 ## Features
 

@@ -3,6 +3,42 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Full re-baseline: all 15 packs (2026-11-26)
+
+The benchmark mandate, run end to end after the ffn sub-timers: every pack on this machine, one at a
+time, 50 tokens, `--temp 0 --prompt-raw "Hello"`, warm-up then two measured runs, mean shown.
+
+| pack | today | was in README | delta |
+| --- | --- | --- | --- |
+| 1.7B Q1_0 | 48.1 | 46.7 | +3% |
+| 1.7B Q2_0 | 27.1 | 23.6 | +15% |
+| 4B Q1_0 | 24.4 | 23.6 | +3% |
+| 4B Q2_0 | 11.7 | 12.2 | -4% |
+| 8B Q1_0 | 12.4 | 13.0 | -5% |
+| 8B Q2_0 | 6.2 | 6.2 | 0 |
+| 2B PTQ1_0 | 25.3 | 15.6 | +62% |
+| 2B PQ2_0 | 25.1 | 18.2 | +38% |
+| 4B PTQ1_0 | 12.0 | 6.9 | +74% |
+| 4B PQ2_0 | 11.2 | 7.2 | +56% |
+| 9B PTQ1_0 | 6.7 | 4.1 | +63% |
+| 9B PQ2_0 | 6.3 | 5.0 | +26% |
+| 27B PTQ1_0 | 2.17 | 1.4 | +55% |
+| 27B PQ2_0 | 1.98 | 1.6 | +24% |
+| 27B 2.5 PTQ1_0 | 2.16 | not listed | - |
+
+- **The dense six were never stale** (±5%, inside the documented spread) and **the hybrid rows were
+  badly stale** — 1.6-1.75x low, all of them, which is what a table looks like when it is written
+  once and the engine moves under it. They now describe this build.
+- The 2.5 refresh is on disk as `PTQ1_0` only and reads 2.16 against the 2-series 2.17: the refresh
+  costs nothing measurable, which is what "same geometry" predicted. Its `PQ2_0`/`Q2_0` are not on
+  this machine and are deliberately given no number rather than an interpolated one.
+- Per-file drift is not uniform: the 2B `PTQ1_0` read 27.81 then 22.81 (18%) and the 2B `PQ2_0` read
+  25.35 then 24.79 (2%) in the same session, so a 2-run mean is only as good as its worse arm. Bench
+  the model you are about to change, not the family.
+- `[generate] avg_cpu_overhead=Nus/token` is mislabelled: it prints `cpu_total_us`, the whole step
+  (sampling + forward), so on the 4B it reads ~37 ms against a 44 ms token. Nothing is wasting that
+  time; do not go looking for it.
+
 ### The ffn's 42 ms is 24 ms of MAC displacement and 15 ms of rotation (2026-11-26)
 
 `ffn_block` now carries five sub-timers, printed as subset rows of `ffn` and summing to it exactly
