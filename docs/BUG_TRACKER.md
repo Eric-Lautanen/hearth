@@ -113,6 +113,16 @@ binaries in `Contents/MacOS` and the icon, README and licenses in `Contents/Reso
 run's artifacts are named `v0.0.0-*` because `STAMP` is the dispatch input; a tag push stamps
 the tag's version instead.
 
+**Release v0.3.0 is published.** Tagged `v0.3.0` at `167fa75` and pushed; the `publish` job ran
+for the first time on this tree and succeeded, putting six assets and `SHA256SUMS` on
+`https://github.com/Eric-Lautanen/hearth/releases/tag/v0.3.0` (Windows MSI + zip, Linux
+x86_64 and aarch64 tarballs, macOS x86_64 and arm64 zips). Every published asset was
+re-downloaded and hashed against `SHA256SUMS` — 6 of 6 match — and the **shipped** MSI, not the
+locally built one, was put through `scripts/msi-query.ps1`: 14 of 14, `ProductVersion=0.3.0`,
+the removal arm covering its own version. The operator then asked for the chat attachments (the
+`+` button, paste-as-file, every file type) to be in the release as well, so `v0.3.0` is
+re-tagged at the tree that carries them and republished under the same version number.
+
 ### The Hadamard fold and the Q8 quantize are AVX2 now, and byte-identical (2026-11-26)
 
 The RESUME's first "do this" item: `rotate_quantize_into` was 15.1 ms/token on the 27B (3% of

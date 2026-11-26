@@ -14,8 +14,11 @@
 > `Info.plist` keys, a `CHANGELOG` section), the Windows installer was verified end to end on
 > a real machine (upgrade from 0.2.0 with two downloaded models, same-version reinstall,
 > uninstall that keeps the models, the installed binary answering all five endpoints), the
-> five-runner release path was exercised with a dry run, and the tag is the last step. The
-> release build is now warning-free under the toolchain CI uses. The one scar
+> five-runner release path was exercised with a dry run, and `v0.3.0` is published
+> (six assets plus `SHA256SUMS`; 6 of 6 hashes match and the *shipped* MSI passes the 14-check
+> table gate). The operator then asked for the chat attachments to be in that release too, so
+> `v0.3.0` is re-tagged at the tree that carries them and republished under the same version.
+> The release build is now warning-free under the toolchain CI uses. The one scar
 > this session left is the most useful lesson in it: **the `kernel-baseline` CI job was red
 > for half a day and nobody saw it**, because the failing job was not the one anybody was
 > watching — see "Do not re-open".
