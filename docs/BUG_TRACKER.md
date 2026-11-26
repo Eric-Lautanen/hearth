@@ -26,26 +26,43 @@ Hearth hands `PQ2_0` and `Q2_0` to the *same* kernel (`hearth-quant/src/lib.rs:4
 are fine on this build (1.7B/4B/8B all coherent), and the hybrid `PQ2_0` is fine, so neither the
 kernel nor the block size is the candidate.
 
-**What differs.** The Hadamard metadata, which is the only thing the hybrid forward treats as
-load-bearing:
+**Ruled out: the tokenizer.** All three 2.5 packs carry the same vocabulary — SHA-256 over the
+248,320 `tokenizer.ggml.tokens` is `6d8afc30d32560a9` and over the 247,587 merges `b645cd089105aa7f`
+in `PTQ1_0`, `PQ2_0` and `Q2_0` alike — and `!` is id **0** in all of them. No pack can differ from
+another in how ids stringify, so a wrong-id theory has to explain a difference that does not exist.
 
-| key | `PTQ1_0` | `PQ2_0` | `Q2_0` |
+**The `!` is id 0 from a degenerate argmax, not a mismapped id.** `HEARTH_Q35_DEBUG=1` prints the
+hidden state straight out of the embedding dequant, before any weight matmul: `emb_raw mean=0.011265`
+on the working pack against **132.001984** here — 11,718x — and the first layer carries it on to
+`qkv_mixed` 15,319 against a reference 1.51. The model is not picking an odd token; its logits are
+garbage from the first row.
+
+**The cause is a stride the pack and the decoder disagree about.** The tensor table says it outright:
+
+| pack | dtype id | first tensor step | bytes per 128 elements |
 | --- | --- | --- | --- |
-| `prism.hadamard.inverse_weight_names` | `[token_embd.weight]` | `[token_embd.weight]` | absent |
-| `prism.hadamard.weight_names` | absent | absent | present, 13,397 B of names |
+| `PQ2_0` | 142 | 337,715,200 | **34** |
+| `Q2_0` | 42 | 357,580,800 | **36** |
 
-The loader reads `block_size`, `sign_values` (required), `inverse_weight_names` and `gdn_v_grouped`,
-and never looks at `weight_names`. The leading reading is that the two working packs store weights
-already rotated (which is why `ffn_block` can rotate *every* activation unconditionally and why
-`token_embd` is named as the one weight needing the inverse), while the `Q2_0` pack declares its
-rotated set explicitly and stores the rest in the original basis — so the blanket activation
-rotation is wrong for it. That is a hypothesis with three observations behind it, not a proven
-cause; the first experiment should be to dump `weight_names`, see whether it lists the ffn/mix
-projections, and then either rotate per that list or skip the rotation for packs without
-`inverse_weight_names`.
+Hearth's `Q2_0` is `BLOCK_SIZE = 128`, `BLOCK_BYTES = 34`, hard-coded in
+`hearth-quant/src/q2_0.rs`. This pack lays its 2-bit tensors out at 36 bytes per 128 elements, so
+block 0 decodes correctly — which is why the first 16 bytes of `token_embd.weight` and
+`blk.0.ffn_gate.weight` are byte-identical between the two packs — and every block after it is read
+two bytes early, turning shifted bytes into f16 scales. The measured 2.15 tok/s is real: it reads 34
+of every 36 bytes, just the wrong 34.
 
-Until it is fixed the pack is dangerous in a way the stale-README problem was not: it loads, it
-runs at full speed, and it produces plausible-looking token counts. The README marks the row.
+The Hadamard hypothesis this entry originally carried was wrong. The metadata difference
+(`weight_names` vs `inverse_weight_names`) is real and probably matters for something, but it is not
+this bug, and changing the rotation would have broken the two packs that work. Dense `Q2_0` models
+are unaffected because their packs really are 34 bytes per 128 — the dtype id alone does not
+distinguish the two encodings, which is the hazard.
+
+**What to do.** Either implement the 36-byte layout or, first, refuse it: a load-time check that each
+tensor's stride (the next tensor's offset minus its own, per 128 elements) matches what
+`dtype.byte_size(shape)` implies would have named this instead of emitting `!`. Until then the pack is
+dangerous in a way the stale-README problem was not: it loads, runs at speed, and reports a plausible
+token count.
+
 
 ### Full re-baseline: all 15 packs (2026-11-26)
 

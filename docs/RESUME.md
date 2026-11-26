@@ -44,14 +44,16 @@ session — so compare the model you changed, and use alternating pairs, never t
    downstream is width-agnostic (scans stay per token, scratch is sized from the constant), so it is
    a one-line change plus identity and timing runs. If the 1 MB tile is not actually resident, the
    number will be flat or worse — measure.
-3. **Fix or refuse the 2.5 `Q2_0` pack — it decodes at 2.1 tok/s of `!!!!`.** Downloaded clean and
-   byte-exact, and it is the first hybrid pack whose weights are *not* all pre-rotated: it carries
-   `prism.hadamard.weight_names` where the working packs carry `inverse_weight_names`, and the loader
-   reads neither `weight_names` nor a "weights are in the original basis" signal, while `ffn_block`
-   and the mix projections rotate every activation unconditionally. Start by dumping `weight_names`
-   and checking whether it lists the ffn/mix projections; then either rotate per that list or skip the
-   rotation when `inverse_weight_names` is absent. Until then, prefer failing the load to decoding
-   garbage — see `docs/BUG_TRACKER.md` for the evidence and the ruled-out candidates.
+3. **Refuse (or implement) the 2.5 `Q2_0` pack: it is a 36-byte-per-128 layout Hearth reads as 34.**
+   Measured, not hypothesised: the tokenizer is identical to the working packs (same SHA over
+   248,320 tokens and 247,587 merges, and `!` is id 0 in all), the hidden state is already 11,718x
+   too large straight out of the embedding dequant (`emb_raw` 132.0 against 0.0113), and the tensor
+   table steps 36 bytes per 128 elements where `hearth-quant/src/q2_0.rs` hard-codes
+   `BLOCK_BYTES = 34`. Only block 0 lines up, which is why the first bytes match and the output does
+   not. An earlier guess in the tracker blamed the Hadamard metadata; that was wrong — do not
+   "fix" the rotation, it would break the packs that work. The cheap remedy is a load-time stride
+   check (next tensor offset minus this one, per 128 elements, against `dtype.byte_size(shape)`),
+   which turns silent garbage into a named error.
 4. **Tool calling is the next template gap, and it is unchecked.** The 2.5 template's `tools` branch
    (`|tojson`, `tool_call.function`, `{% for k, v in …|items %}`, the `<tool_call>` XML format)
    parses, but no fixture exercises it: `TemplateContext` has no `tools` field. Before wiring tools
