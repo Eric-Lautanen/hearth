@@ -59,18 +59,15 @@ is what `scripts/count-sweep.py` measures for you.
 | 27B² | PQ2_0 (2-bit)        | —       | 64     | **2.0** |
 | 27B³ | PTQ1_0 (1-bit)       | —       | 64     | **2.2** |
 | 27B³ | PQ2_0 (2-bit)        | —       | 64     | **1.9** |
-| 27B³ | Q2_0 (2-bit)†        | —       | 64     | **2.1** |
+| 27B³ | Q2_0 (2-bit, 64-el)  | —       | 64     | **2.0** |
 
 ² = Ternary Bonsai 2 (`qwen35` hybrid). ³ = Ternary Bonsai 2.5, the agentic
 refresh of the same architecture: `PTQ1_0` matches the 2-series 27B to the
-rounding and `PQ2_0` is 2% under it. † = the 2.5 `Q2_0` pack **loads and decodes
-at that rate but its output is wrong** (a run of `!` for every prompt). Its tensors
-are laid out at 36 bytes per 128 elements where Hearth's `Q2_0` reads 34, so every
-block after the first is misaligned — the tokenizer and the first block are
-identical to the working `PQ2_0` pack's, which is what made it look like a weights
-problem. Hearth now refuses the pack at load rather than decoding it, so the rate is
-a record of what it used to do, not something you can reproduce. Tracked in
-`docs/BUG_TRACKER.md`. The 27B runs at ~2 tok/s, so raise `--max-tokens`
+rounding and `PQ2_0` is 2% under it. The 2.5 `Q2_0` pack is stock llama.cpp's
+`Q2_0` — 64 weights per 18-byte group, not the Prism fork's 128 per 34 — and runs
+its own kernel (`Q2_0_G64`), landing with `PQ2_0` at 2.0. On a 16 GB machine its
+7.6 GB of weights do not stay resident, so the first run after a cold read is much
+slower (1.1-1.5); the table quotes warm runs. The 27B runs at ~2 tok/s, so raise `--max-tokens`
 deliberately — the UI streams progress and reasoning live instead of buffering a
 reply. Raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md).
 

@@ -656,6 +656,7 @@ fn q8_dot(dtype: GgmlDType) -> Result<crate::pool::DotFn, String> {
     Ok(match dtype {
         GgmlDType::PTQ1_0 => hearth_quant::dot_ptq1_0_q8_0_ptr,
         GgmlDType::PQ2_0 | GgmlDType::Q2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
+        GgmlDType::Q2_0G64 => hearth_quant::dot_q2_0_g64_q8_0_ptr,
         GgmlDType::Q1_0 | GgmlDType::Q10G128 => hearth_quant::dot_q1_0g128_q8_0_ptr,
         GgmlDType::Q8_0 => hearth_quant::dot_q8_0_q8_0_ptr,
         other => {
@@ -1055,10 +1056,12 @@ impl Qwen35Core {
 
         // The weight format decides the worker count as much as the path does; the
         // rule, and the measurements behind it, live on `pool::hybrid_worker_count`.
-        let q2_weights = gguf
-            .tensors
-            .iter()
-            .any(|t| matches!(t.dtype, GgmlDType::Q2_0 | GgmlDType::PQ2_0));
+        let q2_weights = gguf.tensors.iter().any(|t| {
+            matches!(
+                t.dtype,
+                GgmlDType::Q2_0 | GgmlDType::PQ2_0 | GgmlDType::Q2_0G64
+            )
+        });
 
         Ok(Qwen35Core {
             config,
@@ -1235,6 +1238,7 @@ impl Qwen35Core {
         let dot = match entry.dtype {
             GgmlDType::PTQ1_0 => hearth_quant::dot_ptq1_0_q8_0_ptr,
             GgmlDType::PQ2_0 | GgmlDType::Q2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
+            GgmlDType::Q2_0G64 => hearth_quant::dot_q2_0_g64_q8_0_ptr,
             GgmlDType::Q1_0 | GgmlDType::Q10G128 => hearth_quant::dot_q1_0g128_q8_0_ptr,
             GgmlDType::Q8_0 => hearth_quant::dot_q8_0_q8_0_ptr,
             other => {
@@ -1396,6 +1400,9 @@ impl Qwen35Core {
                 hearth_quant::dot_q2_0_q8_0_ptr,
                 Some(hearth_quant::dot_q2_0_q8_0x2_ptr),
             ),
+            // No paired-token kernel for the 64-element layout yet: prefill walks the two
+            // activation rows one at a time, which is correct and re-reads the weights.
+            GgmlDType::Q2_0G64 => (hearth_quant::dot_q2_0_g64_q8_0_ptr, None),
             GgmlDType::Q1_0 | GgmlDType::Q10G128 => (
                 hearth_quant::dot_q1_0g128_q8_0_ptr,
                 Some(hearth_quant::dot_q1_0g128_q8_0x2_ptr),

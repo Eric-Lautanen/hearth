@@ -44,15 +44,15 @@ session — so compare the model you changed, and use alternating pairs, never t
    downstream is width-agnostic (scans stay per token, scratch is sized from the constant), so it is
    a one-line change plus identity and timing runs. If the 1 MB tile is not actually resident, the
    number will be flat or worse — measure.
-3. **The 2.5 `Q2_0` pack is now refused at load; supporting it means implementing the 36-byte layout.**
-   `GgufFile::open` verifies that each tensor's real footprint (the gap to the next offset, allowing
-   one alignment step of padding) matches `dtype.byte_size(shape)`, so this pack fails with a named
-   error — `tensor layout mismatch on output.weight: … the file stores 36 bytes per 128-element block
-   where Q2_0 assumes 34` — instead of decoding at 2.15 tok/s of `!`. All sixteen other packs load
-   unchanged, and the check is load-only, so greedy output is untouched. If the pack is ever wanted,
-   the work is a second `Q2_0` layout at 36 bytes per 128 elements; it would not be faster than
-   `PQ2_0`, since wider blocks mean more bytes read per token. Do not "fix" the Hadamard rotation —
-   an earlier guess in the tracker blamed it and that was wrong.
+3. **The 2.5 `Q2_0` pack decodes — parity reached, prefill is the loose end.** Stock llama.cpp's
+   `Q2_0` is 64 weights per 18-byte group; the fork's is 128 per 34, and type 42 means either.
+   `GgufFile::open` classifies by tensor footprint into the new `Q2_0G64`, and
+   `hearth-quant/src/q2_0_g64.rs` decodes it (AVX2 LUT + scalar). Verified by reproducing the
+   `PQ2_0` weights exactly (cosine 1.00000 on the 27B embedding row) and by coherent output at
+   505 ms/token against `PQ2_0`'s 525. What is missing: a paired-token (`x2`) kernel, so prefill
+   re-reads the weights for the second activation row — `mm_batched` passes `None` there. Adding it
+   is the same shape as `dot_q2_0_q8_0x2_ptr` with 2 sub-blocks per group instead of 4. Do not
+   "fix" the Hadamard rotation: that hypothesis was wrong and the working packs would break.
 4. **Tool calling is the next template gap, and it is unchecked.** The 2.5 template's `tools` branch
    (`|tojson`, `tool_call.function`, `{% for k, v in …|items %}`, the `<tool_call>` XML format)
    parses, but no fixture exercises it: `TemplateContext` has no `tools` field. Before wiring tools

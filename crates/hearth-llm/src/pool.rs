@@ -257,6 +257,7 @@ pub struct ThreadPool {
 pub fn dot_rows_fn(dtype: GgmlDType) -> Option<DotFn> {
     Some(match dtype {
         GgmlDType::Q2_0 | GgmlDType::PQ2_0 => hearth_quant::dot_q2_0_q8_0_ptr,
+        GgmlDType::Q2_0G64 => hearth_quant::dot_q2_0_g64_q8_0_ptr,
         GgmlDType::PTQ1_0 => hearth_quant::dot_ptq1_0_q8_0_ptr,
         GgmlDType::Q10G128 | GgmlDType::Q1_0 => hearth_quant::dot_q1_0g128_q8_0_ptr,
         GgmlDType::Q8_0 => hearth_quant::dot_q8_0_q8_0_ptr,

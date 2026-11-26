@@ -2,6 +2,7 @@ pub mod pq2_0;
 pub mod ptq1_0;
 pub mod q1_0g128;
 pub mod q2_0;
+pub mod q2_0_g64;
 pub mod q4_0;
 pub mod q4_1;
 pub mod q4_k;
@@ -209,6 +210,7 @@ pub fn dequantize(dtype: GgmlDType, data: &[u8], out: &mut [f32]) -> Result<(), 
         GgmlDType::Q5_1 => q5_1::dequantize(data, out),
         GgmlDType::Q4K => q4_k::dequantize(data, out),
         GgmlDType::Q2_0 => q2_0::dequantize(data, out),
+        GgmlDType::Q2_0G64 => q2_0_g64::dequantize(data, out),
         GgmlDType::PQ2_0 => pq2_0::dequantize(data, out),
         GgmlDType::PTQ1_0 => ptq1_0::dequantize(data, out),
         GgmlDType::Q1_0 | GgmlDType::Q10G128 => q1_0g128::dequantize(data, out),
@@ -306,6 +308,12 @@ pub unsafe fn dot_ptq1_0_q8_0x2_ptr(
 /// w_ptr valid for n/128*34 bytes, a_ptr valid for n/32*34 bytes.
 pub unsafe fn dot_q2_0_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
     q2_0::dot_q2_0_q8_0_ptr(w_ptr, a_ptr, n)
+}
+
+/// # Safety
+/// w_ptr valid for n/64*18 bytes, a_ptr valid for n/32*34 bytes.
+pub unsafe fn dot_q2_0_g64_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize) -> f32 {
+    q2_0_g64::dot_q2_0_g64_q8_0_ptr(w_ptr, a_ptr, n)
 }
 
 /// Paired-token Q2_0 dot: one weight row against two Q8_0 activation rows,
@@ -412,6 +420,7 @@ pub fn selected_kernel(dtype: GgmlDType) -> Option<&'static str> {
     match dtype {
         GgmlDType::PTQ1_0 => Some(ptq1_0::kernel_name()),
         GgmlDType::Q2_0 | GgmlDType::PQ2_0 => Some(q2_0::kernel_name()),
+        GgmlDType::Q2_0G64 => Some(q2_0_g64::kernel_name()),
         GgmlDType::Q1_0 | GgmlDType::Q10G128 => Some(q1_0g128::kernel_name()),
         _ => None,
     }

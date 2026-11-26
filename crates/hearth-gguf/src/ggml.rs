@@ -51,6 +51,11 @@ pub enum GgmlDType {
     Q10G128, // 43: PRISM Q1_0_G128 1-bit binary, 128-element blocks, 18 bytes
     PQ2_0,   // 142: Prism 2-bit ternary g128, 34-byte blocks, Hadamard-rotated basis
     PTQ1_0,  // 143: Prism dense-trit ternary g128, 28-byte blocks, Hadamard-rotated basis
+    /// Stock llama.cpp `Q2_0`: 64-element groups, 18-byte blocks. No GGUF id of its own —
+    /// type 42 means the Prism fork's 128-element block, and the two layouts share that id.
+    /// `GgufFile::open` assigns this from the tensor footprint, so it never comes from
+    /// [`GgmlDType::from_id`].
+    Q2_0G64,
 }
 
 impl GgmlDType {
@@ -122,6 +127,7 @@ impl GgmlDType {
             Self::IQ4NL4x4 | Self::IQ4NL4x8 | Self::IQ4NL8x8 => 32,
             Self::Q4_0_4_4 | Self::Q4_0_4_8 | Self::Q4_0_8_8 => 32,
             Self::Q2_0 => 128,
+            Self::Q2_0G64 => 64,
             Self::PQ2_0 => 128,
             Self::PTQ1_0 => 128,
             Self::TQ1_0 | Self::TQ2_0 => 32,
@@ -164,6 +170,7 @@ impl GgmlDType {
             Self::TQ1_0 => 34,
             Self::TQ2_0 => 34,
             Self::Q2_0 => 34,
+            Self::Q2_0G64 => 18,
             Self::PQ2_0 => 34,
             Self::PTQ1_0 => 28,
             Self::Q1_0 | Self::Q10G128 => 18,
@@ -216,6 +223,7 @@ impl GgmlDType {
             Self::IQ4NL8x8 => "IQ4_NL_8x8",
             Self::Q1_0 => "Q1_0",
             Self::Q2_0 => "Q2_0",
+            Self::Q2_0G64 => "Q2_0_G64",
             Self::Q10G128 => "Q1_0_G128",
             Self::PQ2_0 => "PQ2_0",
             Self::PTQ1_0 => "PTQ1_0",
@@ -237,6 +245,9 @@ impl GgmlDType {
     }
 
     pub fn is_q1(&self) -> bool {
-        matches!(self, Self::Q1_0 | Self::Q10G128 | Self::Q2_0)
+        matches!(
+            self,
+            Self::Q1_0 | Self::Q10G128 | Self::Q2_0 | Self::Q2_0G64
+        )
     }
 }

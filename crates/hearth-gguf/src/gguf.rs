@@ -149,6 +149,41 @@ fn read_meta_value(data: &[u8], pos: &mut usize, type_id: u32) -> Result<MetaVal
     })
 }
 
+/// Type 42 names two incompatible layouts: the Prism fork packs 128 weights into a 34-byte
+/// block, stock llama.cpp packs 64 into an 18-byte one. The Ternary-Bonsai 2.5 `Q2_0` file is
+/// the stock layout, and reading it as the fork's gave 36 bytes per 128 weights, which decoded
+/// as garbage. The id cannot tell them apart, so classify by the footprint the file actually
+/// gives each tensor; the stride check then confirms the guess.
+fn resolve_q2_0_group_size(
+    tensors: &mut [TensorInfo],
+    file_len: u64,
+    data_offset: u64,
+    alignment: u64,
+) {
+    let mut order: Vec<usize> = (0..tensors.len()).collect();
+    order.sort_by_key(|&i| tensors[i].offset);
+
+    for (pos, &i) in order.iter().enumerate() {
+        if tensors[i].dtype != GgmlDType::Q2_0 {
+            continue;
+        }
+        let stride = match order.get(pos + 1) {
+            Some(&next) => tensors[next].offset.saturating_sub(tensors[i].offset),
+            None => file_len.saturating_sub(data_offset + tensors[i].offset),
+        };
+        let elems = tensors[i].element_count() as usize;
+        let grouped_64 = GgmlDType::Q2_0G64.byte_size(elems) as u64;
+        let grouped_128 = tensors[i].byte_size() as u64;
+        let fits = |want: u64| stride >= want && stride - want < alignment;
+
+        // Only reinterpret when the stock layout fits and the fork layout does not. A tensor
+        // whose footprint fits neither keeps type 42 and is refused by the stride check.
+        if fits(grouped_64) && !fits(grouped_128) {
+            tensors[i].dtype = GgmlDType::Q2_0G64;
+        }
+    }
+}
+
 /// Every tensor occupies the gap between its own offset and the next tensor's, padded to
 /// `alignment`. If a file lays its blocks out at a different width than its dtype claims — a
 /// `Q2_0` pack written at 36 bytes per 128-element block, say — the first block of each tensor
@@ -296,6 +331,7 @@ impl GgufFile {
             pos as u64
         };
 
+        resolve_q2_0_group_size(&mut tensors, data.len() as u64, data_offset, alignment);
         verify_tensor_layout(&tensors, data.len() as u64, data_offset, alignment)?;
 
         Ok(GgufFile {

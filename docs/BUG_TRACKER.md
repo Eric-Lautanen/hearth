@@ -3,6 +3,47 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### The 2.5 27B `Q2_0` pack decodes: type 42 also means stock llama.cpp's 64-element groups (2026-11-26)
+
+The pack is readable now. The layout was not a mystery once the reference was read: type 42 names
+two incompatible formats — the Prism fork's 128-element block (34 bytes, what Hearth had) and stock
+llama.cpp's `Q2_0` at **64 weights per 18-byte group** (`ggml-org/llama.cpp` `QK2_0 = 64`,
+`{0,1,2,3} → {-1,0,+1,+2}`, fp16 scale first, 2-bit codes LSB-first). 36 bytes per 128 weights is
+exactly two of those groups, which is what the tensor table measured.
+
+**Verified against the working pack before any Rust was written.** Decoding row 0 of
+`token_embd.weight` with the 64-element layout and comparing it with the same row from the `PQ2_0`
+pack: 512/512 signs agree, cosine 1.00000, both `mean|w|=0.010744`, same 0.015 scale. The two packs
+carry the same weights under different containers, so a correct decoder must reproduce `PQ2_0`
+exactly — and it does.
+
+**Implementation.** `hearth-quant/src/q2_0_g64.rs` holds the format: `dequantize`, an f32 reference
+dot, an AVX2 LUT kernel and a scalar fallback, selected by `kernel_name()`. `q2_0.rs` is untouched,
+so the dense 1.7B/4B/8B `Q2_0` models keep the 34-byte kernel bit for bit (`[kernel] Q2_0=avx2_lut`
+still prints for them). The id cannot distinguish the layouts, so `GgufFile::open` classifies each
+type-42 tensor from its footprint and only reports `Q2_0G64` when the 18-byte stride fits and the
+34-byte one does not; a file that fits neither keeps type 42 and is refused by the stride guard.
+
+**Measured.** Coherent output that matches the working pack's prefix (`# Copyright (c) 2013-…`), and
+the hidden state through the embedding dequant is now identical to `PQ2_0`'s (`emb_raw mean=0.011265`
+where the misread layout gave 132.0). Forward time is at parity with the 128-element layout:
+
+| 2.5 27B, 50 tokens | forward ms/token | `ffn gate/up` | `ffn down` | tok/s (warm) |
+| --- | --- | --- | --- | --- |
+| `Q2_0` (64-el) | 505 | 9.61 s | 4.78 s | 2.03, 2.02 |
+| `PQ2_0` (128-el) | 525 | 9.74 s | 5.05 s | 1.94 baseline |
+
+Both read ~2.1 bits per weight, so parity is the expected result. One thing that is not the kernel:
+on this 16 GB box the 7.6 GB of weights do not stay resident, so the first run after a cold read
+reports 1.1-1.5 tok/s and later runs report ~2.0. The dense six-model baseline re-ran at
+44.5 / 24.1 / 21.2 / 10.2 / 11.8 / 5.9 against 48.1 / 27.1 / 24.4 / 11.7 / 12.4 / 6.2 recorded
+earlier — uniformly 7-10% under, including the `Q1_0` models whose code path this change does not
+touch, and reproduced on a second pass, so it is session frequency state rather than a regression.
+
+**Not done.** The 64-element layout has no paired-token (`x2`) prefill kernel, so prompt processing
+walks the two activation rows separately and re-reads the weights; decode, which is what the table
+measures, is unaffected.
+
 ### A tensor stride no longer has to be trusted: mismatched packs are refused at load (2026-11-26)
 
 `GgufFile::open` now checks every tensor's real footprint against what its dtype claims, so the
@@ -83,9 +124,9 @@ this bug, and changing the rotation would have broken the two packs that work. D
 are unaffected because their packs really are 34 bytes per 128 — the dtype id alone does not
 distinguish the two encodings, which is the hazard.
 
-**Resolved** by the entry above: the pack is now refused at load, before any tensor is decoded. What
-remains is the other half — implementing the 36-byte layout, if this pack is worth supporting at all
-(wider blocks mean more bytes read per token, so it would not be faster than `PQ2_0`).
+**Resolved twice over**: the stride guard refuses a layout Hearth cannot decode, and the 64-element
+kernel above decodes this one. The Hadamard metadata difference recorded here was never the cause of
+the garbage — do not revisit it.
 
 
 ### Full re-baseline: all 15 packs (2026-11-26)
