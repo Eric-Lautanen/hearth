@@ -18,10 +18,12 @@ pub fn dequantize(data: &[u8], out: &mut [f32]) {
 }
 
 pub fn quantize_into(src: &[f32], dst: &mut [u8]) {
-    let n = src.len();
-    let full = n / 32;
+    // `full` belongs to the vector path alone: on a target without one the whole
+    // row goes to the scalar reference, so binding it outside the `cfg` block is
+    // an unused variable there (and a warning the gate would refuse).
     #[cfg(target_arch = "x86_64")]
     {
+        let full = src.len() / 32;
         if !crate::scalar_only() && crate::avx2_available() {
             // SAFETY: the vector path is entered only when the CPU reports
             // AVX2, and it reads and writes exactly the blocks it is given.
@@ -42,8 +44,20 @@ pub fn quantize(src: &[f32], dst: &mut Vec<u8>) {
     let blocks = src.len().div_ceil(32);
     dst.reserve(blocks * 34);
     let start = dst.len();
-    dst.resize(start + blocks * 34, 0);
-    quantize_into(src, &mut dst[start..]);
+    // Write into the spare capacity instead of growing the vector with zeros
+    // first: this is the dense model's activation path, and the memset would
+    // be a second pass over bytes that are overwritten a moment later.
+    //
+    // SAFETY: `reserve` guarantees room for `blocks * 34` more bytes, and
+    // `quantize_into` writes every one of them (it is given exactly that
+    // many) before `set_len` grows the vector over them. `u8` has no invalid
+    // bit patterns, so the bytes are fully initialized once written.
+    unsafe {
+        let spare = dst.spare_capacity_mut();
+        let out = std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, blocks * 34);
+        quantize_into(src, out);
+        dst.set_len(start + blocks * 34);
+    }
 }
 
 /// The reference quantization: one block at a time, on the CPU.
@@ -367,6 +381,10 @@ mod tests {
 
     /// A deterministic pseudo-random row, so the tests do not depend on a
     /// random number generator's implementation.
+    ///
+    /// Only the vector paths' equality tests use it, and those exist on x86_64
+    /// alone; on any other target it would be dead code.
+    #[cfg(target_arch = "x86_64")]
     fn pseudo_random(n: usize, seed: u32) -> Vec<f32> {
         let mut s = seed;
         (0..n)
