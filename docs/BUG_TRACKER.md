@@ -3,6 +3,50 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### The 2.5 27B `Q2_0` pack downloads clean and decodes at 2.1 tok/s of garbage (2026-11-26)
+
+Both 2.5 packs that were missing are now on disk and byte-exact against the catalog
+(`PQ2_0` 7,253,354,848 B, `Q2_0` 7,673,194,848 B), so the 27B sweep is complete:
+
+| pack | tok/s | output |
+| --- | --- | --- |
+| 2.5-27B `PTQ1_0` | 2.16 | coherent |
+| 2.5-27B `PQ2_0` | 1.94 (1.93, 1.95) | coherent |
+| 2.5-27B `Q2_0` | 2.15 (2.11, 2.18) | **`!!!!` on every prompt** |
+
+`PQ2_0` lands 2% under `PTQ1_0`, which is the expected ordering (2-bit pooled weights decode at
+about the same speed as the 1-bit ones because both bottleneck on the same pooled kernel). `Q2_0`
+came in *faster than both* and that was the first hint something was wrong: it is not doing the same
+work correctly.
+
+**What is ruled out.** The two packs have identical geometry — `blk.0.ffn_gate.weight` is
+`shape=[5120,17408] dtype=… byte_size=23674880` in both, i.e. 34 bytes per 128 elements — and
+Hearth hands `PQ2_0` and `Q2_0` to the *same* kernel (`hearth-quant/src/lib.rs:414` maps both to
+`q2_0::kernel_name()`, and `qwen35::q8_dot` maps both to `dot_q2_0_q8_0_ptr`). Dense `Q2_0` models
+are fine on this build (1.7B/4B/8B all coherent), and the hybrid `PQ2_0` is fine, so neither the
+kernel nor the block size is the candidate.
+
+**What differs.** The Hadamard metadata, which is the only thing the hybrid forward treats as
+load-bearing:
+
+| key | `PTQ1_0` | `PQ2_0` | `Q2_0` |
+| --- | --- | --- | --- |
+| `prism.hadamard.inverse_weight_names` | `[token_embd.weight]` | `[token_embd.weight]` | absent |
+| `prism.hadamard.weight_names` | absent | absent | present, 13,397 B of names |
+
+The loader reads `block_size`, `sign_values` (required), `inverse_weight_names` and `gdn_v_grouped`,
+and never looks at `weight_names`. The leading reading is that the two working packs store weights
+already rotated (which is why `ffn_block` can rotate *every* activation unconditionally and why
+`token_embd` is named as the one weight needing the inverse), while the `Q2_0` pack declares its
+rotated set explicitly and stores the rest in the original basis — so the blanket activation
+rotation is wrong for it. That is a hypothesis with three observations behind it, not a proven
+cause; the first experiment should be to dump `weight_names`, see whether it lists the ffn/mix
+projections, and then either rotate per that list or skip the rotation for packs without
+`inverse_weight_names`.
+
+Until it is fixed the pack is dangerous in a way the stale-README problem was not: it loads, it
+runs at full speed, and it produces plausible-looking token counts. The README marks the row.
+
 ### Full re-baseline: all 15 packs (2026-11-26)
 
 The benchmark mandate, run end to end after the ffn sub-timers: every pack on this machine, one at a

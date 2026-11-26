@@ -31,7 +31,7 @@ for rotation representation, avoiding gimbal lock...
 
 ## Performance
 
-15 packs on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5), at `--temp 0
+17 packs on AMD Ryzen 7 8840HS (Zen 4, 8C/16T, DDR5), at `--temp 0
 --max-tokens 50 --prompt "Hello" --prompt-raw`, idle machine, one model at a
 time, a warm-up run then two measured runs each — the mean is shown, all
 measured 2026-11-26. Every model runs at its shipped worker count (dense models
@@ -58,13 +58,19 @@ is what `scripts/count-sweep.py` measures for you.
 | 27B² | PTQ1_0 (1-bit)       | —       | 64     | **2.2** |
 | 27B² | PQ2_0 (2-bit)        | —       | 64     | **2.0** |
 | 27B³ | PTQ1_0 (1-bit)       | —       | 64     | **2.2** |
+| 27B³ | PQ2_0 (2-bit)        | —       | 64     | **1.9** |
+| 27B³ | Q2_0 (2-bit)†        | —       | 64     | **2.1** |
 
 ² = Ternary Bonsai 2 (`qwen35` hybrid). ³ = Ternary Bonsai 2.5, the agentic
-refresh of the same architecture: its `PTQ1_0` matches the 2-series 27B to the
-rounding (`PQ2_0` and `Q2_0` were not on the sweep machine, so they carry no
-number here). The 27B runs at ~2 tok/s, so raise `--max-tokens` deliberately —
-the UI streams progress and reasoning live instead of buffering a reply. Raw
-data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md).
+refresh of the same architecture: `PTQ1_0` matches the 2-series 27B to the
+rounding and `PQ2_0` is 2% under it. † = the 2.5 `Q2_0` pack **loads and decodes
+at that rate but its output is wrong** (a run of `!` for every prompt): it is the
+only pack that carries `prism.hadamard.weight_names`, a rotation list Hearth does
+not read, where the working packs carry `inverse_weight_names`. Tracked in
+`docs/BUG_TRACKER.md`; treat the row as a speed measurement of a broken pack, not
+as a usable model. The 27B runs at ~2 tok/s, so raise `--max-tokens`
+deliberately — the UI streams progress and reasoning live instead of buffering a
+reply. Raw data: [`docs/BUG_TRACKER.md`](docs/BUG_TRACKER.md).
 
 ## Features
 

@@ -14,6 +14,8 @@
 > partly real arithmetic the read-only 228.5 ms figure never did) and **+15.1 ms in the serial
 > rotate+quantize**. Finished with the mandated sweep over all 15 packs on this machine and a
 > re-baselined README: the dense six were never stale (±5%), the hybrid rows were 1.6-1.75x low.
+> Then the two missing 2.5 packs were downloaded and benched: `PQ2_0` is a clean 1.94 tok/s, but
+> `Q2_0` runs at 2.15 tok/s of `!` — the first hybrid pack whose weights are not all pre-rotated.
 > Detail: `docs/BUG_TRACKER.md`, newest entry first.
 
 Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md`,
@@ -23,8 +25,8 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
 
 `48.1 / 27.1 / 24.4 / 11.7 / 12.4 / 6.2` tok/s for the dense six in README order (1.7B Q1_0,
 1.7B Q2_0, 4B Q1_0, 4B Q2_0, 8B Q1_0, 8B Q2_0); `25.3 / 25.1 / 12.0 / 11.2 / 6.7 / 6.3` for the
-hybrid 2B/4B/9B in PTQ1_0, PQ2_0 order; `2.17 / 1.98` for the 27B pair and `2.16` for the 2.5
-refresh `PTQ1_0`. Per-file drift is not uniform — the 2B `PTQ1_0` read 27.81 then 22.81 in one
+hybrid 2B/4B/9B in PTQ1_0, PQ2_0 order; `2.17 / 1.98` for the 27B pair, and `2.16 / 1.94 / 2.15` for the 2.5
+refresh (`PTQ1_0`, `PQ2_0`, `Q2_0` — the last one is a broken pack, see below). Per-file drift is not uniform — the 2B `PTQ1_0` read 27.81 then 22.81 in one
 session — so compare the model you changed, and use alternating pairs, never two single runs.
 
 ## Do these first
@@ -42,10 +44,14 @@ session — so compare the model you changed, and use alternating pairs, never t
    downstream is width-agnostic (scans stay per token, scratch is sized from the constant), so it is
    a one-line change plus identity and timing runs. If the 1 MB tile is not actually resident, the
    number will be flat or worse — measure.
-3. **Download and smoke the other 2.5 packs** (`PQ2_0` 7,253,354,848 B, `Q2_0` 7,673,194,848 B).
-   Headers match `PTQ1_0`, but only `PTQ1_0` has decoded a token here, and `Q2_0` exercises the Q2
-   kernel path of the hybrid forward that `PTQ1_0` does not. The README gives them no number until
-   they have one.
+3. **Fix or refuse the 2.5 `Q2_0` pack — it decodes at 2.1 tok/s of `!!!!`.** Downloaded clean and
+   byte-exact, and it is the first hybrid pack whose weights are *not* all pre-rotated: it carries
+   `prism.hadamard.weight_names` where the working packs carry `inverse_weight_names`, and the loader
+   reads neither `weight_names` nor a "weights are in the original basis" signal, while `ffn_block`
+   and the mix projections rotate every activation unconditionally. Start by dumping `weight_names`
+   and checking whether it lists the ffn/mix projections; then either rotate per that list or skip the
+   rotation when `inverse_weight_names` is absent. Until then, prefer failing the load to decoding
+   garbage — see `docs/BUG_TRACKER.md` for the evidence and the ruled-out candidates.
 4. **Tool calling is the next template gap, and it is unchecked.** The 2.5 template's `tools` branch
    (`|tojson`, `tool_call.function`, `{% for k, v in …|items %}`, the `<tool_call>` XML format)
    parses, but no fixture exercises it: `TemplateContext` has no `tools` field. Before wiring tools
