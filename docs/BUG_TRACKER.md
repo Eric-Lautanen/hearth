@@ -3,6 +3,100 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### The Hadamard fold and the Q8 quantize are AVX2 now, and byte-identical (2026-11-26)
+
+The RESUME's first "do this" item: `rotate_quantize_into` was 15.1 ms/token on the 27B (3% of
+the token) and was the largest removable term left in decode. It is now vectorized, and the
+bit-identity is asserted by a test rather than by five matching texts.
+
+**What moved where.** The normalized Sylvester-Walsh-Hadamard transform and the ±1 sign pass
+left `hearth-llm/src/model/qwen35.rs` and now live in `hearth-quant/src/hadamard.rs`, beside
+the Q8 quantize they feed. `hadamard_rotate` / `hadamard_unrotate` in the model are thin
+wrappers over them. The transform is the same butterfly as before - stage `h` computes `a + b`
+and `a - b` on disjoint pairs - but stages `h = 1, 2, 4` are now lane permutations inside an
+8-lane group (`vpermd` for the partner, a blend to pick `v + p` or `p - v`), and the stages
+`h >= 8` are load/add/store pairs of the two halves of each group. The normalization is still
+one multiply by `1.0/(n as f32).sqrt()` at the very end. The Q8_0 activation quantize in
+`hearth-quant/src/q8_0.rs` is AVX2 as well (four 8-lane vectors per 32-element block: the block
+maximum, the scale, and the rounding), and the scalar path stays in the tree as the reference
+implementation.
+
+**The identity is a unit test.** Nine new tests in `hearth-quant` compare the vector path
+against the scalar reference **byte for byte**: the quantize over nine row shapes (1..4097
+values, whole and partial blocks) and over the cases where the two could disagree - an
+all-zero block (the stored fp16 must be 1.0, not 0), exact ±0.5 ties, the max/127 boundary, a
+scale that underflows to zero, a denormal scale, a NaN, an infinity, signed zeros - plus the
+Hadamard transform compared on `to_bits()` for n = 8, 16, 64, 1024, 2048, the rotate/unrotate
+order, and the sign pass. Every generated text was byte-identical between the arms on all
+seven models measured.
+
+Three things the arithmetic has to get right, because the folded weights are quantized and a
+changed rounding changes the token stream:
+
+* **The rounding is half away from zero**, which is what `f32::round` does, and *not*
+  `roundps`'s half-to-even. It is `x + copysign(0.5, x)` truncated toward zero. The step cannot
+  cross an integer: 0.5 is a multiple of x's ulp, so `x + 0.5` is exact while it stays in x's
+  own binade, and when it leaves that binade the only integer left in range is the boundary,
+  which the sum cannot pass. (Cinder caught the first version of this comment claiming the
+  addition was always exact - it is not - and the code was right while the reason was wrong.)
+* **The clamp happens before the rounding.** Rounding then clamping and clamping then rounding
+  give the same integer for every finite value (the bounds are integers), and clamping first
+  keeps `|x| <= 128`, which is what makes the ±0.5 step above safe.
+* **A NaN in a block goes back to the scalar path.** The scalar ignores a NaN in the maximum and
+  casts a NaN value to 0; `minps`/`maxps` clamping cannot reproduce either. The vector path
+  checks the block for non-finite values and hands such a block to the reference
+  implementation, which is also the answer for an infinite scale.
+
+**Measured**, 2.5 27B `PQ2_0`, 30-token decode, `[q35timing]` rows, one binary with
+`HEARTH_QUANT_SCALAR=1` choosing the arm:
+
+| row | before (scalar) | after (AVX2) | speedup |
+| --- | --- | --- | --- |
+| `ffn q in` | 104,746 us | 23,338 us | 4.5x |
+| `ffn q mid` | 351,082 us | 77,606 us | 4.5x |
+| sum | 455,828 us | 100,944 us | **-354,884 us = -11.8 ms/token** |
+
+That is the 15.1 ms/token the RESUME predicted, measured. End to end it is 11.8 ms of a
+~480 ms token, i.e. 2.4%, which is *below* the run-to-run noise of the heavy stages on this
+box - so the honest claim is the 4.5x on the path, not a tok/s figure.
+
+**End to end**, paired A/B (alternating `b,a,a,b`, medians, same binary):
+
+| model | before | after | delta |
+| --- | --- | --- | --- |
+| Bonsai-1.7B-Q1_0 | 42.89 tok/s | 43.62 tok/s | +1.7% |
+| Ternary-Bonsai-1.7B-Q2_0 | 22.95 tok/s | 23.36 tok/s | +1.8% |
+| Bonsai-4B-Q1_0 | 18.85 tok/s | 20.11 tok/s | +6.7% |
+| Ternary-Bonsai-4B-Q2_0 | 10.63 tok/s | 10.97 tok/s | +3.2% |
+| Bonsai-8B-Q1_0 | 11.41 tok/s | 11.49 tok/s | +0.7% |
+| Ternary-Bonsai-8B-Q2_0 | 5.94 tok/s | 6.03 tok/s | +1.5% |
+| Ternary-Bonsai-2.5-27B-PQ2_0 | 1.87 tok/s | 1.91 tok/s | +1.9% |
+
+The dense models gain ~1-3%, which is what the shape predicts: the dense activation quantize
+is only 1.3% of a token (`qkv_quant` 114 us + `ffn_quant` 113 us of 17.632 ms on the 1.7B), so
+there is not much there to win. The hybrids are where the fold lives, and the 27B's +1.9% end to
+end is the 11.8 ms/token (2.4% of its token) arriving through the noise floor.
+
+**A caveat that matters for the next session's numbers.** The *before* arm above - which is the
+pre-change code path, byte for byte - reads 42.89 tok/s on the 1.7B Q1_0 where the README's
+table says 48.1, and the 4B Q1_0 reads 18.85 against 24.4. The table is stale by 6-18% on
+today's box, not because of this change: the paired A/B is immune to that drift (it is the same
+binary, minutes apart) and it says +0.7% to +6.7%. Whoever writes the next session's table
+should re-baseline all 15 packs before quoting an absolute number - the standing hazard in the
+RESUME ("re-baseline before believing a delta") is live right now.
+
+**Two pairs are not enough.** A first 2-pair pass had the 4B Q2_0 at -3.6% and the 1.7B Q2_0
+at -1.8%; with 4 pairs both came back positive. A 4-pair run of the 1.7B Q1_0 that happened
+while a browser was loading the machine read -8.4% with a per-run spread of 14.1 to 43.3 tok/s,
+and the same model read +1.7% in a quiet window with a spread of 41.3 to 44.4. Quote the
+4-pair numbers, and quote the sub-timer rows when the effect is smaller than the noise.
+
+**`HEARTH_QUANT_SCALAR=1`** turns every vector path off (the Hadamard, the sign pass, the Q8
+quantize) and falls back to the reference implementations. It is read once per process. It
+exists so a before/after pair can be measured from **one** binary: no second build, no file
+surgery on a tree three agents are editing, and no chance of comparing two different
+checkouts. The switch is documented in the README.
+
 ### Prefill batches four tokens, and the G64 pack finally pairs (2026-11-26)
 
 Two changes, both prefill-only, both text-identical at `--temp 0`.
