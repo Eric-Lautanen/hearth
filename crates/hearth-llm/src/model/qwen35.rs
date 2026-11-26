@@ -567,6 +567,35 @@ unsafe fn gdn_scan_heads(_worker: usize, begin: usize, end: usize, ctx: usize) {
     }
 }
 
+/// One row of a dense f32 matvec, accumulated in ascending `c` — the order the
+/// serial loop used, which is what keeps the split bit-identical.
+struct MatvecCtx {
+    w: *const f32,
+    x: *const f32,
+    out: *mut f32,
+    n_cols: usize,
+}
+
+/// Below this many multiply-adds a pool dispatch (~50 us) costs more than the
+/// rows it would split: a 32k-MAC matvec takes ~10 us.
+const MATVEC_PARALLEL_MACS: usize = 1 << 15;
+
+/// # Safety
+/// `ctx` points to a live [`MatvecCtx`], and rows `begin..end` of `out` are
+/// writable and disjoint from every other window the pool hands out.
+unsafe fn matvec_rows(_worker: usize, begin: usize, end: usize, ctx: usize) {
+    let c = &*(ctx as *const MatvecCtx);
+    let x = core::slice::from_raw_parts(c.x, c.n_cols);
+    for r in begin..end {
+        let row = core::slice::from_raw_parts(c.w.add(r * c.n_cols), c.n_cols);
+        let mut acc = 0.0f32;
+        for (v, xv) in row.iter().zip(x.iter()) {
+            acc += v * xv;
+        }
+        *c.out.add(r) = acc;
+    }
+}
+
 pub struct Qwen35Core {
     config: ModelConfig,
     pool: ThreadPool,
@@ -1283,19 +1312,34 @@ impl Qwen35Core {
         Ok(())
     }
 
-    /// Serial f32 matvec over a small load-dequantized weight
-    /// (`ssm_alpha`/`ssm_beta`: `dt_rank` rows of `d_model`). Only ~32k MACs, so
-    /// a pool dispatch would cost more than the work itself.
+    /// Dense f32 matvec over a load-dequantized weight (`ssm_alpha`/`ssm_beta`:
+    /// `dt_rank` rows of `d_model`, 48 x 5120 on the 27B), split across the pool
+    /// by row.
+    ///
+    /// Rows are independent and each keeps the ascending-`c` accumulation of the
+    /// serial loop this replaced, so the result is bit-identical. It is not a
+    /// small matvec: two of these per GDN layer push 96.5 MB of f32 per token,
+    /// which on one thread was 21 ms of the 27B's `gdn/attn` stage (`gdn gates`
+    /// in `HEARTH_Q35_TIMERS`) at 4.6 GB/s.
+    ///
+    /// `par_for` publishes its window through the pool's shared state, so this
+    /// must be called from the token-ordered path on the calling thread — never
+    /// from inside a pool task.
     fn matvec_dense(&self, w: &[f32], x: &[f32], out: &mut [f32]) {
         let n_cols = x.len();
-        for (r, o) in out.iter_mut().enumerate() {
-            let row = &w[r * n_cols..(r + 1) * n_cols];
-            let mut acc = 0.0f32;
-            for (c, v) in row.iter().enumerate() {
-                acc += v * x[c];
-            }
-            *o = acc;
+        let rows = out.len();
+        let ctx = MatvecCtx {
+            w: w.as_ptr(),
+            x: x.as_ptr(),
+            out: out.as_mut_ptr(),
+            n_cols,
+        };
+        let ctx = &ctx as *const MatvecCtx as usize;
+        if rows * n_cols < MATVEC_PARALLEL_MACS {
+            unsafe { matvec_rows(0, 0, rows, ctx) };
+            return;
         }
+        self.pool.par_for(rows, matvec_rows, ctx);
     }
 
     // -- sandwich norm + FFN ------------------------------------------------

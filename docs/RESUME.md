@@ -82,6 +82,15 @@ Earlier sessions: `docs/BUG_TRACKER.md`. Packaging: `packaging/windows/README.md
 
 ## Open inference items (most valuable first)
 
+0. **The 27B's stage-level waste is gone; do not re-open it.** `matvec_dense` is split over the
+   pool now (`gdn gates` 20 ms -> 3-4 ms, `gdn/attn` 154.5 -> 138.9, five hybrid models still
+   byte-identical), the PTQ1_0 decode is 16 lanes wide, and the scan measures 8.5-9.7 ms with
+   nothing to win without changing summation. What remains in the stage is size-limited matmul
+   throughput: 6.7-11.2 MiB projections read 77-85% of the ceiling for their own size, so a stage
+   number below `kernel-bench`'s 140 MiB headline is expected rather than a leak.
+
+## Open inference items (most valuable first)
+
 0. **Parallelize `matvec_dense` over rows — the one measured waste left in the 27B's gdn/attn.**
    `ssm_alpha`/`ssm_beta` are f32 (1.92 MiB per GDN layer) and are dotted on one thread: 96.5 MB
    per token at 4.6 GB/s, 21 ms, 13% of the stage. Rows are independent dots in ascending `c`, so

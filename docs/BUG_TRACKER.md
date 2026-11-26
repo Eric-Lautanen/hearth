@@ -3,6 +3,40 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### `matvec_dense` split over the pool: `gdn gates` 20 ms -> 3-4 ms (2026-11-25)
+
+The sub-stage timers found the one genuinely slow thing in the 27B's `gdn/attn`: `ssm_alpha`/
+`ssm_beta` are f32 and were dotted on one thread, 96.5 MB per token at 4.6 GB/s for 21 ms. They are
+48 rows of 5120, and the rows are independent, so `matvec_dense` now hands them to `pool.par_for`
+once `rows * cols` reaches 32k MACs (below that a dispatch costs more than the rows; a 32k-MAC
+matvec is ~10 us against ~50 us of dispatch). Each row keeps the serial loop's ascending-`c`
+accumulation, so nothing about the arithmetic moved — only which worker owns which row.
+
+A/B with both binaries interleaved on the same machine and model (27B PTQ1_0, 20 tokens):
+
+| | gdn gates | gdn/attn | ffn | decode |
+| --- | --- | --- | --- | --- |
+| before, round 1 | 19.6 ms | 154.5 | 257.6 | 430.9 |
+| after, round 1 | **3.1** | **138.9** | 260.1 | **417.7** |
+| before, round 2 | 20.0 | 160.2 | 265.5 | 444.7 |
+| after, round 2 | **4.4** | 153.1 | 280.8 | 454.0 |
+
+Round 2's `ffn` drifted 5.8% slower after the change, which swamps the decode total; normalising
+the stage for that drift puts it at ~144.8 ms, i.e. the same ~15 ms saving as round 1. The gates
+matvec itself runs at 22-31 GB/s now, in f32, instead of 4.6.
+
+**Byte-identical.** Five hybrid models (2.5-27B PTQ1_0, 2-2B/4B/9B PTQ1_0, 2-27B PQ2_0) produce
+the same text as a binary built from the previous commit at 48 tokens.
+
+**Reentrancy.** `par_for` publishes its window through the pool's shared state, so `matvec_dense`
+must stay on the thread that walks tokens in order — it does: `gdn_alpha_beta` is called from
+`gdn_layer`, and both prefill paths run that per token on the calling thread. Doing the same split
+from inside a pool task would corrupt the dispatch parameters, which is now stated in the
+function's doc.
+
+What is left in the stage is the scan (8.5-9.7 ms) and the size-limited matmuls; neither is the
+kind of thing this entry was fixing.
+
 ### The 8-lane decode defect is PTQ1_0's alone: Q1_0_G128 and Q2_0 measured (2026-11-25)
 
 PTQ1_0 gained 39% by decoding 16 lanes at a time instead of 8-byte halves with an `i8` pack and a
