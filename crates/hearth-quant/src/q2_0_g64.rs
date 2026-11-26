@@ -201,6 +201,110 @@ pub unsafe fn dot_q2_0_g64_q8_0_ptr(w_ptr: *const u8, a_ptr: *const u8, n: usize
     dot_q2_0_g64_q8_0_scalar(w_ptr, a_ptr, n)
 }
 
+/// Paired-token AVX2 LUT kernel: the same weight row against two activation rows,
+/// expanded once.
+///
+/// Each token's accumulation order is identical to
+/// [`dot_q2_0_g64_q8_0_lut_avx2`]'s — `acc_block` over `sub`, then `w_scale` —
+/// so the pair of results is bit-identical to two single calls; only the LUT
+/// stores are shared. A 64-element group covers two Q8_0 activation blocks, so
+/// the expansion is four table stores per 16 elements, and each token gets its
+/// own `vpmaddwd` from them.
+///
+/// # Safety
+/// `w_ptr` must be valid for `n/64*18` bytes and `a0_ptr`/`a1_ptr` each for
+/// `n/32*34` bytes; the caller must confirm AVX2, FMA and F16C are present — see
+/// [`avx2_lut_available`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "fma")]
+#[target_feature(enable = "f16c")]
+unsafe fn dot_q2_0_g64_q8_0x2_lut_avx2(
+    w_ptr: *const u8,
+    a0_ptr: *const u8,
+    a1_ptr: *const u8,
+    n: usize,
+) -> (f32, f32) {
+    let blocks = n / BLOCK_SIZE;
+    let mut acc_global0 = _mm256_setzero_ps();
+    let mut acc_global1 = _mm256_setzero_ps();
+    for b in 0..blocks {
+        let w_off = b * BLOCK_BYTES;
+        let w_scale = _mm256_set1_ps(crate::f16_bits_to_f32(u16::from_le_bytes([
+            *w_ptr.add(w_off),
+            *w_ptr.add(w_off + 1),
+        ])));
+        let qs = w_ptr.add(w_off + 2);
+
+        let mut acc_block0 = _mm256_setzero_ps();
+        let mut acc_block1 = _mm256_setzero_ps();
+        for sub in 0..2 {
+            let a_off = (b * 2 + sub) * Q8_BLOCK_BYTES;
+            let a0_scale = _mm256_set1_ps(crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a0_ptr.add(a_off),
+                *a0_ptr.add(a_off + 1),
+            ])));
+            let a1_scale = _mm256_set1_ps(crate::f16_bits_to_f32(u16::from_le_bytes([
+                *a1_ptr.add(a_off),
+                *a1_ptr.add(a_off + 1),
+            ])));
+            let a0_vals = a0_ptr.add(a_off + 2);
+            let a1_vals = a1_ptr.add(a_off + 2);
+            let qs_sub = qs.add(sub * 8);
+
+            let mut acc0 = _mm256_setzero_si256();
+            let mut acc1 = _mm256_setzero_si256();
+            for half in 0..2usize {
+                let v0 =
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(a0_vals.add(half * 16) as *const __m128i));
+                let v1 =
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(a1_vals.add(half * 16) as *const __m128i));
+                let mut w_buf: [i16; 16] = [0i16; 16];
+                for j in 0..4usize {
+                    core::ptr::copy_nonoverlapping(
+                        Q2V_I16[*qs_sub.add(half * 4 + j) as usize].as_ptr(),
+                        w_buf.as_mut_ptr().add(j * 4),
+                        4,
+                    );
+                }
+                let s = _mm256_loadu_si256(w_buf.as_ptr() as *const __m256i);
+                acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(v0, s));
+                acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(v1, s));
+            }
+
+            acc_block0 = _mm256_fmadd_ps(a0_scale, _mm256_cvtepi32_ps(acc0), acc_block0);
+            acc_block1 = _mm256_fmadd_ps(a1_scale, _mm256_cvtepi32_ps(acc1), acc_block1);
+        }
+        acc_global0 = _mm256_fmadd_ps(w_scale, acc_block0, acc_global0);
+        acc_global1 = _mm256_fmadd_ps(w_scale, acc_block1, acc_global1);
+    }
+    (hsum_float_8(acc_global0), hsum_float_8(acc_global1))
+}
+
+/// Paired-token dot for `Q2_0G64` prefill: one weight-row expansion for two
+/// activations, bit-identical to two calls to [`dot_q2_0_g64_q8_0_ptr`].
+///
+/// # Safety
+/// `w_ptr` must be valid for `n/64*18` bytes and `a0_ptr`/`a1_ptr` each for
+/// `n/32*34` bytes.
+pub unsafe fn dot_q2_0_g64_q8_0x2_ptr(
+    w_ptr: *const u8,
+    a0_ptr: *const u8,
+    a1_ptr: *const u8,
+    n: usize,
+) -> (f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_lut_available() {
+            return dot_q2_0_g64_q8_0x2_lut_avx2(w_ptr, a0_ptr, a1_ptr, n);
+        }
+    }
+    (
+        dot_q2_0_g64_q8_0_ptr(w_ptr, a0_ptr, n),
+        dot_q2_0_g64_q8_0_ptr(w_ptr, a1_ptr, n),
+    )
+}
+
 /// Name of the kernel [`dot_q2_0_g64_q8_0_ptr`] selects on this machine.
 pub fn kernel_name() -> &'static str {
     #[cfg(target_arch = "x86_64")]
@@ -301,5 +405,40 @@ mod tests {
             "{} {dispatched} vs reference {reference}",
             kernel_name()
         );
+    }
+
+    /// The paired kernel must be *exactly* two single dots, not merely close: a
+    /// prefill that pairs tokens feeds the same weight row to two activations, so
+    /// any reordering would make prefill output differ from decode's.
+    #[test]
+    fn paired_kernel_is_bit_identical_to_two_single_dots() {
+        let n = BLOCK_SIZE * 6;
+        let mut w = vec![0u8; n / BLOCK_SIZE * BLOCK_BYTES];
+        let mut a0 = vec![0u8; n / 32 * Q8_BLOCK_BYTES];
+        let mut a1 = vec![0u8; n / 32 * Q8_BLOCK_BYTES];
+        let mut seed = 0x2468_ace1u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+        for (i, b) in w.iter_mut().enumerate() {
+            *b = if i % BLOCK_BYTES < 2 { 0x3c } else { next() };
+        }
+        for buf in [&mut a0, &mut a1] {
+            for blk in 0..n / 32 {
+                let off = blk * Q8_BLOCK_BYTES;
+                buf[off] = 0x30;
+                buf[off + 1] = 0x3c;
+                for j in 0..32 {
+                    buf[off + 2 + j] = next();
+                }
+            }
+        }
+        let single0 = unsafe { dot_q2_0_g64_q8_0_ptr(w.as_ptr(), a0.as_ptr(), n) };
+        let single1 = unsafe { dot_q2_0_g64_q8_0_ptr(w.as_ptr(), a1.as_ptr(), n) };
+        let (pair0, pair1) =
+            unsafe { dot_q2_0_g64_q8_0x2_ptr(w.as_ptr(), a0.as_ptr(), a1.as_ptr(), n) };
+        assert_eq!(pair0.to_bits(), single0.to_bits(), "first token drifted");
+        assert_eq!(pair1.to_bits(), single1.to_bits(), "second token drifted");
     }
 }

@@ -635,8 +635,9 @@ impl LlamaModel {
                 // PTQ1_0 model in the catalog is a qwen35 hybrid that never calls
                 // `matmul_batch`: wiring it here would be a no-op that reads like
                 // a prefill speedup. The hybrid prefill pairs it itself, in
-                // `qwen35.rs::mm_batched` at `PREFILL_CHUNK` = 2 (1.41x on the FFN
-                // block of a 27B PTQ1_0; see docs/BUG_TRACKER.md).
+                // `qwen35.rs::mm_batched`, which batches `PREFILL_CHUNK` prompt
+                // tokens per weight pass (1.41x on the FFN block of a 27B PTQ1_0
+                // when the chunk was two; see docs/BUG_TRACKER.md).
                 _ => None,
             };
             let _q8_hold;

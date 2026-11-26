@@ -3,6 +3,57 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Prefill batches four tokens, and the G64 pack finally pairs (2026-11-26)
+
+Two changes, both prefill-only, both text-identical at `--temp 0`.
+
+**1. `PREFILL_CHUNK` 2 -> 4** (`qwen35.rs`). The paired dot kernels still take two rows at a time,
+so a four-row chunk is two pair passes — but `pool::batched_rows_chunk` walks the weights in 1 MB
+tiles with the token loop *inside* the tile, so the second pair re-reads the tile the first pair just
+filled instead of returning to DRAM. Everything downstream was already width-agnostic (the GDN/attn
+scans stay per token in order, `ffn_block` takes `rows`), so the change is the constant and its
+scratch buffers.
+
+**2. `Q2_0G64` gets a paired kernel** (`q2_0_g64.rs::dot_q2_0_g64_q8_0x2_lut_avx2`, wired through
+`qwen35.rs::mm_batched`). A 64-element group covers two Q8_0 activation blocks, so the LUT expansion
+is shared and each token keeps its own `vpmaddwd` and its own accumulation order — bit-identical to
+two single dots, which is what the new unit test asserts on `to_bits()`.
+
+Prefill ms/token, 61-token prompt, `HEARTH_Q35_TIMERS` `prefill` row, alternating pairs (b,a,a,b) on
+one binary pair, warm:
+
+| model | before | after | delta |
+| --- | --- | --- | --- |
+| 2-2B `PTQ1_0` | 39.07, 37.01 | 34.00, 30.19 | **-15.6%** |
+| 2-9B `PTQ1_0` | 120.86, 118.92, 122.28, 116.76 | 114.58, 114.48, 115.61, 113.39 | **-4 to -5%**, 4/4 pairs |
+| 2-27B `PTQ1_0` | 474.75 (cold), 374.18 | 375.47, 376.84 | ~0 |
+| 2.5-27B `Q2_0` (G64) | 673.65 (cold), 496.67 | 336.60, 340.16 | **-32%** |
+
+The two large-model rows say different things, and the difference is the whole finding:
+
+- The 27B `PTQ1_0` row is the chunk change alone, and it is a **wash**: at `d_model` 5120 a 1 MB tile
+  is 935 rows, which does not stay resident across the second pair pass on this 8 MB-L3 part, so
+  there is no L2 reuse to collect. The rewiring is still correct; it just does not pay here.
+- The 2.5 `Q2_0` row is the **x2 kernel**, not the chunk: `mm_batched` passed `None` for `Q2_0G64`
+  before, so every tile was walked twice from DRAM. Halving that reads as -32%.
+
+Decode is untouched by construction (it calls `forward` with `rows = 1` and never enters
+`batched_rows_chunk`). Measured anyway, 50 tokens, 4 alternating pairs: 2-9B `PTQ1_0` before
+5.82 / 5.95 / 6.23 / 5.68 against after 6.38 / 6.41 / 6.45 / 6.58 tok/s; dense 1.7B `Q1_0` before
+29.19 (cold) / 42.92 against 48.97 / 45.75. Both arms sit inside this box's documented ±5-10%
+spread, in opposite directions, so nothing regressed.
+
+Identity: generated text at `--temp 0` compared between the two binaries on 2-2B `PTQ1_0`, 2-2B
+`PQ2_0`, 2-4B `PTQ1_0` (md5 of the text region), 2-9B `PTQ1_0`, 2.5-27B `Q2_0` and 2-27B `PQ2_0` —
+identical on all six. The 2.5 `Q2_0` one is the load-bearing case: it is the first run in which that
+kernel has ever been paired.
+
+**Known follow-up, not measured:** the hybrid worker counts (`physical + physical/4` for
+`Q2_0`/`PQ2_0`) were derived from a 109-token prefill at width 2 (13346 ms at 10 workers against
+13940 at 8). Width 4 is a different path, so those two numbers are now historical and the quarter is
+provisional until `scripts/count-sweep.py` is run at the new width. `pool.rs` says so in all three
+places the old width was baked into prose.
+
 ### CI now type-checks the Intel Mac release leg on every PR (2026-11-26)
 
 `check` runs on `macos-latest` (arm64), while `release.yml:45-48` builds `macos-x86_64` on

@@ -112,14 +112,17 @@ pub fn default_worker_count() -> usize {
 /// kernel and the count are one decision.
 ///
 /// `Q2_0`/`PQ2_0` take the quarter past physical: the LUT kernel is the fastest arm
-/// per thread, and the hybrid prefill batches a fixed two tokens at a time
-/// (`qwen35::forward_pair`), never a whole prompt, so it keeps the single-token
-/// path's stability as well as its appetite for threads — that distinction is the
-/// whole rule, and [`dense_worker_count_for`] has the measurements for it.
-/// Measured on Ternary-Bonsai-2-4B-PQ2_0: decode 8.5 tok/s at 10 workers against
-/// 7.9 at 8, 109-token prefill 13346 ms against 13940. `PTQ1_0` has no fast kernel
-/// and goes the other way: it hides the pool's barrier behind more threads
-/// (measured 6.7 tok/s at 12 workers against 5.9 at 8).
+/// per thread, and the hybrid prefill batches a fixed number of tokens at a time
+/// (`qwen35::forward_pair`, `PREFILL_CHUNK`), never a whole prompt, so it keeps the
+/// single-token path's stability as well as its appetite for threads — that
+/// distinction is the whole rule, and [`dense_worker_count_for`] has the measurements
+/// for it. Measured on Ternary-Bonsai-2-4B-PQ2_0 at a batch width of **two**: decode
+/// 8.5 tok/s at 10 workers against 7.9 at 8, 109-token prefill 13346 ms against
+/// 13940. The width has been four since 2026-11-26, so both of those numbers are
+/// historical and the quarter is provisional until a count sweep runs at the new
+/// width (`scripts/count-sweep.py`). `PTQ1_0` has no fast kernel and goes the other
+/// way: it hides the pool's barrier behind more threads (measured 6.7 tok/s at 12
+/// workers against 5.9 at 8).
 ///
 /// Honors `HEARTH_THREADS` first, then [`hybrid_worker_count_for`].
 pub(crate) fn hybrid_worker_count(has_q2_weights: bool) -> usize {
@@ -148,8 +151,8 @@ pub(crate) fn hybrid_worker_count(has_q2_weights: bool) -> usize {
 /// tok/s at 10, 12.9 at 9, 11.7 at 8; dense 8B Q2_0 7.0 at 9 against 6.5 at 8 - so
 /// the count is a real trade and the conservative side of it is the physical count,
 /// until the batched path's instability is understood. The hybrids keep the
-/// quarter: their prefill batches a fixed two tokens at a time (`qwen35.rs`), not a
-/// whole prompt, so the wide batch behind that instability never forms.
+/// quarter: their prefill batches `PREFILL_CHUNK` tokens at a time (`qwen35.rs`),
+/// not a whole prompt, so the wide batch behind that instability never forms.
 fn dense_worker_count_for(logical: usize, physical: usize) -> usize {
     physical.min(logical)
 }
@@ -157,12 +160,14 @@ fn dense_worker_count_for(logical: usize, physical: usize) -> usize {
 /// The hybrid path's policy, with the core counts passed in for the same reason.
 ///
 /// `Q2_0`/`PQ2_0` take the quarter past physical: the hybrid's prefill walks the
-/// recurrence in token order and pairs two tokens at a time (`qwen35.rs::forward_pair`),
-/// so its batch width is 2 whatever the prompt length (hybrid 4B PQ2_0, 109-token
-/// prompt: 13346 ms at 10 against 13940 at 8, decode 8.5 tok/s against 7.9, both
-/// tight across repeats). `PTQ1_0` has no fast kernel and goes the other
-/// way, hiding the pool's barrier behind more threads (6.7 tok/s at 12 against 5.9
-/// at 8).
+/// recurrence in token order and batches `PREFILL_CHUNK` tokens per weight pass
+/// (`qwen35.rs::forward_pair`), so its batch width is that constant whatever the
+/// prompt length (hybrid 4B PQ2_0, 109-token prompt, **measured at width 2**: 13346 ms
+/// at 10 against 13940 at 8, decode 8.5 tok/s against 7.9, both tight across
+/// repeats). The width changed to 4 on 2026-11-26, so treat the quarter as
+/// provisional until a sweep is run at 4. `PTQ1_0` has no fast kernel and goes the
+/// other way, hiding the pool's barrier behind more threads (6.7 tok/s at 12 against
+/// 5.9 at 8).
 fn hybrid_worker_count_for(logical: usize, physical: usize, has_q2_weights: bool) -> usize {
     if has_q2_weights {
         (physical + physical / 4).min(logical)
