@@ -3,6 +3,13 @@
 **Date**: 2026-06-02 (Session 11)
 **Commit**: Current HEAD — no kernel changes survived review (S11 was exploration only)
 
+> **Reading note (2026-11-26):** this is the historical llama.cpp comparison, kept as
+> the record of that session. One methodology line below is wrong: `[generate]
+> avg_cpu_overhead` prints the whole step including the forward pass, so it is not
+> overhead and nothing was wasting that time. The headline tok/s figures stand on
+> their own; do not read the per-token percentage table as an overhead breakdown.
+> Current numbers and measurement rules are in `README.md` and `BUG_TRACKER.md`.
+
 ## System
 
 | Component | Detail |
