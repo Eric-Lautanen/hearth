@@ -3,6 +3,33 @@
 ## System
 AMD Ryzen 7 8840HS (8C/16T), Radeon 780M iGPU (12 CU RDNA3), 16 GB DDR5, Windows 11. Hearth: 8 workers dense (`physical`), 10 for hybrid `Q2_0`/`PQ2_0`, 12 for hybrid `PTQ1_0` — see the two entries below for why they differ. Ref: llama.cpp-prism.
 
+### Park/wake is not the 0.45 ms either (2026-11-25)
+
+The last open explanation for the 27B's ffn sitting above the 228.5 ms single-pass stream was that a
+worker which parks between two dispatches takes ~0.45 ms to wake. Tested directly, with two
+temporary knobs on the pool's idle loop and 20-token 27B PTQ1_0 runs, three rounds per arm:
+
+| arm | `ffn` ms/token |
+| --- | --- |
+| shipped: 65536-iteration spin, no window | 267.7 / 258.0 / 258.0 |
+| + 200 us wall-clock window | 264.6 / 262.7 / 266.4 |
+| + 2000 us wall-clock window | 262.7 / 262.9 / 268.8 |
+| iteration budget forced to 1 (parks almost immediately) | 270.0 / 266.1 / 268.5 |
+
+- **Extending the spin is worse**, not better: the iteration budget already covers the gaps between
+  the ffn's dispatches, so a longer window only burns a core that the other workers could use.
+- **Forcing the workers to park costs ~3 ms/token**, i.e. 0.02-0.04 ms across 128 dispatches. A futex
+  wake is that cheap on this box, and it is 10-20x smaller than the 0.45 ms the prefill comparison
+  suggested.
+- Neither arm beats 258 ms as a *change*: the shipped build already touches 258.0 on this machine,
+  which is why nothing was kept and both knobs were reverted (`pool.rs` is untouched).
+
+So the ffn is 258-269 ms against 228.5 ms, and the gap is neither dispatch count (measured at ~0.1 ms
+each by the gate/up fusion) nor park/wake (measured here at ~0.03 ms each). What is left to look at is
+inside the bucket: silu/gating over 17408 values per layer, the two per-layer activation
+quantizations, and reading 19.5 MB tensors one dispatch at a time out of a 5.4 GB mmap instead of one
+contiguous 3.74 GB pass. That needs sub-timers before it needs another knob.
+
 ### Fusing gate+up: bit-identical, ~1-2% of ffn, and the dispatch theory dies (2026-11-25)
 
 Decode paid three pool passes per layer for the ffn (gate, up, down), 192 dispatches per token.
